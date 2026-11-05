@@ -22,6 +22,8 @@ export interface PdfReadEnv {
   encodeImage?: (pixels: Uint8Array | Uint8ClampedArray, width: number, height: number, channels: 1 | 3 | 4) => Promise<{ data: Uint8Array; mime: string }>;
   onProgress?: (fraction: number) => void;
   password?: string;
+  /** Return an empty document instead of failing (OCR will fill it). */
+  allowEmpty?: boolean;
 }
 
 interface Frag {
@@ -771,7 +773,16 @@ function headerFooterFilter(pages: { lines: Line[]; height: number }[]): (line: 
   };
 }
 
-export async function pdfToDoc(bytes: Uint8Array, env: PdfReadEnv): Promise<{ doc: Doc; warnings: string[] }> {
+/** Prefix of the warning about pages without a text layer (scans). */
+export const NO_TEXT_LAYER = 'Нет текстового слоя (скан).';
+
+export interface PdfPageInfo {
+  hasText: boolean;
+  /** Indices of top-level blocks that came from this page. */
+  blocks: number[];
+}
+
+export async function pdfToDoc(bytes: Uint8Array, env: PdfReadEnv): Promise<{ doc: Doc; warnings: string[]; pages: PdfPageInfo[] }> {
   const { pdfjs } = env;
   let pdf;
   let task;
@@ -896,9 +907,10 @@ export async function pdfToDoc(bytes: Uint8Array, env: PdfReadEnv): Promise<{ do
   const sizes = [...headingSizes].sort((a, b) => b - a);
   const levelOf = (fs: number): 1 | 2 | 3 | 4 => (Math.min(sizes.indexOf(Math.round(fs)), 3) + 1) as 1 | 2 | 3 | 4;
 
-  // Merge paragraphs split by page breaks
+  // Merge paragraphs split by page breaks (remembering each item's page)
   const flat: PageItem[] = [];
-  for (const items of pageItems) {
+  const itemPage: number[] = [];
+  pageItems.forEach((items, pi) => {
     const first = items[0];
     const last = flat[flat.length - 1];
     if (
@@ -912,14 +924,21 @@ export async function pdfToDoc(bytes: Uint8Array, env: PdfReadEnv): Promise<{ do
     ) {
       last.p.runs = normalizeRuns([...last.p.runs, { text: ' ' }, ...first.p.runs]);
       flat.push(...items.slice(1));
-    } else flat.push(...items);
-  }
+      items.slice(1).forEach(() => itemPage.push(pi));
+    } else {
+      flat.push(...items);
+      items.forEach(() => itemPage.push(pi));
+    }
+  });
 
   // Emit blocks
   const blocks: Block[] = [];
+  const blockPage: number[] = [];
   type ListBlock = Extract<Block, { type: 'list' }>;
   let stack: { list: ListBlock; x0: number }[] = [];
-  for (const it of flat) {
+  for (let fi = 0; fi < flat.length; fi++) {
+    const it = flat[fi];
+    while (blockPage.length < blocks.length) blockPage.push(itemPage[fi - 1] ?? 0);
     if (it.type === 'image') {
       stack = [];
       blocks.push(it.img.block);
@@ -977,16 +996,18 @@ export async function pdfToDoc(bytes: Uint8Array, env: PdfReadEnv): Promise<{ do
     }
   }
 
+  while (blockPage.length < blocks.length) blockPage.push(itemPage[flat.length - 1] ?? 0);
   const warnings = [...layout.warnings];
   const textPages = pages.filter((p) => p.lines.length).length;
   if (textPages < pages.length) {
     warnings.push(
       textPages === 0
-        ? 'В PDF нет текстового слоя (скан). Страницы перенесены как изображения; распознавание текста (OCR) не выполняется.'
-        : `На ${pages.length - textPages} стр. нет текстового слоя — они перенесены как изображения.`,
+        ? `${NO_TEXT_LAYER} Страницы перенесены как изображения — включите распознавание текста (OCR), чтобы получить редактируемый текст.`
+        : `${NO_TEXT_LAYER} На ${pages.length - textPages} стр. — они перенесены как изображения.`,
     );
   }
-  if (!blocks.length) throw new ConvertError('В PDF не найдено ни текста, ни изображений для извлечения.');
+  const pageInfo: PdfPageInfo[] = pages.map((p, i) => ({ hasText: p.lines.length > 0, blocks: blockPage.flatMap((bp, bi) => (bp === i ? [bi] : [])) }));
+  if (!blocks.length && !env.allowEmpty) throw new ConvertError('В PDF не найдено ни текста, ни изображений для извлечения.');
   // Document defaults: the dominant family and body size; runs keep only what differs
   const famChars = new Map<FontFamily, number>();
   forEachRun(blocks, (r) => r.font && !r.code && famChars.set(r.font, (famChars.get(r.font) ?? 0) + r.text.length));
@@ -997,7 +1018,7 @@ export async function pdfToDoc(bytes: Uint8Array, env: PdfReadEnv): Promise<{ do
     if (r.size !== undefined && Math.abs(r.size - size) < 0.6) delete r.size;
   });
   const normalized = renormalize(blocks);
-  return { doc: { title, blocks: normalized, font, size }, warnings };
+  return { doc: { title, blocks: normalized, font, size }, warnings, pages: pageInfo };
 }
 
 /** Merge runs that became identical after dropping default font/size. */

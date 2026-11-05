@@ -1,4 +1,4 @@
-import { detectFormat, FORMATS, pipelineFor, targetsFor, type FormatId } from '../../core/formats';
+import { detectFormat, FORMATS, pipelineFor, targetLabel, targetsFor, type FormatId } from '../../core/formats';
 import type { ConvertOptions } from '../../core/convert-lite';
 import { engine, EngineError } from '../engine/client';
 import type { ConvertResult } from '../engine/protocol';
@@ -11,6 +11,10 @@ interface Options {
   quality: number;
   dpi: number;
   csvDelimiter: ',' | ';';
+  /** Text recognition for PDFs: only scanned pages, every page, or never. */
+  ocr: 'auto' | 'on' | 'off';
+  /** Add an invisible OCR text layer when images become a PDF. */
+  imageOcr: boolean;
 }
 
 interface Item {
@@ -81,7 +85,7 @@ export function mount(root: HTMLElement, params: URLSearchParams): () => void {
     items.forEach(paint);
   });
   const savedOpts = prefs.get<Partial<Options>>('convert-options', {});
-  const defaults = (): Options => ({ pageSize: 'auto', imagePage: 'fit', quality: 0.9, dpi: 150, csvDelimiter: ',', ...savedOpts });
+  const defaults = (): Options => ({ ocr: 'auto', imageOcr: false, pageSize: 'auto', imagePage: 'fit', quality: 0.9, dpi: 150, csvDelimiter: ',', ...savedOpts });
   const urlTo = params.get('to') as FormatId | null;
   let preferred: FormatId | null = urlTo && FORMATS[urlTo] ? urlTo : null;
 
@@ -249,6 +253,21 @@ export function mount(root: HTMLElement, params: URLSearchParams): () => void {
     if (to === 'pdf' && pipe === 'doc') {
       fields.push(select('Размер страницы', item.opts.pageSize, [['auto', 'Как в документе'], ['a4', 'A4'], ['letter', 'Letter']], (v) => ((item.opts.pageSize = v as Options['pageSize']), saveOpts(item))));
     }
+    if (from === 'pdf' && pipe === 'doc') {
+      fields.push(
+        select('Распознавание текста (OCR)', item.opts.ocr, [['auto', 'Авто — только сканы'], ['on', 'Все страницы'], ['off', 'Выключено']], (v) => ((item.opts.ocr = v as Options['ocr']), saveOpts(item))),
+      );
+    }
+    if (pipe === 'images-to-pdf') {
+      fields.push(
+        h(
+          'label',
+          { class: 'checkbox', style: 'align-self:center' },
+          h('input', { type: 'checkbox', checked: item.opts.imageOcr, onchange: (e: Event) => ((item.opts.imageOcr = (e.target as HTMLInputElement).checked), saveOpts(item)) }),
+          'Распознать текст (поиск в PDF)',
+        ),
+      );
+    }
     if (pipe === 'images-to-pdf') {
       fields.push(
         select('Страница', item.opts.imagePage, [['fit', 'По размеру изображения'], ['a4', 'A4 с полями'], ['letter', 'Letter с полями']], (v) => ((item.opts.imagePage = v as Options['imagePage']), saveOpts(item))),
@@ -285,7 +304,7 @@ export function mount(root: HTMLElement, params: URLSearchParams): () => void {
   function hasOptions(item: Item): boolean {
     if (!item.format || !item.target) return false;
     const pipe = pipelineFor(item.format, item.target);
-    return (item.target === 'pdf' && pipe === 'doc') || pipe === 'images-to-pdf' || (item.format === 'pdf' && pipe === 'raster') || ['jpg', 'webp', 'avif', 'csv'].includes(item.target);
+    return (item.target === 'pdf' && pipe === 'doc') || (item.format === 'pdf' && pipe === 'doc') || pipe === 'images-to-pdf' || (item.format === 'pdf' && pipe === 'raster') || ['jpg', 'webp', 'avif', 'csv'].includes(item.target);
   }
 
   function paint(item: Item): void {
@@ -305,7 +324,7 @@ export function mount(root: HTMLElement, params: URLSearchParams): () => void {
             disabled: item.status === 'working',
             onchange: (e: Event) => setTarget(item, (e.target as HTMLSelectElement).value as FormatId),
           },
-          targets.map((t) => h('option', { value: t, selected: t === item.target }, `${FORMATS[t].label} (.${FORMATS[t].ext})`)),
+          targets.map((t) => h('option', { value: t, selected: t === item.target }, targetLabel(f, t))),
         ),
       );
       if (hasOptions(item)) {
@@ -381,7 +400,35 @@ export function mount(root: HTMLElement, params: URLSearchParams): () => void {
     const t0 = performance.now();
     try {
       const pipe = pipelineFor(from, to);
-      if (pipe === 'doc') {
+      const status = (v: number, label?: string): void => {
+        onProgress(v);
+        if (label && label !== item.message) {
+          item.message = label;
+          const msg = item.el.querySelector<HTMLElement>('.file__status .progress + div');
+          if (msg) msg.textContent = label;
+        }
+      };
+      if (pipe === 'doc' && from === 'pdf' && item.opts.ocr !== 'off') {
+        const { pdfToDocWithOcr } = await import('../ocr-convert');
+        const opts: ConvertOptions = { pageSize: item.opts.pageSize, csvDelimiter: item.opts.csvDelimiter };
+        const r = await pdfToDocWithOcr(item.bytes, to, opts, item.opts.ocr, base, status, ctrl.signal);
+        item.result = { data: r.data, name: `${base}.${r.ext}`, mime: r.mime };
+        item.warnings = r.warnings;
+      } else if (pipe === 'ocr') {
+        const { imageToDocWithOcr } = await import('../ocr-convert');
+        const r = await imageToDocWithOcr(item.file, from, to, base, status);
+        item.result = { data: r.data, name: `${base}.${r.ext}`, mime: r.mime };
+        item.warnings = r.warnings;
+      } else if (pipe === 'ocr-pdf') {
+        const { searchablePdf } = await import('../ocr-convert');
+        const r = await searchablePdf(item.bytes, status, ctrl.signal);
+        item.result = { data: r.data, name: `${base}-ocr.pdf`, mime: FORMATS.pdf.mime };
+        item.warnings = r.warnings;
+      } else if (pipe === 'images-to-pdf' && item.opts.imageOcr) {
+        const { imagesToSearchablePdf } = await import('../ocr-convert');
+        const data = await imagesToSearchablePdf([{ file: item.file, format: from }], item.opts.imagePage, status);
+        item.result = { data, name: `${base}.pdf`, mime: FORMATS.pdf.mime };
+      } else if (pipe === 'doc') {
         const copy = item.bytes.slice();
         const opts: ConvertOptions = { pageSize: item.opts.pageSize, csvDelimiter: item.opts.csvDelimiter };
         const r = await engine.run<ConvertResult>({ op: 'convert', bytes: copy, from, to, opts, title: base }, { transfer: [copy.buffer], onProgress, signal: ctrl.signal });
@@ -442,6 +489,11 @@ export function mount(root: HTMLElement, params: URLSearchParams): () => void {
   async function mergeImages(images: Item[]): Promise<void> {
     try {
       toast('Создаю PDF из изображений…');
+      if (images[0].opts.imageOcr) {
+        const { imagesToSearchablePdf } = await import('../ocr-convert');
+        download(await imagesToSearchablePdf(images.map((i) => ({ file: i.file, format: i.format! })), images[0].opts.imagePage, () => {}), 'images.pdf', 'application/pdf');
+        return;
+      }
       const inputs = [];
       for (const it of images) inputs.push(await toPdfImage(it.file, it.format!));
       const data = await engine.run<Uint8Array>(

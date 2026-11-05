@@ -137,8 +137,25 @@ async function handle(id: number, req: EngineRequest): Promise<{ result: unknown
       return { result: r, transfer: [r.data.buffer] };
     }
     case 'imagesToPdf': {
-      const { imagesToPdf } = await import('../../core/pdf-tools');
-      const data = await imagesToPdf(req.images, req.opts);
+      const { imagesToPdfLayout } = await import('../../core/pdf-tools');
+      const r = await imagesToPdfLayout(req.images, req.opts);
+      return req.placements ? { result: r, transfer: [r.pdf.buffer] } : { result: r.pdf, transfer: [r.pdf.buffer] };
+    }
+    case 'pdfModel': {
+      const pdfjs = await loadPdfjs();
+      const { pdfToDoc } = await import('../../core/readers/pdf');
+      const e = env(id);
+      const r = await pdfToDoc(req.bytes, { pdfjs, docParams: e.pdfDocParams, encodeImage, onProgress: e.onProgress, allowEmpty: true });
+      r.doc.title ??= req.title;
+      return { result: r, transfer: [] };
+    }
+    case 'writeDoc': {
+      const r = await writeContent({ kind: 'doc', doc: req.doc }, req.to, env(id, req.to === 'pdf' ? await loadSubsetter() : undefined), req.opts, req.title);
+      return { result: r, transfer: [r.data.buffer] };
+    }
+    case 'overlayText': {
+      const { overlayTextLayers } = await import('../../core/pdf-tools');
+      const data = await overlayTextLayers(req.base, req.layers);
       return { result: data, transfer: [data.buffer] };
     }
     case 'composePdf': {

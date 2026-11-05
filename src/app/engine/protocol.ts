@@ -1,6 +1,7 @@
 import type { FormatId } from '../../core/formats';
 import type { ConvertOptions } from '../../core/convert-lite';
-import type { ImageInput, ImagesToPdfOptions, PageSpec } from '../../core/pdf-tools';
+import type { ImageInput, ImagePlacement, ImagesToPdfOptions, PageSpec, TextLayer } from '../../core/pdf-tools';
+import type { PdfPageInfo } from '../../core/readers/pdf';
 import type { Doc } from '../../core/model';
 
 /** Document-level settings that the editor keeps alongside its HTML. */
@@ -10,7 +11,10 @@ export type EngineRequest =
   | { op: 'convert'; bytes: Uint8Array; from: FormatId; to: FormatId; opts: ConvertOptions; title?: string }
   | { op: 'toHtml'; bytes: Uint8Array; from: FormatId; title?: string }
   | { op: 'fromHtml'; html: string; to: FormatId; opts: ConvertOptions; title?: string; meta?: DocMeta }
-  | { op: 'imagesToPdf'; images: ImageInput[]; opts: ImagesToPdfOptions }
+  | { op: 'imagesToPdf'; images: ImageInput[]; opts: ImagesToPdfOptions; placements?: boolean }
+  | { op: 'pdfModel'; bytes: Uint8Array; title?: string }
+  | { op: 'writeDoc'; doc: Doc; to: FormatId; opts: ConvertOptions; title?: string }
+  | { op: 'overlayText'; base: Uint8Array; layers: TextLayer[] }
   | { op: 'composePdf'; sources: Uint8Array[]; pages: PageSpec[] };
 
 export interface ConvertResult {
@@ -18,6 +22,17 @@ export interface ConvertResult {
   mime: string;
   ext: string;
   warnings: string[];
+}
+
+export interface PdfModelResult {
+  doc: Doc;
+  pages: PdfPageInfo[];
+  warnings: string[];
+}
+
+export interface ImagesPdfResult {
+  pdf: Uint8Array;
+  placements: ImagePlacement[];
 }
 
 export interface HtmlResult {

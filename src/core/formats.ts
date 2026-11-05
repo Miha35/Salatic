@@ -82,7 +82,7 @@ export const IMAGE_INPUTS: FormatId[] = ['png', 'jpg', 'webp', 'gif', 'bmp', 'sv
 export const IMAGE_OUTPUTS: FormatId[] = ['png', 'jpg', 'webp', 'bmp', 'ico'];
 
 const TARGETS: Partial<Record<FormatId, FormatId[]>> = {
-  pdf: ['docx', 'txt', 'md', 'html', 'png', 'jpg'],
+  pdf: ['docx', 'txt', 'md', 'html', 'pdf', 'png', 'jpg'],
   docx: ['pdf', 'txt', 'md', 'html', 'xlsx', 'csv'],
   txt: ['pdf', 'docx', 'md', 'html'],
   md: ['pdf', 'docx', 'html', 'txt'],
@@ -96,7 +96,7 @@ const TARGETS: Partial<Record<FormatId, FormatId[]>> = {
 /** Available output formats for a given input format. */
 export function targetsFor(from: FormatId, opts: { avif?: boolean } = {}): FormatId[] {
   if (FORMATS[from]?.kind === 'image') {
-    const outs: FormatId[] = [...IMAGE_OUTPUTS, 'pdf'];
+    const outs: FormatId[] = [...IMAGE_OUTPUTS, 'pdf', 'docx', 'txt'];
     if (opts.avif) outs.splice(3, 0, 'avif');
     return outs.filter((f) => f !== from);
   }
@@ -104,11 +104,21 @@ export function targetsFor(from: FormatId, opts: { avif?: boolean } = {}): Forma
 }
 
 /** Pipeline that executes a conversion. */
-export function pipelineFor(from: FormatId, to: FormatId): 'doc' | 'raster' | 'images-to-pdf' | null {
+export function pipelineFor(from: FormatId, to: FormatId): 'doc' | 'raster' | 'images-to-pdf' | 'ocr' | 'ocr-pdf' | null {
   if (!targetsFor(from, { avif: true }).includes(to)) return null;
-  if (FORMATS[from].kind === 'image') return to === 'pdf' ? 'images-to-pdf' : 'raster';
+  if (FORMATS[from].kind === 'image') return to === 'pdf' ? 'images-to-pdf' : to === 'docx' || to === 'txt' ? 'ocr' : 'raster';
   if (from === 'pdf' && (to === 'png' || to === 'jpg')) return 'raster';
+  if (from === 'pdf' && to === 'pdf') return 'ocr-pdf';
   return 'doc';
+}
+
+/** Human label of a conversion target (OCR variants are spelled out). */
+export function targetLabel(from: FormatId, to: FormatId): string {
+  const base = `${FORMATS[to].label} (.${FORMATS[to].ext})`;
+  const p = pipelineFor(from, to);
+  if (p === 'ocr') return `${base} — распознать текст`;
+  if (p === 'ocr-pdf') return 'PDF с распознанным текстом (OCR)';
+  return base;
 }
 
 const EXT_MAP: Record<string, FormatId> = {

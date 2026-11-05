@@ -1,5 +1,5 @@
 /** PDF assembly: images → PDF, and page composition for the PDF editor (merge, reorder, rotate, annotate). */
-import { degrees, LineCapStyle, PDFDocument, rgb, type PDFImage, type PDFPage } from 'pdf-lib';
+import { concatTransformationMatrix, degrees, drawObject, LineCapStyle, PDFDocument, popGraphicsState, pushGraphicsState, rgb, type PDFImage, type PDFPage } from 'pdf-lib';
 import { FontManager, type FontKey, type FontLoader } from './pdf-fonts';
 import type { Subsetter } from './hb-subset';
 import { ConvertError } from './util';
@@ -27,8 +27,22 @@ async function embed(pdf: PDFDocument, img: { data: Uint8Array; mime: string }):
   }
 }
 
+/** Where each image was drawn: page index and rectangle in PDF points (origin bottom-left). */
+export interface ImagePlacement {
+  page: number;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
 export async function imagesToPdf(images: ImageInput[], opts: ImagesToPdfOptions = {}): Promise<Uint8Array> {
+  return (await imagesToPdfLayout(images, opts)).pdf;
+}
+
+export async function imagesToPdfLayout(images: ImageInput[], opts: ImagesToPdfOptions = {}): Promise<{ pdf: Uint8Array; placements: ImagePlacement[] }> {
   if (!images.length) throw new ConvertError('Нет изображений для создания PDF.');
+  const placements: ImagePlacement[] = [];
   const pdf = await PDFDocument.create();
   pdf.setCreator('Salatic');
   pdf.setProducer('Salatic');
@@ -39,6 +53,7 @@ export async function imagesToPdf(images: ImageInput[], opts: ImagesToPdfOptions
     if (!opts.pageSize || opts.pageSize === 'fit') {
       const page = pdf.addPage([wPt, hPt]);
       page.drawImage(img, { x: 0, y: 0, width: wPt, height: hPt });
+      placements.push({ page: pdf.getPageCount() - 1, x: 0, y: 0, w: wPt, h: hPt });
       continue;
     }
     const [pw0, ph0] = PAGE[opts.pageSize];
@@ -50,8 +65,49 @@ export async function imagesToPdf(images: ImageInput[], opts: ImagesToPdfOptions
     const h = hPt * k;
     const page = pdf.addPage([pw, ph]);
     page.drawImage(img, { x: (pw - w) / 2, y: (ph - h) / 2, width: w, height: h });
+    placements.push({ page: pdf.getPageCount() - 1, x: (pw - w) / 2, y: (ph - h) / 2, w, h });
   }
-  return pdf.save({ useObjectStreams: true });
+  return { pdf: await pdf.save({ useObjectStreams: true }), placements };
+}
+
+export interface TextLayer {
+  /** Page index in the base document. */
+  page: number;
+  /** One-page PDF with invisible text (Tesseract "text only" output). */
+  pdf: Uint8Array;
+  /** Canvas pixel → base page user space (y of pixels grows downwards). */
+  toUser: [number, number, number, number, number, number];
+  /** Size of the recognised image in pixels. */
+  width: number;
+  height: number;
+}
+
+/**
+ * Make a PDF searchable: draw OCR text layers (invisible text) over the original
+ * pages, mapped exactly onto the area that was recognised.
+ */
+export async function overlayTextLayers(base: Uint8Array, layers: TextLayer[]): Promise<Uint8Array> {
+  let doc: PDFDocument;
+  try {
+    doc = await PDFDocument.load(base, { ignoreEncryption: true, updateMetadata: false });
+  } catch {
+    throw new ConvertError('PDF повреждён и не может быть обработан.');
+  }
+  if (doc.isEncrypted) throw new ConvertError('PDF зашифрован — добавить текстовый слой нельзя.', 'encrypted');
+  for (const l of layers) {
+    const src = await PDFDocument.load(l.pdf);
+    const srcPage = src.getPage(0);
+    const { width: tw, height: th } = srcPage.getSize();
+    const [emb] = await doc.embedPdf(src, [0]);
+    const page = doc.getPage(l.page);
+    // text space (y up, tw×th) → pixels (y down) → base user space
+    const s: [number, number, number, number, number, number] = [l.width / tw, 0, 0, -l.height / th, 0, l.height];
+    const [a, b, c, d, e, f] = l.toUser;
+    const m = [a * s[0] + c * s[1], b * s[0] + d * s[1], a * s[2] + c * s[3], b * s[2] + d * s[3], a * s[4] + c * s[5] + e, b * s[4] + d * s[5] + f];
+    const name = page.node.newXObject('OcrText', emb.ref);
+    page.pushOperators(pushGraphicsState(), concatTransformationMatrix(m[0], m[1], m[2], m[3], m[4], m[5]), drawObject(name), popGraphicsState());
+  }
+  return doc.save({ useObjectStreams: true });
 }
 
 // ---------------------------------------------------------------------------

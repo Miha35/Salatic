@@ -130,6 +130,10 @@ async function makeFixtures() {
   const page = await ctx.newPage();
   await page.setContent('<div style="height:400px;background:linear-gradient(90deg,#e11d48,#4f46e5,#10b981)"><h1 style="color:#fff;font:700 48px sans-serif;padding:40px">Salatic</h1></div>');
   writeFileSync(join(fx, 'photo.png'), await page.screenshot());
+  // A "scanned" page: text rendered as pixels only
+  await page.setViewportSize({ width: 1100, height: 900 });
+  await page.setContent(`<div style="padding:60px;font:28px/1.5 serif;background:#fff;color:#111;width:980px"><h1 style="font-size:46px">Договор поставки №17</h1><p>Поставщик обязуется передать покупателю товар надлежащего качества в срок до пятнадцатого декабря.</p><p>The quick brown fox jumps over the lazy dog.</p></div>`);
+  writeFileSync(join(fx, 'scan.png'), await page.screenshot({ fullPage: true }));
   await ctx.close();
 }
 const F = (n) => join(fx, n);
@@ -274,6 +278,24 @@ test('Converter: batch, ZIP download, merge images, unsupported file message', a
     expect(Object.keys(unzipSync(all.bytes)).length === 3, 'zip of 3 results');
     const merged = await downloadFrom(page, () => page.getByRole('button', { name: /Объединить 2 изобр/ }).click());
     expect((await PDFDocument.load(merged.bytes)).getPageCount() === 2, 'merged pdf has 2 pages');
+  });
+});
+
+// ---------------------------------------------------------------------------- OCR
+test('OCR: scanned PDF → Word (auto), → searchable PDF, photo → Word', async () => {
+  await withPage(async (page) => {
+    const scan = await convertOne(page, F('scan.png'), 'pdf');
+    writeFileSync(F('scan.pdf'), scan.bytes);
+    expect(!(await pdfText(scan.bytes)).join('').trim(), 'scan has no text layer');
+    const docx = await convertOne(page, F('scan.pdf'), 'docx');
+    const t = docxText(docx.bytes);
+    for (const s of ['Договор поставки', 'надлежащего качества', 'quick brown fox']) expect(t.includes(s), `docx OCR has "${s}": ${t}`);
+    const searchable = await convertOne(page, F('scan.pdf'), 'pdf');
+    const layer = (await pdfText(searchable.bytes)).join(' ').replace(/\s+/g, ' ');
+    expect(layer.includes('надлежащего') && layer.includes('lazy dog'), `text layer: ${layer}`);
+    expect((await PDFDocument.load(searchable.bytes)).getPageCount() === 1, 'one page');
+    const fromPhoto = await convertOne(page, F('scan.png'), 'docx');
+    expect(docxText(fromPhoto.bytes).includes('Поставщик обязуется'), 'photo OCR');
   });
 });
 
