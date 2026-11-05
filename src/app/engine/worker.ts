@@ -7,7 +7,7 @@ import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { convert, readContent, writeContent, type ConvertEnv } from '../../core/convert';
 import { asDoc } from '../../core/convert-lite';
 import { htmlToDoc } from '../../core/readers/html';
-import { blocksToHtml } from '../../core/writers/text';
+import { docToHtmlFragment } from '../../core/writers/text';
 import { encodePng } from '../../core/png';
 import type { FontKey } from '../../core/pdf-fonts';
 import { createSubsetter, type Subsetter } from '../../core/hb-subset';
@@ -125,10 +125,13 @@ async function handle(id: number, req: EngineRequest): Promise<{ result: unknown
     case 'toHtml': {
       const { content, warnings } = await readContent(req.bytes, req.from, env(id), req.title);
       const doc = asDoc(content, req.title);
-      return { result: { html: blocksToHtml(doc.blocks), title: doc.title, warnings }, transfer: [] };
+      const meta = { font: doc.font, size: doc.size, page: doc.page, defaults: doc.defaults };
+      return { result: { html: docToHtmlFragment(doc), title: doc.title, meta, warnings }, transfer: [] };
     }
     case 'fromHtml': {
-      const doc = htmlToDoc(req.html);
+      const doc = { ...req.meta, ...htmlToDoc(req.html) };
+      doc.font ??= req.meta?.font;
+      doc.size ??= req.meta?.size;
       doc.title = req.title || doc.title;
       const r = await writeContent({ kind: 'doc', doc }, req.to, env(id, req.to === 'pdf' ? await loadSubsetter() : undefined), req.opts, req.title);
       return { result: r, transfer: [r.data.buffer] };

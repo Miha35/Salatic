@@ -308,6 +308,43 @@ test('Doc editor: open DOCX, edit, save as DOCX and PDF, draft survives reload',
   });
 });
 
+test('Doc editor: font, size, highlight, footnote, footer with page numbers', async () => {
+  await withPage(async (page) => {
+    await page.goto(`${BASE}/doc-editor`);
+    await page.click('.doc-page');
+    await page.keyboard.type('Обычный текст ');
+    await page.keyboard.type('крупный');
+    // select the last word and make it Times New Roman 14 pt, highlighted
+    await page.keyboard.down('Shift');
+    for (let i = 0; i < 'крупный'.length; i++) await page.keyboard.press('ArrowLeft');
+    await page.keyboard.up('Shift');
+    await page.selectOption('select[aria-label="Шрифт"]', 'serif');
+    await page.selectOption('select[aria-label="Размер шрифта"]', '14');
+    await page.evaluate(() => {
+      const m = document.querySelector('input[aria-label="Цвет выделения текста"]');
+      m.value = '#ffff00';
+      m.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    await page.keyboard.press('End');
+    await page.click('button[aria-label="Вставить сноску"]');
+    await page.keyboard.type('Пояснение в сноске');
+    await page.click('button[aria-label^="Нижний колонтитул"]');
+    await page.selectOption('select[aria-label="Формат сохранения"]', 'docx');
+    const docx = await downloadFrom(page, () => page.getByRole('button', { name: 'Скачать' }).click());
+    const files = unzipSync(docx.bytes);
+    const xml = text(files['word/document.xml']);
+    expect(/Times New Roman.*?<w:sz w:val="28"\/>.*?крупный/s.test(xml), `font+size: ${xml.slice(0, 600)}`);
+    expect(/w:fill="FFFF00"/i.test(xml), 'highlight');
+    expect(text(files['word/footnotes.xml'] ?? new Uint8Array()).includes('Пояснение в сноске'), 'footnote saved');
+    expect(text(files['word/footer1.xml'] ?? new Uint8Array()).includes('PAGE'), 'page field in footer');
+    await page.selectOption('select[aria-label="Формат сохранения"]', 'pdf');
+    const pdf = await downloadFrom(page, () => page.getByRole('button', { name: 'Скачать' }).click());
+    const t = (await pdfText(pdf.bytes)).join(' ');
+    expect(t.includes('Пояснение в сноске'), `pdf footnote: ${t}`);
+    expect(/Страница\s+1\s+из\s+1/.test(t), `pdf footer: ${t}`);
+  });
+});
+
 test('Doc editor: paste is sanitised (no scripts or handlers)', async () => {
   await withPage(async (page) => {
     await page.goto(`${BASE}/doc-editor`);

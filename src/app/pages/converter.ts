@@ -6,7 +6,7 @@ import { convertImage, pdfToImages, supportsAvifEncoding, toPdfImage, zipFiles }
 import { baseName, button, download, dropzone, formatBytes, h, handOff, icon, iconButton, note, onPasteFiles, prefs, readFile, toast } from '../ui';
 
 interface Options {
-  pageSize: 'a4' | 'letter';
+  pageSize: 'auto' | 'a4' | 'letter';
   imagePage: 'fit' | 'a4' | 'letter';
   quality: number;
   dpi: number;
@@ -81,7 +81,7 @@ export function mount(root: HTMLElement, params: URLSearchParams): () => void {
     items.forEach(paint);
   });
   const savedOpts = prefs.get<Partial<Options>>('convert-options', {});
-  const defaults = (): Options => ({ pageSize: 'a4', imagePage: 'fit', quality: 0.9, dpi: 150, csvDelimiter: ',', ...savedOpts });
+  const defaults = (): Options => ({ pageSize: 'auto', imagePage: 'fit', quality: 0.9, dpi: 150, csvDelimiter: ',', ...savedOpts });
   const urlTo = params.get('to') as FormatId | null;
   let preferred: FormatId | null = urlTo && FORMATS[urlTo] ? urlTo : null;
 
@@ -247,7 +247,7 @@ export function mount(root: HTMLElement, params: URLSearchParams): () => void {
         ),
       );
     if (to === 'pdf' && pipe === 'doc') {
-      fields.push(select('Размер страницы', item.opts.pageSize, [['a4', 'A4'], ['letter', 'Letter']], (v) => ((item.opts.pageSize = v as Options['pageSize']), saveOpts(item))));
+      fields.push(select('Размер страницы', item.opts.pageSize, [['auto', 'Как в документе'], ['a4', 'A4'], ['letter', 'Letter']], (v) => ((item.opts.pageSize = v as Options['pageSize']), saveOpts(item))));
     }
     if (pipe === 'images-to-pdf') {
       fields.push(

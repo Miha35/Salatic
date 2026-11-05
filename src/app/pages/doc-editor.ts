@@ -1,9 +1,11 @@
 import { detectFormat, FORMATS, type FormatId } from '../../core/formats';
 import { htmlToDoc } from '../../core/readers/html';
-import { blocksToHtml } from '../../core/writers/text';
+import { blocksToHtml, CSS_FONT, docToHtmlFragment } from '../../core/writers/text';
+import { familyOf, type FontFamily } from '../../core/model';
 import { escapeHtml } from '../../core/util';
 import { engine } from '../engine/client';
-import type { ConvertResult, HtmlResult } from '../engine/protocol';
+import type { ConvertResult, DocMeta, HtmlResult } from '../engine/protocol';
+import { registerEditorFonts } from '../editor-fonts';
 import { baseName, button, confirmDialog, download, formatBytes, h, iconButton, note, pickFiles, prefs, promptText, readFile, takeHandoff, toast } from '../ui';
 
 const OPEN_ACCEPT = '.docx,.pdf,.md,.markdown,.html,.htm,.txt,.csv,.tsv,.xlsx,.json';
@@ -14,8 +16,18 @@ const MAX_DRAFT = 4_000_000;
 /** Sanitise arbitrary HTML through the document model (drops scripts, handlers, unknown markup). */
 const sanitize = (html: string): string => blocksToHtml(htmlToDoc(html).blocks);
 
+const FONT_CHOICES: [FontFamily, string][] = [
+  ['sans', 'Arial'],
+  ['serif', 'Times New Roman'],
+  ['calibri', 'Calibri'],
+  ['mono', 'Courier New'],
+];
+const SIZE_CHOICES = [8, 9, 10, 10.5, 11, 12, 14, 16, 18, 20, 24, 28, 36, 48, 72];
+
 export function mount(root: HTMLElement): () => void {
-  const draft = prefs.get<{ title: string; html: string; at: number } | null>(DRAFT_KEY, null);
+  registerEditorFonts();
+  const draft = prefs.get<{ title: string; html: string; at: number; meta?: DocMeta } | null>(DRAFT_KEY, null);
+  let meta: DocMeta = draft?.meta ?? { font: 'serif', size: 12 };
   let format: FormatId = prefs.get<FormatId>('doc-save-format', 'docx');
   let dirty = false;
   let saveTimer = 0;
@@ -74,7 +86,126 @@ export function mount(root: HTMLElement): () => void {
   };
 
   const color = h('input', { type: 'color', class: 'input', value: '#d92d3a', title: 'Цвет текста', 'aria-label': 'Цвет текста' });
-  color.addEventListener('change', () => exec('foreColor', color.value));
+  color.addEventListener('change', () => withCss(() => exec('foreColor', color.value)));
+  const marker = h('input', { type: 'color', class: 'input', value: '#fff176', title: 'Цвет выделения', 'aria-label': 'Цвет выделения текста' });
+  marker.addEventListener('change', () => withCss(() => exec('hiliteColor', marker.value)));
+
+  /** Run a formatting command producing <span style> rather than <font>. */
+  function withCss(fn: () => void): void {
+    try {
+      document.execCommand('styleWithCSS', false, 'true');
+      fn();
+    } finally {
+      document.execCommand('styleWithCSS', false, 'false');
+    }
+  }
+
+  const fontSelect = h(
+    'select',
+    {
+      class: 'select',
+      'aria-label': 'Шрифт',
+      title: 'Шрифт',
+      onchange: () => {
+        withCss(() => exec('fontName', FONT_CHOICES.find(([f]) => f === fontSelect.value)![1]));
+      },
+    },
+    FONT_CHOICES.map(([f, label]) => h('option', { value: f, style: `font-family:${CSS_FONT[f]}` }, label)),
+  );
+  const sizeSelect = h(
+    'select',
+    {
+      class: 'select',
+      'aria-label': 'Размер шрифта',
+      title: 'Размер шрифта, пт',
+      style: 'width:76px',
+      onchange: () => applySize(+sizeSelect.value),
+    },
+    SIZE_CHOICES.map((n) => h('option', { value: n }, String(n))),
+  );
+
+  /** execCommand only knows sizes 1–7: apply 7, then replace it with the exact point size. */
+  function applySize(pt: number): void {
+    withCss(() => exec('fontSize', '7'));
+    editor.querySelectorAll<HTMLElement>('[style*="xxx-large"], font[size="7"]').forEach((el) => {
+      if (el.tagName === 'FONT') {
+        const span = document.createElement('span');
+        span.style.fontSize = `${pt}pt`;
+        span.append(...el.childNodes);
+        el.replaceWith(span);
+      } else el.style.fontSize = `${pt}pt`;
+    });
+    changed();
+  }
+
+  function applyMeta(): void {
+    editor.style.fontFamily = CSS_FONT[meta.font ?? 'sans'];
+    editor.style.fontSize = `${meta.size ?? 12}pt`;
+  }
+
+  // ------------------------------------------------------------------ footnotes, header, footer
+  function insertFootnote(): void {
+    const ids = [...editor.querySelectorAll('li[id^="fn"]')].map((li) => parseInt(li.id.slice(2), 10)).filter(Number.isFinite);
+    const n = (ids.length ? Math.max(...ids) : 0) + 1;
+    exec('insertHTML', `<sup class="footnote-ref"><a href="#fn${n}" id="fnref${n}">${n}</a></sup>&#8203;`);
+    let section = editor.querySelector('section.footnotes');
+    if (!section) {
+      section = h('section', { class: 'footnotes' }, h('hr'), h('ol'));
+      const footer = editor.querySelector('footer.doc-footer');
+      if (footer) editor.insertBefore(section, footer);
+      else editor.append(section);
+    }
+    const li = h('li', { id: `fn${n}` }, h('p', null, 'Текст сноски'));
+    section.querySelector('ol')!.append(li);
+    // Put the caret into the new note so the user can type it right away
+    const range = document.createRange();
+    range.selectNodeContents(li.querySelector('p')!);
+    const sel = document.getSelection();
+    sel?.removeAllRanges();
+    sel?.addRange(range);
+    changed();
+  }
+
+  function toggleRegion(kind: 'header' | 'footer'): void {
+    const cls = kind === 'header' ? 'doc-header' : 'doc-footer';
+    const existing = editor.querySelector(`${kind}.${cls}`);
+    if (existing) {
+      existing.remove();
+    } else {
+      const el = h(kind, { class: cls }, h('p', { style: kind === 'footer' ? 'text-align:center' : 'text-align:right' }, kind === 'footer' ? ['Страница ', fieldSpan('page'), ' из ', fieldSpan('pages')] : 'Верхний колонтитул'));
+      if (kind === 'header') editor.prepend(el);
+      else editor.append(el);
+    }
+    focusBody();
+    changed();
+  }
+
+  /** Make sure the body has at least one paragraph and put the caret into it (not into a header/footer). */
+  function focusBody(): void {
+    const isRegion = (n: Element): boolean => n.matches('header.doc-header, footer.doc-footer, section.footnotes');
+    let target = [...editor.children].find((n) => !isRegion(n));
+    if (!target) {
+      target = h('p', null, h('br'));
+      const after = editor.querySelector('section.footnotes, footer.doc-footer');
+      if (after) editor.insertBefore(target, after);
+      else editor.append(target);
+    }
+    const sel = document.getSelection();
+    const anchor = sel?.anchorNode ?? null;
+    const inRegion = anchor ? !!(anchor.nodeType === 1 ? (anchor as Element) : anchor.parentElement)?.closest('header.doc-header, footer.doc-footer') : true;
+    if (inRegion || !editor.contains(anchor)) {
+      const range = document.createRange();
+      range.selectNodeContents(target);
+      range.collapse(false);
+      sel?.removeAllRanges();
+      sel?.addRange(range);
+    }
+    editor.focus();
+  }
+
+  function fieldSpan(field: 'page' | 'pages'): HTMLElement {
+    return h('span', { 'data-field': field, contenteditable: 'false', title: field === 'page' ? 'Номер страницы' : 'Число страниц' }, '#');
+  }
 
   const formatSelect = h(
     'select',
@@ -104,6 +235,9 @@ export function mount(root: HTMLElement): () => void {
     cmdBtn('underline', 'Подчёркнутый (Ctrl+U)', 'underline', undefined, true),
     cmdBtn('strike', 'Зачёркнутый', 'strikeThrough', undefined, true),
     color,
+    marker,
+    fontSelect,
+    sizeSelect,
     h('span', { class: 'toolbar__sep' }),
     cmdBtn('list-ul', 'Маркированный список', 'insertUnorderedList', undefined, true),
     cmdBtn('list-ol', 'Нумерованный список', 'insertOrderedList', undefined, true),
@@ -118,6 +252,11 @@ export function mount(root: HTMLElement): () => void {
     cmdBtn('hr', 'Горизонтальная линия', 'insertHorizontalRule'),
     withMouseGuard(iconButton('page-break', 'Разрыв страницы', () => exec('insertHTML', '<hr class="page-break"><p><br></p>'))),
     cmdBtn('clear-format', 'Очистить форматирование', 'removeFormat'),
+    h('span', { class: 'toolbar__sep' }),
+    withMouseGuard(iconButton('footnote', 'Вставить сноску', insertFootnote)),
+    withMouseGuard(iconButton('header', 'Верхний колонтитул (добавить/убрать)', () => toggleRegion('header'))),
+    withMouseGuard(iconButton('footer', 'Нижний колонтитул с номером страницы (добавить/убрать)', () => toggleRegion('footer'))),
+    withMouseGuard(iconButton('hash', 'Вставить номер страницы', () => exec('insertHTML', '<span data-field="page" contenteditable="false">#</span>&#8203;'))),
     h('span', { class: 'toolbar__spacer' }),
     formatSelect,
     button('Скачать', () => void save(), { icon: 'download', variant: 'primary', small: true }),
@@ -155,6 +294,17 @@ export function mount(root: HTMLElement): () => void {
       }
       b.setAttribute('aria-pressed', String(on));
     }
+    // Font and size of the text at the caret
+    const node = document.getSelection()?.anchorNode;
+    const el = node ? (node.nodeType === 1 ? (node as Element) : node.parentElement) : null;
+    if (el && editor.contains(el)) {
+      const cs = getComputedStyle(el);
+      const fam = familyOf(cs.fontFamily) ?? 'sans';
+      fontSelect.value = fam;
+      const pt = Math.round(parseFloat(cs.fontSize) * 0.75 * 2) / 2;
+      const nearest = SIZE_CHOICES.reduce((a, b) => (Math.abs(b - pt) < Math.abs(a - pt) ? b : a));
+      sizeSelect.value = String(nearest);
+    }
     try {
       const block = String(document.queryCommandValue('formatBlock') || 'p').toLowerCase();
       blockSelect.value = ['h1', 'h2', 'h3', 'h4', 'blockquote', 'pre'].includes(block) ? block : 'p';
@@ -182,7 +332,7 @@ export function mount(root: HTMLElement): () => void {
       statusRight.textContent = 'Черновик слишком большой для автосохранения';
       return;
     }
-    prefs.set(DRAFT_KEY, { title: titleInput.value, html, at: Date.now() });
+    prefs.set(DRAFT_KEY, { title: titleInput.value, html, at: Date.now(), meta });
     statusRight.textContent = `Черновик сохранён ${new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })}`;
   }
 
@@ -290,6 +440,8 @@ export function mount(root: HTMLElement): () => void {
   async function newDoc(): Promise<void> {
     if (editor.textContent?.trim() && !(await confirmDialog('Новый документ', 'Текущий текст будет удалён. Продолжить?', 'Создать'))) return;
     editor.innerHTML = '';
+    meta = { font: 'serif', size: 12 };
+    applyMeta();
     titleInput.value = 'Документ';
     banner.replaceChildren();
     dirty = false;
@@ -316,6 +468,8 @@ export function mount(root: HTMLElement): () => void {
     try {
       const r = await engine.run<HtmlResult>({ op: 'toHtml', bytes, from: det.format, title: baseName(file.name) }, { transfer: [bytes.buffer] });
       editor.innerHTML = r.html;
+      meta = r.meta;
+      applyMeta();
       titleInput.value = baseName(file.name);
       banner.replaceChildren(...r.warnings.map((w) => h('div', { style: 'margin-top:10px' }, note('warn', w))));
       if (det.format === 'pdf') banner.append(h('div', { style: 'margin-top:10px' }, note('ok', 'PDF преобразован в редактируемый текст. Для правки страниц «как есть» используйте редактор PDF.')));
@@ -335,7 +489,7 @@ export function mount(root: HTMLElement): () => void {
     }
     try {
       toast(`Сохраняю в ${FORMATS[format].label}…`, 'info', 2000);
-      const r = await engine.run<ConvertResult>({ op: 'fromHtml', html, to: format, opts: {}, title });
+      const r = await engine.run<ConvertResult>({ op: 'fromHtml', html, to: format, opts: {}, title, meta });
       download(r.data, `${title.replace(/[\\/:*?"<>|]+/g, '_')}.${r.ext}`, r.mime);
       for (const w of r.warnings) toast(w);
       dirty = false;
@@ -348,7 +502,7 @@ export function mount(root: HTMLElement): () => void {
   const handed = takeHandoff('/doc-editor');
   if (handed) void openFile(handed);
   else if (draft?.html) {
-    editor.innerHTML = sanitize(draft.html);
+    editor.innerHTML = docToHtmlFragment(htmlToDoc(draft.html));
     banner.replaceChildren(
       h(
         'div',
@@ -358,6 +512,7 @@ export function mount(root: HTMLElement): () => void {
       ),
     );
   }
+  applyMeta();
   updateCounts();
   if (!handed) setTimeout(() => editor.focus(), 0);
 

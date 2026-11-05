@@ -86,6 +86,10 @@ const ICONS: Record<string, string> = {
   scissors: '<circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M8.1 8.1 20 20M8.1 15.9 20 4"/>',
   'file-plus': '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M12 11v6M9 14h6"/>',
   'clear-format': '<path d="M5 6V4h14v2M12 4l-3 16M15 15l5 5M20 15l-5 5"/>',
+  footnote: '<path d="M4 6h10M4 10h10M4 14h6M4 20h9"/><path d="M17 4h3v6"/><path d="M16 10h5"/>',
+  header: '<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 8h18M7 5.5h6"/>',
+  footer: '<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 16h18M10 18.5h4"/>',
+  hash: '<path d="M5 9h14M5 15h14M10 4 8 20M16 4l-2 16"/>',
 };
 
 export function icon(name: string, label?: string): SVGSVGElement {
