@@ -190,8 +190,8 @@ const isPageBreak = (node: HNode, where: 'before' | 'after'): boolean => {
 };
 
 function imageFromNode(node: HNode): Block | null {
-  const src = node.attrs.src ?? '';
-  const parsed = parseDataUri(src);
+  const src = node.attrs.src ?? node.attrs['xlink:href'] ?? node.attrs.href ?? '';
+  const parsed = parseDataUri(src) ?? currentCtx?.resolveImage?.(src) ?? null;
   if (!parsed) return null;
   const mime = sniffImageMime(parsed.data) ?? parsed.mime;
   if (!mime.startsWith('image/')) return null;
@@ -218,8 +218,12 @@ class Ctx {
   title?: string;
   header?: Block[];
   footer?: Block[];
-  /** Footnote bodies by element id (pandoc/markdown-it/our own HTML). */
+  /** Footnote bodies by element id (pandoc/markdown-it/our own HTML, EPUB asides). */
   notes = new Map<string, HNode>();
+  /** Note bodies already attached to a reference (skipped where they stand). */
+  used = new Set<HNode>();
+  /** Resolves non-data image sources (e.g. files inside an EPUB). */
+  resolveImage?: (src: string) => { mime: string; data: Uint8Array } | null;
 }
 
 let currentCtx: Ctx | null = null;
@@ -272,6 +276,7 @@ function inlineRuns(node: HNode, style: InlineStyle, runs: TextRun[], pre: boole
       const { sup: _s, link: _l, ...rest } = clean(style);
       const ctx = currentCtx;
       ctx.notes.delete(node.attrs.href!.slice(1)); // a note body is used once
+      ctx.used.add(li);
       const body = collectBlocks(li.children.filter((c) => !(c.tag === 'a' && /^#fnref|footnote-back/.test((c.attrs.href ?? '') + ' ' + (c.attrs.class ?? '')))), {}, ctx);
       runs.push({ text: '', ...rest, note: stripBackrefs(body) });
       return;
@@ -319,6 +324,7 @@ function collectBlocks(children: HNode[], style: InlineStyle, ctx: Ctx, fmt?: Pa
     out.push(b);
   };
   for (const c of children) {
+    if (ctx.used.has(c)) continue;
     if (INLINE.has(c.tag)) inlineRuns(c, style, runs, false, sink);
     else {
       flush();
@@ -466,15 +472,17 @@ function blockFrom(node: HNode, style: InlineStyle, ctx: Ctx, out: Block[], inhe
 }
 
 /** Parse an HTML string (full document or fragment) into a Doc. */
-export function htmlToDoc(html: string): Doc {
+export function htmlToDoc(html: string, opts: { resolveImage?: Ctx['resolveImage'] } = {}): Doc {
   const tree = parseHtml(html);
   const ctx = new Ctx();
+  ctx.resolveImage = opts.resolveImage;
   const titleNode = findTag(tree, 'title');
   if (titleNode) ctx.title = htmlText(titleNode).trim() || undefined;
   // Footnote bodies: <li id="fn1"> inside a .footnotes container
   const visit = (n: HNode, inNotes: boolean): void => {
     const here = inNotes || /\bfootnotes\b/.test(n.attrs.class ?? '') || n.attrs.role === 'doc-endnotes';
     if (here && n.tag === 'li' && n.attrs.id) ctx.notes.set(n.attrs.id, n);
+    else if (n.attrs.id && (/\b(footnote|endnote|rearnote)\b/.test(n.attrs['epub:type'] ?? '') || /\bdoc-(foot|end)note\b/.test(n.attrs.role ?? ''))) ctx.notes.set(n.attrs.id, n);
     for (const c of n.children) visit(c, here);
   };
   visit(tree, false);

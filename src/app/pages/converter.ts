@@ -53,6 +53,8 @@ const POPULAR: { label: string; from: FormatId[]; to: FormatId }[] = [
   { label: 'XLS → XLSX', from: ['xls'], to: 'xlsx' },
   { label: 'ODT → Word', from: ['odt'], to: 'docx' },
   { label: 'RTF → Word', from: ['rtf'], to: 'docx' },
+  { label: 'EPUB → PDF', from: ['epub'], to: 'pdf' },
+  { label: 'Word → EPUB', from: ['docx'], to: 'epub' },
 ];
 
 const DEFAULT_TARGET: Partial<Record<FormatId, FormatId>> = {
@@ -61,6 +63,7 @@ const DEFAULT_TARGET: Partial<Record<FormatId, FormatId>> = {
   doc: 'docx',
   odt: 'docx',
   rtf: 'docx',
+  epub: 'pdf',
   ods: 'xlsx',
   xls: 'xlsx',
   txt: 'pdf',
@@ -131,7 +134,7 @@ export function mount(root: HTMLElement, params: URLSearchParams): () => void {
   const zone = dropzone({
     accept: ACCEPT,
     title: 'Перетащите файлы сюда или нажмите, чтобы выбрать',
-    hint: 'PDF, Word (DOCX/DOC), Excel (XLSX/XLS), OpenDocument, RTF, CSV, JSON, Markdown, HTML, TXT, JPG, PNG, WebP, GIF, SVG и другие · можно вставить из буфера (Ctrl+V)',
+    hint: 'PDF, Word (DOCX/DOC), Excel (XLSX/XLS), OpenDocument, RTF, EPUB, CSV, JSON, Markdown, HTML, TXT, JPG, PNG, WebP, GIF, SVG и другие · можно вставить из буфера (Ctrl+V)',
     onFiles: addFiles,
   });
   onPasteFiles(root, addFiles);

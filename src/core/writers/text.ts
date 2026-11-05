@@ -234,19 +234,28 @@ export const CSS_FONT: Record<FontFamily, string> = {
 
 const num = (n: number): string => String(Math.round(n * 100) / 100);
 
-function htmlRuns(runs: TextRun[], notes: Notes): string {
+/** Markup flavour: HTML for pages, XHTML (self-closed void tags, no named entities) for EPUB. */
+export interface HtmlCtx {
+  xhtml: boolean;
+  /** Image source for a block; defaults to an inline data URI. */
+  imageSrc?: (b: Extract<Block, { type: 'image' }>) => string;
+}
+const HTML: HtmlCtx = { xhtml: false };
+
+function htmlRuns(runs: TextRun[], notes: Notes, ctx: HtmlCtx = HTML): string {
+  const br = ctx.xhtml ? '<br/>' : '<br>';
   let s = '';
   for (const r of runs) {
     if (r.note) {
       const n = notes.add(r.note);
-      s += `<sup class="footnote-ref"><a href="#fn${n}" id="fnref${n}">${n}</a></sup>`;
+      s += `<sup class="footnote-ref"><a href="#fn${n}" id="fnref${n}"${ctx.xhtml ? ' epub:type="noteref"' : ''}>${n}</a></sup>`;
       continue;
     }
     if (r.field) {
       s += `<span data-field="${r.field}">#</span>`;
       continue;
     }
-    let t = escapeHtml(r.text).replace(/\n/g, '<br>').replace(/\t/g, '&emsp;');
+    let t = escapeHtml(r.text).replace(/\n/g, br).replace(/\t/g, ctx.xhtml ? '&#8195;' : '&emsp;');
     if (!t) continue;
     if (r.code) t = `<code>${t}</code>`;
     if (r.bold) t = `<strong>${t}</strong>`;
@@ -281,15 +290,17 @@ function paraStyle(f: ParaFormat): string {
 
 const alignAttr = (a?: Align): string => (a && a !== 'left' ? ` style="text-align:${a}"` : '');
 
-function blocksHtml(blocks: Block[], notes: Notes): string {
+function blocksHtml(blocks: Block[], notes: Notes, ctx: HtmlCtx = HTML): string {
+  const br = ctx.xhtml ? '<br/>' : '<br>';
+  const hr = ctx.xhtml ? '<hr/>' : '<hr>';
   let s = '';
   for (const b of blocks) {
     switch (b.type) {
       case 'paragraph':
-        s += `<p${paraStyle(b)}>${htmlRuns(b.runs, notes) || '<br>'}</p>\n`;
+        s += `<p${paraStyle(b)}>${htmlRuns(b.runs, notes, ctx) || br}</p>\n`;
         break;
       case 'heading':
-        s += `<h${b.level}${paraStyle(b)}>${htmlRuns(b.runs, notes)}</h${b.level}>\n`;
+        s += `<h${b.level}${paraStyle(b)}>${htmlRuns(b.runs, notes, ctx)}</h${b.level}>\n`;
         break;
       case 'list': {
         const tag = b.ordered ? 'ol' : 'ul';
@@ -298,8 +309,8 @@ function blocksHtml(blocks: Block[], notes: Notes): string {
         for (const it of b.items) {
           // A single paragraph item is rendered inline to keep the markup compact
           const [first, ...rest] = it.blocks;
-          if (first?.type === 'paragraph') s += `<li>${htmlRuns(first.runs, notes)}${rest.length ? '\n' + blocksHtml(rest, notes) : ''}</li>\n`;
-          else s += `<li>${blocksHtml(it.blocks, notes)}</li>\n`;
+          if (first?.type === 'paragraph') s += `<li>${htmlRuns(first.runs, notes, ctx)}${rest.length ? '\n' + blocksHtml(rest, notes, ctx) : ''}</li>\n`;
+          else s += `<li>${blocksHtml(it.blocks, notes, ctx)}</li>\n`;
         }
         s += `</${tag}>\n`;
         break;
@@ -313,41 +324,48 @@ function blocksHtml(blocks: Block[], notes: Notes): string {
             const span = c.colspan && c.colspan > 1 ? ` colspan="${c.colspan}"` : '';
             const only = c.blocks.length === 1 && c.blocks[0].type === 'paragraph' ? c.blocks[0] : null;
             const align = only ? alignAttr(only.align) : '';
-            s += `<${tag}${span}${align}>${only ? htmlRuns(only.runs, notes) : blocksHtml(c.blocks, notes)}</${tag}>`;
+            s += `<${tag}${span}${align}>${only ? htmlRuns(only.runs, notes, ctx) : blocksHtml(c.blocks, notes, ctx)}</${tag}>`;
           }
           s += '</tr>\n';
         }
         s += '</table>\n';
         break;
       case 'image':
-        s += `<p><img src="data:${b.mime};base64,${bytesToBase64(b.data)}" width="${b.width}" height="${b.height}" alt="${escapeHtml(b.alt ?? '')}"></p>\n`;
+        s += `<p><img src="${ctx.imageSrc ? escapeHtml(ctx.imageSrc(b)) : `data:${b.mime};base64,${bytesToBase64(b.data)}`}" width="${b.width}" height="${b.height}" alt="${escapeHtml(b.alt ?? '')}"${ctx.xhtml ? '/' : ''}></p>\n`;
         break;
       case 'code':
         s += `<pre><code>${escapeHtml(b.text)}</code></pre>\n`;
         break;
       case 'quote':
-        s += `<blockquote>\n${blocksHtml(b.blocks, notes)}</blockquote>\n`;
+        s += `<blockquote>\n${blocksHtml(b.blocks, notes, ctx)}</blockquote>\n`;
         break;
       case 'hr':
-        s += '<hr>\n';
+        s += `${hr}\n`;
         break;
       case 'pagebreak':
-        s += '<hr class="page-break">\n';
+        s += `<hr class="page-break"${ctx.xhtml ? '/' : ''}>\n`;
         break;
     }
   }
   return s;
 }
 
-function notesHtml(notes: Notes): string {
+function notesHtml(notes: Notes, ctx: HtmlCtx = HTML): string {
   if (!notes.list.length) return '';
-  let s = '<section class="footnotes">\n<hr>\n<ol>\n';
+  let s = `<section class="footnotes"${ctx.xhtml ? ' epub:type="footnotes"' : ''}>\n${ctx.xhtml ? '<hr/>' : '<hr>'}\n<ol>\n`;
   // Notes may reference further notes: iterate while the list grows
   for (let i = 0; i < notes.list.length; i++) {
-    const body = blocksHtml(notes.list[i], notes).trim();
-    s += `<li id="fn${i + 1}">${body}</li>\n`;
+    const body = blocksHtml(notes.list[i], notes, ctx).trim();
+    s += `<li id="fn${i + 1}"${ctx.xhtml ? ' epub:type="footnote"' : ''}>${body}</li>\n`;
   }
   return s + '</ol>\n</section>\n';
+}
+
+/** XHTML body of a chapter (blocks + its footnotes) for EPUB. */
+export function blocksToXhtml(blocks: Block[], imageSrc: HtmlCtx['imageSrc']): string {
+  const notes = new Notes();
+  const ctx: HtmlCtx = { xhtml: true, imageSrc };
+  return blocksHtml(blocks, notes, ctx) + notesHtml(notes, ctx);
 }
 
 /** Blocks only (no header, footer or footnotes) – used where a bare fragment is needed. */

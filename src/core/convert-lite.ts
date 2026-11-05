@@ -15,6 +15,8 @@ import { odsToBook, odtToDoc } from './readers/odf';
 import { bookToOds, docToOdt } from './writers/odf';
 import { rtfToDoc } from './readers/rtf';
 import { docToRtf } from './writers/rtf';
+import { epubToDoc } from './readers/epub';
+import { docToEpub } from './writers/epub';
 import { htmlToDoc } from './readers/html';
 import { markdownToDoc } from './readers/markdown';
 import { textToDoc } from './readers/text';
@@ -36,7 +38,7 @@ export interface ConvertOutput {
   warnings: string[];
 }
 
-export const LITE_FORMATS: FormatId[] = ['docx', 'doc', 'odt', 'rtf', 'txt', 'md', 'html', 'csv', 'tsv', 'json', 'xlsx', 'xls', 'ods'];
+export const LITE_FORMATS: FormatId[] = ['docx', 'doc', 'odt', 'rtf', 'epub', 'txt', 'md', 'html', 'csv', 'tsv', 'json', 'xlsx', 'xls', 'ods'];
 
 export function readLite(bytes: Uint8Array, from: FormatId, title?: string): { content: Content; warnings: string[] } {
   switch (from) {
@@ -66,6 +68,11 @@ export function readLite(bytes: Uint8Array, from: FormatId, title?: string): { c
     }
     case 'rtf': {
       const { doc, warnings } = rtfToDoc(bytes);
+      doc.title ??= title;
+      return { content: { kind: 'doc', doc }, warnings };
+    }
+    case 'epub': {
+      const { doc, warnings } = epubToDoc(bytes);
       doc.title ??= title;
       return { content: { kind: 'doc', doc }, warnings };
     }
@@ -149,6 +156,11 @@ export function writeLite(content: Content, to: FormatId, opts: ConvertOptions =
     case 'rtf': {
       const doc = asDoc(content, title);
       const r = docToRtf({ ...doc, title: doc.title ?? title }, opts);
+      return out(r.data, to, r.warnings);
+    }
+    case 'epub': {
+      const doc = asDoc(content, title);
+      const r = docToEpub({ ...doc, title: doc.title ?? title });
       return out(r.data, to, r.warnings);
     }
     default:

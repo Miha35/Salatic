@@ -13,6 +13,8 @@ import { bookToOds, docToOdt } from '../../src/core/writers/odf';
 import { odsToBook, odtToDoc } from '../../src/core/readers/odf';
 import { docToRtf } from '../../src/core/writers/rtf';
 import { rtfToDoc } from '../../src/core/readers/rtf';
+import { docToEpub } from '../../src/core/writers/epub';
+import { epubToDoc } from '../../src/core/readers/epub';
 import type { Workbook } from '../../src/core/model';
 import { bytes, env, hasCmd, loadFonts, pdfToText, soffice, text } from './helpers';
 import { sample } from './sample';
@@ -57,6 +59,8 @@ async function fixture(f: FormatId): Promise<Uint8Array> {
       return docToRtf(sample).data;
     case 'ods':
       return bookToOds(book);
+    case 'epub':
+      return docToEpub(sample).data;
     // legacy binary formats are produced by LibreOffice (tests are skipped without it)
     case 'doc':
       return soffice(docToDocx(sample).data, 'docx', 'doc:MS Word 97');
@@ -90,6 +94,9 @@ function validate(to: FormatId, data: Uint8Array, mustContain: string): void {
       break;
     case 'rtf':
       expect(JSON.stringify(rtfToDoc(data).doc)).toContain(mustContain);
+      break;
+    case 'epub':
+      expect(JSON.stringify(epubToDoc(data).doc)).toContain(mustContain);
       break;
     case 'json':
       expect(JSON.stringify(JSON.parse(text(data)))).toContain(mustContain);
