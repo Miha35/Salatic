@@ -212,7 +212,8 @@ describe('formats', () => {
     expect(detectFormat('a.md', bytes('# hi')).format).toBe('md');
     expect(detectFormat('noext', bytes('<!DOCTYPE html><p>x')).format).toBe('html');
     expect(detectFormat('noext', bytes('[1,2]')).format).toBe('json');
-    expect(detectFormat('old.doc', new Uint8Array([0xd0, 0xcf, 0x11, 0xe0, 0, 0])).error).toMatch(/\.docx/);
+    expect(detectFormat('old.doc', new Uint8Array([0xd0, 0xcf, 0x11, 0xe0, 0, 0])).error).toMatch(/повреждён/);
+    expect(detectFormat('x.rtf', bytes('{\\rtf1 hi}')).format).toBe('rtf');
     expect(detectFormat('x.xlsx', bookToXlsx({ sheets: [{ name: 'a', rows: [] }] })).format).toBe('xlsx');
     expect(detectFormat('x.svg', bytes('<?xml version="1.0"?><svg></svg>')).format).toBe('svg');
   });

@@ -1,4 +1,4 @@
-import { detectFormat, FORMATS, pipelineFor, targetLabel, targetsFor, type FormatId } from '../../core/formats';
+import { acceptFor, detectFormat, DOC_READABLE, FORMATS, IMAGE_INPUTS, pipelineFor, targetLabel, targetsFor, type FormatId } from '../../core/formats';
 import type { ConvertOptions } from '../../core/convert-lite';
 import { engine, EngineError } from '../engine/client';
 import type { ConvertResult } from '../engine/protocol';
@@ -49,11 +49,20 @@ const POPULAR: { label: string; from: FormatId[]; to: FormatId }[] = [
   { label: 'Markdown → PDF', from: ['md'], to: 'pdf' },
   { label: 'HTML → Word', from: ['html'], to: 'docx' },
   { label: 'JSON → Excel', from: ['json'], to: 'xlsx' },
+  { label: 'DOC → DOCX', from: ['doc'], to: 'docx' },
+  { label: 'XLS → XLSX', from: ['xls'], to: 'xlsx' },
+  { label: 'ODT → Word', from: ['odt'], to: 'docx' },
+  { label: 'RTF → Word', from: ['rtf'], to: 'docx' },
 ];
 
 const DEFAULT_TARGET: Partial<Record<FormatId, FormatId>> = {
   pdf: 'docx',
   docx: 'pdf',
+  doc: 'docx',
+  odt: 'docx',
+  rtf: 'docx',
+  ods: 'xlsx',
+  xls: 'xlsx',
   txt: 'pdf',
   md: 'pdf',
   html: 'pdf',
@@ -71,7 +80,7 @@ const DEFAULT_TARGET: Partial<Record<FormatId, FormatId>> = {
   avif: 'png',
 };
 
-const ACCEPT = '.pdf,.docx,.doc,.txt,.md,.markdown,.html,.htm,.csv,.tsv,.json,.xlsx,.xls,.png,.jpg,.jpeg,.webp,.gif,.bmp,.svg,.ico,.avif,.odt,.rtf';
+const ACCEPT = acceptFor([...DOC_READABLE, ...IMAGE_INPUTS]);
 const FILE_LIMIT = 300 * 1024 * 1024;
 
 const kindIcon = (f: FormatId | null): string => (!f ? 'file' : FORMATS[f].kind === 'image' ? 'image' : FORMATS[f].kind === 'data' ? 'table' : 'file-text');
@@ -122,7 +131,7 @@ export function mount(root: HTMLElement, params: URLSearchParams): () => void {
   const zone = dropzone({
     accept: ACCEPT,
     title: 'Перетащите файлы сюда или нажмите, чтобы выбрать',
-    hint: 'PDF, Word, Excel, CSV, JSON, Markdown, HTML, TXT, JPG, PNG, WebP, GIF, SVG и другие · можно вставить из буфера (Ctrl+V)',
+    hint: 'PDF, Word (DOCX/DOC), Excel (XLSX/XLS), OpenDocument, RTF, CSV, JSON, Markdown, HTML, TXT, JPG, PNG, WebP, GIF, SVG и другие · можно вставить из буфера (Ctrl+V)',
     onFiles: addFiles,
   });
   onPasteFiles(root, addFiles);

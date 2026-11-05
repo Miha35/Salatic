@@ -16,6 +16,9 @@ export type FormatId =
   | 'json'
   | 'xlsx'
   | 'xls'
+  | 'odt'
+  | 'rtf'
+  | 'ods'
   | 'png'
   | 'jpg'
   | 'webp'
@@ -69,6 +72,9 @@ export const FORMATS: Record<FormatId, FormatInfo> = {
     description: 'Таблица Microsoft Excel',
   },
   xls: { id: 'xls', label: 'Excel 97–2003', ext: 'xls', mime: 'application/vnd.ms-excel', kind: 'data', description: 'Таблица Excel 97–2003' },
+  odt: { id: 'odt', label: 'OpenDocument', ext: 'odt', mime: 'application/vnd.oasis.opendocument.text', kind: 'document', description: 'Текст OpenDocument (LibreOffice)' },
+  rtf: { id: 'rtf', label: 'RTF', ext: 'rtf', mime: 'application/rtf', kind: 'document', description: 'Документ RTF (WordPad, Word)' },
+  ods: { id: 'ods', label: 'OpenDocument Calc', ext: 'ods', mime: 'application/vnd.oasis.opendocument.spreadsheet', kind: 'data', description: 'Таблица OpenDocument (LibreOffice)' },
   png: { id: 'png', label: 'PNG', ext: 'png', mime: 'image/png', kind: 'image', description: 'Изображение PNG' },
   jpg: { id: 'jpg', label: 'JPG', ext: 'jpg', mime: 'image/jpeg', kind: 'image', description: 'Изображение JPEG' },
   webp: { id: 'webp', label: 'WebP', ext: 'webp', mime: 'image/webp', kind: 'image', description: 'Изображение WebP' },
@@ -80,24 +86,27 @@ export const FORMATS: Record<FormatId, FormatInfo> = {
 };
 
 /** Formats handled by the document/data engine (no canvas required). */
-export const DOC_READABLE: FormatId[] = ['pdf', 'docx', 'doc', 'txt', 'md', 'html', 'csv', 'tsv', 'json', 'xlsx', 'xls'];
-export const DOC_WRITABLE: FormatId[] = ['pdf', 'docx', 'txt', 'md', 'html', 'csv', 'tsv', 'json', 'xlsx'];
+export const DOC_READABLE: FormatId[] = ['pdf', 'docx', 'doc', 'odt', 'rtf', 'txt', 'md', 'html', 'csv', 'tsv', 'json', 'xlsx', 'xls', 'ods'];
+export const DOC_WRITABLE: FormatId[] = ['pdf', 'docx', 'odt', 'rtf', 'txt', 'md', 'html', 'csv', 'tsv', 'json', 'xlsx', 'ods'];
 export const IMAGE_INPUTS: FormatId[] = ['png', 'jpg', 'webp', 'gif', 'bmp', 'svg', 'ico', 'avif'];
 /** Image outputs the browser can always encode (avif is feature-detected at runtime). */
 export const IMAGE_OUTPUTS: FormatId[] = ['png', 'jpg', 'webp', 'bmp', 'ico'];
 
 const TARGETS: Partial<Record<FormatId, FormatId[]>> = {
-  pdf: ['docx', 'txt', 'md', 'html', 'pdf', 'png', 'jpg'],
-  docx: ['pdf', 'txt', 'md', 'html', 'xlsx', 'csv'],
-  doc: ['docx', 'pdf', 'txt', 'md', 'html', 'xlsx', 'csv'],
-  txt: ['pdf', 'docx', 'md', 'html'],
-  md: ['pdf', 'docx', 'html', 'txt'],
-  html: ['pdf', 'docx', 'md', 'txt', 'xlsx', 'csv'],
-  csv: ['xlsx', 'json', 'tsv', 'html', 'pdf', 'docx', 'md'],
-  tsv: ['xlsx', 'json', 'csv', 'html', 'pdf', 'docx', 'md'],
-  json: ['xlsx', 'csv', 'tsv', 'html', 'pdf', 'docx', 'md'],
-  xlsx: ['csv', 'tsv', 'json', 'html', 'pdf', 'docx', 'md'],
-  xls: ['xlsx', 'csv', 'tsv', 'json', 'html', 'pdf', 'docx', 'md'],
+  pdf: ['docx', 'odt', 'rtf', 'txt', 'md', 'html', 'pdf', 'png', 'jpg'],
+  docx: ['pdf', 'odt', 'rtf', 'txt', 'md', 'html', 'xlsx', 'csv'],
+  doc: ['docx', 'pdf', 'odt', 'rtf', 'txt', 'md', 'html', 'xlsx', 'csv'],
+  odt: ['docx', 'pdf', 'rtf', 'txt', 'md', 'html', 'xlsx', 'ods', 'csv'],
+  rtf: ['docx', 'pdf', 'odt', 'txt', 'md', 'html'],
+  txt: ['pdf', 'docx', 'odt', 'rtf', 'md', 'html'],
+  md: ['pdf', 'docx', 'odt', 'rtf', 'html', 'txt'],
+  html: ['pdf', 'docx', 'odt', 'rtf', 'md', 'txt', 'xlsx', 'csv'],
+  csv: ['xlsx', 'ods', 'json', 'tsv', 'html', 'pdf', 'docx', 'md'],
+  tsv: ['xlsx', 'ods', 'json', 'csv', 'html', 'pdf', 'docx', 'md'],
+  json: ['xlsx', 'ods', 'csv', 'tsv', 'html', 'pdf', 'docx', 'md'],
+  xlsx: ['csv', 'ods', 'tsv', 'json', 'html', 'pdf', 'docx', 'md'],
+  xls: ['xlsx', 'ods', 'csv', 'tsv', 'json', 'html', 'pdf', 'docx', 'md'],
+  ods: ['xlsx', 'csv', 'tsv', 'json', 'html', 'pdf', 'docx', 'md'],
 };
 
 /** Available output formats for a given input format. */
@@ -152,6 +161,12 @@ const EXT_MAP: Record<string, FormatId> = {
   xlsm: 'xlsx',
   xls: 'xls',
   xlt: 'xls',
+  odt: 'odt',
+  ott: 'odt',
+  fodt: 'odt',
+  ods: 'ods',
+  ots: 'ods',
+  rtf: 'rtf',
   png: 'png',
   jpg: 'jpg',
   jpeg: 'jpg',
@@ -167,9 +182,6 @@ const EXT_MAP: Record<string, FormatId> = {
 const UNSUPPORTED_HINTS: Record<string, string> = {
   ppt: 'Презентации пока не поддерживаются.',
   pptx: 'Презентации пока не поддерживаются.',
-  odt: 'Формат ODT пока не поддерживается. Сохраните документ как .docx.',
-  ods: 'Формат ODS пока не поддерживается. Сохраните таблицу как .xlsx.',
-  rtf: 'Формат RTF пока не поддерживается. Сохраните документ как .docx.',
   heic: 'Формат HEIC не поддерживается браузером. Сохраните фото как JPG.',
   tif: 'Формат TIFF не поддерживается браузером. Сохраните изображение как PNG.',
   tiff: 'Формат TIFF не поддерживается браузером. Сохраните изображение как PNG.',
@@ -201,14 +213,17 @@ function cfbKind(bytes: Uint8Array): FormatId | null {
 function zipKind(bytes: Uint8Array): FormatId | null {
   try {
     let kind: FormatId | null = null;
-    // Only list entry names; the filter returning false avoids inflating anything.
-    unzipSync(bytes, {
+    // Entry names only; nothing but the tiny `mimetype` entry is inflated.
+    const small = unzipSync(bytes, {
       filter: (f) => {
         if (f.name === 'word/document.xml') kind = 'docx';
         else if (f.name === 'xl/workbook.xml') kind = 'xlsx';
-        return false;
+        return f.name === 'mimetype' && f.originalSize < 200;
       },
     });
+    const mime = small['mimetype'] ? new TextDecoder().decode(small['mimetype']).trim() : '';
+    if (mime === 'application/vnd.oasis.opendocument.text' || mime === 'application/vnd.oasis.opendocument.text-template') return 'odt';
+    if (mime === 'application/vnd.oasis.opendocument.spreadsheet' || mime === 'application/vnd.oasis.opendocument.spreadsheet-template') return 'ods';
     return kind;
   } catch {
     return null;
@@ -226,15 +241,18 @@ export function detectFormat(name: string, bytes: Uint8Array): Detection {
   if (startsWith(bytes, [0x00, 0x00, 0x01, 0x00]) && (ext === 'ico' || ext === 'cur' || !ext)) return { format: 'ico' };
   if (startsWith(bytes, [0x66, 0x74, 0x79, 0x70], 4) && (startsWith(bytes, [0x61, 0x76, 0x69], 8) || ext === 'avif')) return { format: 'avif' };
   if (startsWith(bytes, [0x42, 0x4d]) && (ext === 'bmp' || ext === 'dib' || !ext)) return { format: 'bmp' };
+  if (startsWith(bytes, [0x7b, 0x5c, 0x72, 0x74, 0x66])) return { format: 'rtf' };
   if (startsWith(bytes, [0xd0, 0xcf, 0x11, 0xe0])) {
     const kind = cfbKind(bytes);
     if (kind) return { format: kind };
-    return { format: null, error: UNSUPPORTED_HINTS[ext] ?? 'Этот файл Office старого формата не распознан (поддерживаются .doc и .xls).' };
+    if (UNSUPPORTED_HINTS[ext]) return { format: null, error: UNSUPPORTED_HINTS[ext] };
+    if (['doc', 'dot', 'xls', 'xlt'].includes(ext)) return { format: null, error: 'Файл повреждён: не удалось прочитать структуру документа Office.' };
+    return { format: null, error: 'Этот файл Office старого формата не распознан (поддерживаются .doc и .xls).' };
   }
   if (startsWith(bytes, [0x50, 0x4b, 0x03, 0x04])) {
     const kind = zipKind(bytes);
     if (kind) return { format: kind };
-    return { format: null, error: UNSUPPORTED_HINTS[ext] ?? 'Этот ZIP-архив не является документом Word или Excel.' };
+    return { format: null, error: UNSUPPORTED_HINTS[ext] ?? 'Этот ZIP-архив не является документом Word, Excel или OpenDocument.' };
   }
   if (UNSUPPORTED_HINTS[ext]) return { format: null, error: UNSUPPORTED_HINTS[ext] };
   const byExt = EXT_MAP[ext];
@@ -259,6 +277,14 @@ function isProbablyText(bytes: Uint8Array): boolean {
     if (b < 9 || (b > 13 && b < 32)) bad++;
   }
   return bad / Math.max(1, n) < 0.02;
+}
+
+/** `accept` attribute value (".a,.b,…") for file pickers that take the given formats. */
+export function acceptFor(formats: FormatId[]): string {
+  return Object.entries(EXT_MAP)
+    .filter(([, f]) => formats.includes(f))
+    .map(([ext]) => `.${ext}`)
+    .join(',');
 }
 
 export function formatFromExtension(ext: string): FormatId | null {

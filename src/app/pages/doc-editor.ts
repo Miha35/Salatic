@@ -1,4 +1,4 @@
-import { detectFormat, FORMATS, type FormatId } from '../../core/formats';
+import { acceptFor, detectFormat, DOC_READABLE, FORMATS, type FormatId } from '../../core/formats';
 import { htmlToDoc } from '../../core/readers/html';
 import { blocksToHtml, CSS_FONT, docToHtmlFragment } from '../../core/writers/text';
 import { familyOf, type FontFamily } from '../../core/model';
@@ -8,8 +8,8 @@ import type { ConvertResult, DocMeta, HtmlResult } from '../engine/protocol';
 import { registerEditorFonts } from '../editor-fonts';
 import { baseName, button, confirmDialog, download, formatBytes, h, iconButton, note, pickFiles, prefs, promptText, readFile, takeHandoff, toast } from '../ui';
 
-const OPEN_ACCEPT = '.docx,.pdf,.md,.markdown,.html,.htm,.txt,.csv,.tsv,.xlsx,.json';
-const SAVE_FORMATS: FormatId[] = ['docx', 'pdf', 'html', 'md', 'txt'];
+const OPEN_ACCEPT = acceptFor(DOC_READABLE);
+const SAVE_FORMATS: FormatId[] = ['docx', 'pdf', 'odt', 'rtf', 'html', 'md', 'txt'];
 const DRAFT_KEY = 'doc-draft';
 const MAX_DRAFT = 4_000_000;
 

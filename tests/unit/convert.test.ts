@@ -9,8 +9,12 @@ import { bookToJson, bookToXlsx, sheetToCsv } from '../../src/core/writers/data'
 import { docxToDoc } from '../../src/core/readers/docx';
 import { xlsxToBook } from '../../src/core/readers/data';
 import { readLite, writeLite } from '../../src/core/convert-lite';
+import { bookToOds, docToOdt } from '../../src/core/writers/odf';
+import { odsToBook, odtToDoc } from '../../src/core/readers/odf';
+import { docToRtf } from '../../src/core/writers/rtf';
+import { rtfToDoc } from '../../src/core/readers/rtf';
 import type { Workbook } from '../../src/core/model';
-import { bytes, env, hasCmd, loadFonts, pdfToText, text } from './helpers';
+import { bytes, env, hasCmd, loadFonts, pdfToText, soffice, text } from './helpers';
 import { sample } from './sample';
 
 const book: Workbook = {
@@ -47,6 +51,17 @@ async function fixture(f: FormatId): Promise<Uint8Array> {
       return bytes(bookToJson(book));
     case 'xlsx':
       return bookToXlsx(book);
+    case 'odt':
+      return docToOdt(sample).data;
+    case 'rtf':
+      return docToRtf(sample).data;
+    case 'ods':
+      return bookToOds(book);
+    // legacy binary formats are produced by LibreOffice (tests are skipped without it)
+    case 'doc':
+      return soffice(docToDocx(sample).data, 'docx', 'doc:MS Word 97');
+    case 'xls':
+      return soffice(bookToXlsx(book), 'xlsx', 'xls:MS Excel 97');
     default:
       throw new Error(f);
   }
@@ -67,6 +82,15 @@ function validate(to: FormatId, data: Uint8Array, mustContain: string): void {
     case 'xlsx':
       expect(JSON.stringify(xlsxToBook(data))).toContain(mustContain);
       break;
+    case 'ods':
+      expect(JSON.stringify(odsToBook(data).book)).toContain(mustContain);
+      break;
+    case 'odt':
+      expect(JSON.stringify(odtToDoc(data).doc)).toContain(mustContain);
+      break;
+    case 'rtf':
+      expect(JSON.stringify(rtfToDoc(data).doc)).toContain(mustContain);
+      break;
     case 'json':
       expect(JSON.stringify(JSON.parse(text(data)))).toContain(mustContain);
       break;
@@ -78,7 +102,7 @@ function validate(to: FormatId, data: Uint8Array, mustContain: string): void {
 describe('conversion matrix', () => {
   for (const from of DOC_READABLE) {
     for (const to of targetsFor(from).filter((t) => pipelineFor(from, t) === 'doc')) {
-      it(`${from} → ${to}`, async () => {
+      it.skipIf((from === 'doc' || from === 'xls') && !hasCmd('soffice'))(`${from} → ${to}`, async () => {
         const input = await fixture(from);
         const isData = FORMATS[from].kind === 'data';
         // docx/html → table formats export the table; data → anything keeps the cells

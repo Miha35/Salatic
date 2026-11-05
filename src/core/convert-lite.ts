@@ -11,6 +11,10 @@ import { csvToBook, jsonToBook, xlsxToBook } from './readers/data';
 import { docxToDoc } from './readers/docx';
 import { docBinaryToDoc } from './readers/doc';
 import { xlsToBook } from './readers/xls';
+import { odsToBook, odtToDoc } from './readers/odf';
+import { bookToOds, docToOdt } from './writers/odf';
+import { rtfToDoc } from './readers/rtf';
+import { docToRtf } from './writers/rtf';
 import { htmlToDoc } from './readers/html';
 import { markdownToDoc } from './readers/markdown';
 import { textToDoc } from './readers/text';
@@ -32,7 +36,7 @@ export interface ConvertOutput {
   warnings: string[];
 }
 
-export const LITE_FORMATS: FormatId[] = ['docx', 'doc', 'txt', 'md', 'html', 'csv', 'tsv', 'json', 'xlsx', 'xls'];
+export const LITE_FORMATS: FormatId[] = ['docx', 'doc', 'odt', 'rtf', 'txt', 'md', 'html', 'csv', 'tsv', 'json', 'xlsx', 'xls', 'ods'];
 
 export function readLite(bytes: Uint8Array, from: FormatId, title?: string): { content: Content; warnings: string[] } {
   switch (from) {
@@ -54,6 +58,20 @@ export function readLite(bytes: Uint8Array, from: FormatId, title?: string): { c
       const { doc, warnings } = docxToDoc(bytes);
       doc.title ??= title;
       return { content: { kind: 'doc', doc }, warnings };
+    }
+    case 'odt': {
+      const { doc, warnings } = odtToDoc(bytes);
+      doc.title ??= title;
+      return { content: { kind: 'doc', doc }, warnings };
+    }
+    case 'rtf': {
+      const { doc, warnings } = rtfToDoc(bytes);
+      doc.title ??= title;
+      return { content: { kind: 'doc', doc }, warnings };
+    }
+    case 'ods': {
+      const { book, warnings } = odsToBook(bytes);
+      return { content: { kind: 'book', book }, warnings };
     }
     case 'csv':
       return { content: { kind: 'book', book: csvToBook(decodeText(bytes)) }, warnings: [] };
@@ -121,6 +139,18 @@ export function writeLite(content: Content, to: FormatId, opts: ConvertOptions =
       return out(utf8(bookToJson(asBook(content))), to);
     case 'xlsx':
       return out(bookToXlsx(asBook(content)), to);
+    case 'odt': {
+      const doc = asDoc(content, title);
+      const r = docToOdt({ ...doc, title: doc.title ?? title }, opts);
+      return out(r.data, to, r.warnings);
+    }
+    case 'ods':
+      return out(bookToOds(asBook(content)), to);
+    case 'rtf': {
+      const doc = asDoc(content, title);
+      const r = docToRtf({ ...doc, title: doc.title ?? title }, opts);
+      return out(r.data, to, r.warnings);
+    }
     default:
       throw new ConvertError(`Сохранение в формат ${FORMATS[to]?.label ?? to} здесь не поддерживается.`, 'unsupported');
   }
