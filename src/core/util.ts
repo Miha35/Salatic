@@ -25,7 +25,7 @@ export function decodeText(bytes: Uint8Array): string {
     return new TextDecoder('utf-16be').decode(bytes.subarray(2));
   }
   try {
-    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    return new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(bytes);
   } catch {
     for (const enc of ['windows-1251', 'latin1']) {
       try {

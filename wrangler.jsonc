@@ -1,0 +1,16 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "salatic",
+  "main": "src/server/index.ts",
+  "compatibility_date": "2026-10-01",
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    // SPA routes (/pdf-editor, …) fall back to index.html
+    "not_found_handling": "single-page-application",
+    // Only API requests invoke the Worker; static files are served directly from the edge cache
+    "run_worker_first": ["/api/*"]
+  },
+  "observability": { "enabled": true },
+  "limits": { "cpu_ms": 5000 }
+}

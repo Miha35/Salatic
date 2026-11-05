@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Salatic — конвертер и редактор файлов</title>
+    <meta name="description" content="Быстрый и приватный конвертер файлов: PDF в Word, Word в PDF, JPG в PDF, Excel в CSV и многое другое. Редакторы PDF, изображений и документов. Файлы обрабатываются прямо в браузере." />
+    <meta name="theme-color" content="#4f46e5" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <script src="/theme.js"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Перейти к содержимому</a>
+    <header class="topbar">
+      <div class="topbar__inner">
+        <a class="brand" href="/" data-link>
+          <svg class="brand__logo" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8" fill="currentColor"/><path d="M10 9h8l5 5v9a2 2 0 0 1-2 2H10a2 2 0 0 1-2-2V11a2 2 0 0 1 2-2Z" fill="#fff" opacity=".95"/><path d="M18 9v5h5" fill="none" stroke="#4f46e5" stroke-width="1.6"/><path d="M11.5 19.5h6m0 0-2.2-2.2m2.2 2.2-2.2 2.2" fill="none" stroke="#4f46e5" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span>Salatic</span>
+        </a>
+        <nav class="nav" aria-label="Разделы">
+          <a href="/" data-link data-nav="convert">Конвертер</a>
+          <a href="/pdf-editor" data-link data-nav="pdf">Редактор PDF</a>
+          <a href="/image-editor" data-link data-nav="image">Изображения</a>
+          <a href="/doc-editor" data-link data-nav="doc">Документы</a>
+        </nav>
+        <button class="icon-btn theme-toggle" type="button" aria-label="Сменить тему" title="Сменить тему"></button>
+      </div>
+    </header>
+    <main id="main" class="main" tabindex="-1"></main>
+    <footer class="footer">
+      <div class="footer__inner">
+        <span>Файлы обрабатываются локально в вашем браузере и не покидают устройство.</span>
+        <span class="footer__links"><a href="/api/formats" target="_blank" rel="noopener">API</a></span>
+      </div>
+    </footer>
+    <div class="toasts" aria-live="polite" aria-atomic="false"></div>
+    <script type="module" src="/src/app/main.ts"></script>
+  </body>
+</html>
