@@ -65,7 +65,7 @@ interface Group {
 }
 
 interface Pict {
-  kind?: 'png' | 'jpeg' | 'other';
+  kind?: 'png' | 'jpeg' | 'emf' | 'wmf' | 'other';
   w?: number;
   h?: number;
   wGoal?: number;
@@ -910,7 +910,11 @@ export class RtfReader {
         p.kind = 'jpeg';
         break;
       case 'emfblip':
+        p.kind = 'emf';
+        break;
       case 'wmetafile':
+        p.kind = 'wmf';
+        break;
       case 'macpict':
       case 'pmmetafile':
       case 'dibitmap':
@@ -1021,8 +1025,8 @@ export class RtfReader {
   }
 
   private picture(p: Pict, sink: Sink): void {
-    if (p.kind !== 'png' && p.kind !== 'jpeg') {
-      if (p.kind) this.warnings.add('Некоторые изображения (WMF/EMF) пропущены: формат не поддерживается.');
+    if (p.kind !== 'png' && p.kind !== 'jpeg' && p.kind !== 'emf' && p.kind !== 'wmf') {
+      if (p.kind) this.warnings.add('Некоторые изображения (PICT/DIB) пропущены: формат не поддерживается.');
       return;
     }
     let data = p.bin;
@@ -1039,7 +1043,8 @@ export class RtfReader {
     width = (width * p.scaleX) / 100;
     height = (height * p.scaleY) / 100;
     this.imageCount++;
-    const block: Block = { type: 'image', data, mime: p.kind === 'png' ? 'image/png' : 'image/jpeg', width: Math.round(width), height: Math.round(height) };
+    const mime = p.kind === 'png' ? 'image/png' : p.kind === 'jpeg' ? 'image/jpeg' : p.kind === 'emf' ? 'image/emf' : 'image/wmf';
+    const block: Block = { type: 'image', data, mime, width: Math.round(width), height: Math.round(height) };
     if (p.alt) block.alt = p.alt;
     // An image is a block of its own: split the paragraph around it
     const runs = sink.runs;

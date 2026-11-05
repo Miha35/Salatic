@@ -11,7 +11,8 @@
  * per-character fallback (DejaVu Sans → Noto Sans CJK → Noto Emoji), Word-style line
  * spacing from the fonts' Windows metrics, subsetting with HarfBuzz.
  */
-import { PDFDocument, PDFName, PDFString, rgb, type PDFImage, type PDFPage } from 'pdf-lib';
+import { clip, concatTransformationMatrix, degrees, endPath, PDFDocument, PDFName, PDFString, popGraphicsState, pushGraphicsState, rectangle, rgb, type PDFImage, type PDFPage } from 'pdf-lib';
+import { parseMetafile, type Metafile } from '../metafile';
 import type { Align, Block, Doc, FontFamily, ParaFormat, TextRun } from '../model';
 import { FontManager, styleOf, type FontKey, type FontLoader } from '../pdf-fonts';
 import type { Subsetter } from '../hb-subset';
@@ -42,6 +43,7 @@ export type Op =
   | { k: 'line'; x1: number; y1: number; x2: number; y2: number; w: number; color: Color; top: number; bottom: number }
   | { k: 'rect'; x: number; y: number; w: number; h: number; fill?: Color; stroke?: Color; clip: true; top: number; bottom: number }
   | { k: 'image'; x: number; y: number; w: number; h: number; img: PDFImage; top: number; bottom: number }
+  | { k: 'meta'; x: number; y: number; w: number; h: number; meta: Metafile; fonts: ({ key: FontKey; text: string }[] | null)[]; imgs: (PDFImage | null)[]; top: number; bottom: number }
   | { k: 'link'; x: number; y: number; w: number; h: number; url: string; top: number; bottom: number };
 
 export interface Box {
@@ -405,6 +407,87 @@ export class PdfWriter {
 
   // ------------------------------------------------------------------ blocks
 
+  /** Vector picture (EMF/WMF): parse, prepare its fonts and bitmaps; drawn by draw(). */
+  protected async metaOp(data: Uint8Array, x: number, y: number, w: number, h: number): Promise<Extract<Op, { k: 'meta' }> | null> {
+    const meta = parseMetafile(data);
+    if (!meta || !meta.cmds.length) {
+      this.warnings.add('Некоторые векторные рисунки (EMF/WMF) не удалось прочитать и они пропущены.');
+      return null;
+    }
+    const fonts: ({ key: FontKey; text: string }[] | null)[] = [];
+    const imgs: (PDFImage | null)[] = [];
+    for (const c of meta.cmds) {
+      if (c.k === 'text') {
+        const primary: FontKey = `${c.family}-${styleOf(c.bold, c.italic)}`;
+        await this.fm.load([primary]);
+        const need = new Set<FontKey>();
+        for (const ch of c.text) for (const k of this.fm.fallbacksFor(primary, ch.codePointAt(0)!)) need.add(k);
+        if (need.size) await this.fm.load(need);
+        const segs: { key: FontKey; text: string }[] = [];
+        for (const ch of c.text) {
+          const key = this.fm.resolve(primary, ch.codePointAt(0)!) ?? primary;
+          const t = this.fm.resolve(primary, ch.codePointAt(0)!) ? ch : '?';
+          this.fm.markUsed(key, t);
+          if (segs.length && segs[segs.length - 1].key === key) segs[segs.length - 1].text += t;
+          else segs.push({ key, text: t });
+        }
+        fonts.push(segs);
+        imgs.push(null);
+      } else if (c.k === 'image') {
+        fonts.push(null);
+        let img: PDFImage | null = null;
+        try {
+          img = await this.pdf.embedPng(c.png);
+        } catch {
+          img = null;
+        }
+        imgs.push(img);
+      } else {
+        fonts.push(null);
+        imgs.push(null);
+      }
+    }
+    return { k: 'meta', x, y, w, h, meta, fonts, imgs, top: y, bottom: y + h };
+  }
+
+  /** Draw a prepared metafile with its top-left corner at (x, top) in PDF coordinates (y up). */
+  protected drawMeta(page: PDFPage, o: Extract<Op, { k: 'meta' }>, x: number, top: number): void {
+    const m = o.meta;
+    const sx = o.w / m.width;
+    const sy = o.h / m.height;
+    page.pushOperators(pushGraphicsState(), rectangle(x, top - o.h, o.w, o.h), clip(), endPath(), concatTransformationMatrix(sx, 0, 0, sy, x, top));
+    m.cmds.forEach((c, i) => {
+      if (c.k === 'path') {
+        page.drawSvgPath(c.d, {
+          x: 0,
+          y: 0,
+          color: c.fill ? rgb(...hexColor(c.fill)) : undefined,
+          borderColor: c.stroke ? rgb(...hexColor(c.stroke)) : undefined,
+          borderWidth: c.stroke ? c.width : 0,
+          borderDashArray: c.dash,
+        });
+      } else if (c.k === 'image') {
+        const img = o.imgs[i];
+        if (img) page.drawImage(img, { x: c.x, y: -(c.y + c.h), width: c.w, height: c.h });
+      } else {
+        const segs = o.fonts[i] ?? [];
+        const width = segs.reduce((s, sg) => s + this.fm.width(sg.key, sg.text, c.size), 0);
+        let cx = c.anchor === 'middle' ? c.x - width / 2 : c.anchor === 'end' ? c.x - width : c.x;
+        const base = c.baseline === 'top' ? c.y + c.size * 0.88 : c.baseline === 'bottom' ? c.y - c.size * 0.21 : c.y;
+        const rad = (c.angle * Math.PI) / 180;
+        for (const sg of segs) {
+          // rotation is around the reference point, counter-clockwise like GDI escapement
+          const dx = cx - c.x;
+          const px = c.x + dx * Math.cos(rad) + (base - c.y) * Math.sin(rad);
+          const py = c.y - dx * Math.sin(rad) + (base - c.y) * Math.cos(rad);
+          page.drawText(sg.text, { x: px, y: -py, size: c.size, font: this.fm.pdfFont(sg.key), color: rgb(...hexColor(c.color)), rotate: c.angle ? degrees(c.angle) : undefined });
+          cx += this.fm.width(sg.key, sg.text, c.size);
+        }
+      }
+    });
+    page.pushOperators(popGraphicsState());
+  }
+
   protected async image(b: Extract<Block, { type: 'image' }>): Promise<PDFImage | null> {
     if (this.images.has(b.data)) return this.images.get(b.data)!;
     let data = b.data;
@@ -491,6 +574,18 @@ export class PdfWriter {
           boxes.push(...(await this.table(b, x, width, ctx, depth)));
           break;
         case 'image': {
+          if (b.mime === 'image/emf' || b.mime === 'image/wmf') {
+            let w = (b.width * 72) / 96;
+            let h = (b.height * 72) / 96;
+            const maxH = this.contentBottom - this.contentTop - 20;
+            const k = Math.min(1, width / w, maxH / h);
+            w *= k;
+            h *= k;
+            const ix = w < width ? x + (width - w) / 2 : x;
+            const op = await this.metaOp(b.data, ix, 0, w, h);
+            if (op) boxes.push({ height: h, ops: [op], spaceBefore: 4, spaceAfter: 8 });
+            break;
+          }
           const img = await this.image(b);
           if (!img) break;
           let w = (b.width * 72) / 96;
@@ -752,6 +847,9 @@ export class PdfWriter {
           break;
         case 'image':
           page.drawImage(o.img, { x: o.x, y: H - (offset + o.y + o.h - from), width: o.w, height: o.h });
+          break;
+        case 'meta':
+          this.drawMeta(page, o, o.x, H - (offset + o.y - from));
           break;
         case 'link': {
           const y1 = H - (offset + o.y + o.h - from);

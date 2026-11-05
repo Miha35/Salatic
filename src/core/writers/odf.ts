@@ -22,7 +22,7 @@ const FONT_DECLS =
   `<style:font-face style:name="Courier New" svg:font-family="'Courier New'" style:font-family-generic="modern" style:font-pitch="fixed"/>` +
   '<style:font-face style:name="Calibri" svg:font-family="Calibri" style:font-family-generic="swiss" style:font-pitch="variable"/>' +
   '</office:font-face-decls>';
-const IMAGE_EXT: Record<string, string> = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/bmp': 'bmp', 'image/svg+xml': 'svg', 'image/webp': 'webp' };
+const IMAGE_EXT: Record<string, string> = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/bmp': 'bmp', 'image/svg+xml': 'svg', 'image/webp': 'webp', 'image/emf': 'emf', 'image/wmf': 'wmf' };
 const BULLETS = ['•', '◦', '▪'];
 
 const pt = (v: number): string => `${Math.round(v * 100) / 100}pt`;
@@ -231,7 +231,7 @@ class OdtWriter {
     const title = b.alt ? `<svg:title>${escapeXml(b.alt)}</svg:title>` : '';
     return (
       `<draw:frame draw:style-name="${fr}" draw:name="Image${n}" text:anchor-type="as-char" svg:width="${cm(w)}" svg:height="${cm(h)}" draw:z-index="${n}">` +
-      `<draw:image xlink:href="${path}" xlink:type="simple" xlink:show="embed" xlink:actuate="onLoad" draw:mime-type="${b.mime}"/>${title}</draw:frame>`
+      `<draw:image xlink:href="${path}" xlink:type="simple" xlink:show="embed" xlink:actuate="onLoad" draw:mime-type="${b.mime === 'image/emf' || b.mime === 'image/wmf' ? b.mime.replace('/', '/x-') : b.mime}"/>${title}</draw:frame>`
     );
   }
 
@@ -444,7 +444,7 @@ class OdtWriter {
 function manifest(mime: string, pictures: string[]): string {
   const pic = (p: string): string => {
     const ext = p.split('.').pop() ?? '';
-    const type = ext === 'jpg' ? 'image/jpeg' : ext === 'svg' ? 'image/svg+xml' : `image/${ext}`;
+    const type = ext === 'jpg' ? 'image/jpeg' : ext === 'svg' ? 'image/svg+xml' : ext === 'emf' || ext === 'wmf' ? `image/x-${ext}` : `image/${ext}`;
     return `<manifest:file-entry manifest:full-path="${p}" manifest:media-type="${type}"/>`;
   };
   return (

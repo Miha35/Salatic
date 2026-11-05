@@ -337,7 +337,7 @@ class PptxReader {
     const rel = rid ? p.rels.get(rid) : undefined;
     const data = rel && !rel.external ? this.files[rel.target] : undefined;
     if (!data) return undefined;
-    const mime = sniffImageMime(data) ?? (/\.svg$/i.test(rel!.target) ? 'image/svg+xml' : /\.tiff?$/i.test(rel!.target) ? 'image/tiff' : /\.(emf|wmf)$/i.test(rel!.target) ? 'image/x-emf' : 'application/octet-stream');
+    const mime = sniffImageMime(data) ?? (/\.svg$/i.test(rel!.target) ? 'image/svg+xml' : /\.tiff?$/i.test(rel!.target) ? 'image/tiff' : /\.emf$/i.test(rel!.target) ? 'image/emf' : /\.wmf$/i.test(rel!.target) ? 'image/wmf' : 'application/octet-stream');
     return { data, mime };
   }
 
@@ -920,7 +920,7 @@ export function deckToDoc(deck: Deck): Doc {
     const order = (e: SlideElement): number => (e.kind === 'shape' && e.role === 'title' ? -1e9 : (e.kind === 'line' ? e.y1 : e.y) * 10000 + (e.kind === 'line' ? e.x1 : e.x));
     for (const e of [...els].sort((a, b) => order(a) - order(b))) {
       if (e.kind === 'shape' && e.text) paragraphsToBlocks(e.text, e.role, blocks);
-      else if (e.kind === 'image' && e.w > 20 && e.h > 20 && /^image\/(png|jpeg|gif|webp|bmp|svg\+xml)$/.test(e.mime)) {
+      else if (e.kind === 'image' && e.w > 20 && e.h > 20 && /^image\/(png|jpeg|gif|webp|bmp|svg\+xml|tiff|emf|wmf)$/.test(e.mime)) {
         blocks.push({ type: 'image', data: e.data, mime: e.mime, width: Math.round((e.w * 96) / 72), height: Math.round((e.h * 96) / 72), alt: e.alt });
       } else if (e.kind === 'table') {
         const rows = e.rows.map((r, ri) => ({

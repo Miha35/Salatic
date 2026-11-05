@@ -144,9 +144,9 @@ class RtfWriter {
   }
 
   private image(b: Extract<Block, { type: 'image' }>, maxW: number): string {
-    const kind = b.mime === 'image/png' ? 'pngblip' : b.mime === 'image/jpeg' ? 'jpegblip' : null;
+    const kind = b.mime === 'image/png' ? 'pngblip' : b.mime === 'image/jpeg' ? 'jpegblip' : b.mime === 'image/emf' ? 'emfblip' : b.mime === 'image/wmf' ? 'wmetafile8' : null;
     if (!kind) {
-      this.warnings.add('Некоторые изображения пропущены: RTF поддерживает только PNG и JPEG.');
+      this.warnings.add('Некоторые изображения пропущены: RTF поддерживает PNG, JPEG, EMF и WMF.');
       return '';
     }
     const maxH = this.pageH - this.margins.top - this.margins.bottom - 600;
@@ -155,10 +155,12 @@ class RtfWriter {
     const k = Math.min(1, maxW / w, maxH / h);
     w = Math.round(w * k);
     h = Math.round(h * k);
+    // RTF carries WMF without the 22-byte "placeable" header
+    const data = kind === 'wmetafile8' && b.data[0] === 0xd7 && b.data[1] === 0xcd ? b.data.subarray(22) : b.data;
     let hex = '';
     const parts: string[] = [];
-    for (let i = 0; i < b.data.length; i++) {
-      hex += b.data[i].toString(16).padStart(2, '0');
+    for (let i = 0; i < data.length; i++) {
+      hex += data[i].toString(16).padStart(2, '0');
       if (hex.length >= 128) {
         parts.push(hex);
         hex = '';

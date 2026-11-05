@@ -6,6 +6,7 @@ import { zipSync, type Zippable } from 'fflate';
 import { blockText, type Block, type Doc } from '../model';
 import { escapeXml, utf8 } from '../util';
 import { blocksToXhtml, CSS_FONT } from './text';
+import { metafileToSvgBytes } from '../metafile';
 
 const IMAGE_EXT: Record<string, string> = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/svg+xml': 'svg', 'image/webp': 'webp' };
 const MAX_CHAPTER_CHARS = 120_000;
@@ -67,6 +68,14 @@ export function docToEpub(doc: Doc): { data: Uint8Array; warnings: string[] } {
   const imageIds = new Map<Uint8Array, string>();
   const imageSrc = (b: Extract<Block, { type: 'image' }>): string => {
     let path = imageIds.get(b.data);
+    if (!path && (b.mime === 'image/emf' || b.mime === 'image/wmf')) {
+      const svg = metafileToSvgBytes(b.data);
+      if (svg) {
+        path = `images/img${images.length + 1}.svg`;
+        images.push({ path, mime: 'image/svg+xml', data: svg });
+        imageIds.set(b.data, path);
+      }
+    }
     if (!path) {
       const ext = IMAGE_EXT[b.mime];
       if (!ext) {

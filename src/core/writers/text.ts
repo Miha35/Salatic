@@ -1,9 +1,19 @@
 /** Doc → plain text, Markdown, HTML. */
+import { metafileToSvgBytes } from '../metafile';
 import type { Align, Block, Doc, FontFamily, ParaFormat, TextRun } from '../model';
 import { blockText } from '../model';
 import { bytesToBase64, escapeHtml, maxOf } from '../util';
 
 /** Footnotes collected while writing; references are numbered in reading order. */
+/** Image as a data URI; EMF/WMF pictures (which browsers cannot show) become SVG. */
+function dataUri(b: Extract<Block, { type: 'image' }>): string {
+  if (b.mime === 'image/emf' || b.mime === 'image/wmf') {
+    const svg = metafileToSvgBytes(b.data);
+    if (svg) return `data:image/svg+xml;base64,${bytesToBase64(svg)}`;
+  }
+  return `data:${b.mime};base64,${bytesToBase64(b.data)}`;
+}
+
 class Notes {
   list: Block[][] = [];
   add(blocks: Block[]): number {
@@ -204,7 +214,7 @@ export function docToMarkdown(doc: Doc): string {
             out.push(prefix + '---');
             break;
           case 'image':
-            out.push(`${prefix}![${mdEscape(b.alt ?? '')}](data:${b.mime};base64,${bytesToBase64(b.data)})`);
+            out.push(`${prefix}![${mdEscape(b.alt ?? '')}](${dataUri(b)})`);
             break;
         }
       }
@@ -331,7 +341,7 @@ function blocksHtml(blocks: Block[], notes: Notes, ctx: HtmlCtx = HTML): string 
         s += '</table>\n';
         break;
       case 'image':
-        s += `<p><img src="${ctx.imageSrc ? escapeHtml(ctx.imageSrc(b)) : `data:${b.mime};base64,${bytesToBase64(b.data)}`}" width="${b.width}" height="${b.height}" alt="${escapeHtml(b.alt ?? '')}"${ctx.xhtml ? '/' : ''}></p>\n`;
+        s += `<p><img src="${ctx.imageSrc ? escapeHtml(ctx.imageSrc(b)) : dataUri(b)}" width="${b.width}" height="${b.height}" alt="${escapeHtml(b.alt ?? '')}"${ctx.xhtml ? '/' : ''}></p>\n`;
         break;
       case 'code':
         s += `<pre><code>${escapeHtml(b.text)}</code></pre>\n`;

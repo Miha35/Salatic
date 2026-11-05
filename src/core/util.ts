@@ -202,5 +202,7 @@ export function sniffImageMime(data: Uint8Array): string | null {
   if (data[0] === 0x42 && data[1] === 0x4d) return 'image/bmp';
   if (data.length > 12 && data[0] === 0x52 && data[1] === 0x49 && data[8] === 0x57 && data[9] === 0x45) return 'image/webp';
   if ((data[0] === 0x49 && data[1] === 0x49 && data[2] === 0x2a && data[3] === 0) || (data[0] === 0x4d && data[1] === 0x4d && data[2] === 0 && data[3] === 0x2a)) return 'image/tiff';
+  if (data.length > 44 && data[0] === 1 && data[1] === 0 && data[2] === 0 && data[3] === 0 && data[40] === 0x20 && data[41] === 0x45 && data[42] === 0x4d && data[43] === 0x46) return 'image/emf';
+  if (data.length > 22 && ((data[0] === 0xd7 && data[1] === 0xcd && data[2] === 0xc6 && data[3] === 0x9a) || ((data[0] === 1 || data[0] === 2) && data[1] === 0 && data[2] === 9 && data[3] === 0 && data[5] === 3))) return 'image/wmf';
   return null;
 }

@@ -171,7 +171,8 @@ export class SlidePdfWriter extends PdfWriter {
       }
       case 'image': {
         if (/emf|wmf/.test(e.mime)) {
-          this.warnings.add('Некоторые изображения (EMF/WMF) не отображаются: формат не поддерживается.');
+          const op = await this.metaOp(e.data, e.x, e.y, e.w, e.h);
+          if (op) cmds.push((page) => this.rotated(page, e, e.rot, () => this.drawMeta(page, op, e.x, H - e.y)));
           return;
         }
         const img = await this.image({ type: 'image', data: e.data, mime: e.mime, width: 1, height: 1 });

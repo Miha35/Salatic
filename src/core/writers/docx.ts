@@ -13,7 +13,7 @@ const NS_ALL = `xmlns:w="${NS_W}" xmlns:r="${NS_R}" xmlns:wp="http://schemas.ope
 const REL = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
 const XML_HEAD = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n';
 const EMU_PER_PX = 9525;
-const IMAGE_EXT: Record<string, string> = { 'image/png': 'png', 'image/jpeg': 'jpeg', 'image/gif': 'gif', 'image/bmp': 'bmp' };
+const IMAGE_EXT: Record<string, string> = { 'image/png': 'png', 'image/jpeg': 'jpeg', 'image/gif': 'gif', 'image/bmp': 'bmp', 'image/emf': 'emf', 'image/wmf': 'wmf' };
 const BULLETS = ['•', '◦', '▪'];
 const FONT_NAME: Record<FontFamily, string> = { sans: 'Arial', serif: 'Times New Roman', mono: 'Courier New', calibri: 'Calibri' };
 const tw = (pt: number): number => Math.round(pt * 20);
@@ -408,6 +408,8 @@ function contentTypes(overrides: string[]): string {
     '<Default Extension="jpeg" ContentType="image/jpeg"/>' +
     '<Default Extension="gif" ContentType="image/gif"/>' +
     '<Default Extension="bmp" ContentType="image/bmp"/>' +
+    '<Default Extension="emf" ContentType="image/x-emf"/>' +
+    '<Default Extension="wmf" ContentType="image/x-wmf"/>' +
     '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>' +
     '<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>' +
     '<Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/>' +
