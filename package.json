@@ -1,0 +1,36 @@
+{
+  "name": "salatic",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Fast in-browser file converter and editor served by Cloudflare Workers",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "npm run typecheck && vite build",
+    "preview": "npm run build && wrangler dev",
+    "deploy": "npm run build && wrangler deploy",
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.test.json && tsc -p tsconfig.server.json",
+    "test": "vitest run",
+    "test:e2e": "node tests/e2e/run.mjs",
+    "check": "npm run typecheck && npm run test && npm run build && npm run test:e2e"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "dependencies": {
+    "@pdf-lib/fontkit": "^1.1.1",
+    "fflate": "^0.8.3",
+    "pdf-lib": "^1.17.1",
+    "pdfjs-dist": "^6.5.438"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261104.1",
+    "@expo-google-fonts/pt-mono": "^0.4.1",
+    "@expo-google-fonts/pt-sans": "^0.4.1",
+    "@types/node": "^22.20.5",
+    "typescript": "^5.9.3",
+    "vite": "^8.3.5",
+    "vitest": "^5.1.0",
+    "wrangler": "^4.157.0"
+  }
+}

@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.wrangler/
+.dev.vars
+*.log
+.DS_Store
+test-results/
+coverage/
+tests/e2e/.out/
+.scratch/
