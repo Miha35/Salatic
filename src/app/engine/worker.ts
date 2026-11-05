@@ -3,6 +3,7 @@
  * fonts) are loaded on first use only.
  */
 import hbSubsetUrl from 'harfbuzzjs/dist/harfbuzz-subset.wasm?url';
+import heifWasmUrl from 'libheif-js/libheif-wasm/libheif.wasm?url';
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { convert, readContent, writeContent, type ConvertEnv } from '../../core/convert';
 import { asDoc } from '../../core/convert-lite';
@@ -81,8 +82,27 @@ async function encodeImage(pixels: Uint8Array | Uint8ClampedArray, width: number
   return { data: encodePng(pixels, width, height, channels), mime: 'image/png' };
 }
 
+const heifWasm = async (): Promise<Uint8Array> => {
+  const res = await fetch(heifWasmUrl);
+  if (!res.ok) throw new Error('Не удалось загрузить декодер HEIC.');
+  return new Uint8Array(await res.arrayBuffer());
+};
+
+async function decodePages(bytes: Uint8Array, format: 'tiff' | 'heic'): Promise<import('../../core/image-decode').RgbaImage[]> {
+  const { decodeTiff, decodeHeic } = await import('../../core/image-decode');
+  return format === 'tiff' ? decodeTiff(bytes) : decodeHeic(bytes, heifWasm);
+}
+
 async function transcodeImage(data: Uint8Array, mime: string): Promise<{ data: Uint8Array; mime: string } | null> {
   if (typeof OffscreenCanvas === 'undefined' || typeof createImageBitmap === 'undefined') return null;
+  if (mime === 'image/tiff' || mime === 'image/heic' || mime === 'image/heif') {
+    // Formats browsers cannot decode: our own decoders, first page
+    const [page] = await decodePages(data, mime === 'image/tiff' ? 'tiff' : 'heic');
+    const canvas = new OffscreenCanvas(page.width, page.height);
+    canvas.getContext('2d')!.putImageData(new ImageData(new Uint8ClampedArray(page.data.buffer as ArrayBuffer, page.data.byteOffset, page.data.byteLength), page.width, page.height), 0, 0);
+    const blob = await canvas.convertToBlob({ type: 'image/png' });
+    return { data: new Uint8Array(await blob.arrayBuffer()), mime: 'image/png' };
+  }
   const bmp = await createImageBitmap(new Blob([data as BlobPart], { type: mime }));
   const canvas = new OffscreenCanvas(bmp.width, bmp.height);
   canvas.getContext('2d')!.drawImage(bmp, 0, 0);
@@ -157,6 +177,10 @@ async function handle(id: number, req: EngineRequest): Promise<{ result: unknown
       const { overlayTextLayers } = await import('../../core/pdf-tools');
       const data = await overlayTextLayers(req.base, req.layers);
       return { result: data, transfer: [data.buffer] };
+    }
+    case 'decodeImage': {
+      const pages = await decodePages(req.bytes, req.format);
+      return { result: pages, transfer: pages.map((p) => p.data.buffer) };
     }
     case 'composePdf': {
       const { composePdf } = await import('../../core/pdf-tools');

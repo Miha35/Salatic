@@ -2,7 +2,7 @@ import { acceptFor, detectFormat, DOC_READABLE, FORMATS, IMAGE_INPUTS, pipelineF
 import type { ConvertOptions } from '../../core/convert-lite';
 import { engine, EngineError } from '../engine/client';
 import type { ConvertResult } from '../engine/protocol';
-import { convertImage, pdfToImages, supportsAvifEncoding, toPdfImage, zipFiles } from '../raster';
+import { convertImage, pdfToImages, supportsAvifEncoding, toPdfImages, zipFiles } from '../raster';
 import { baseName, button, download, dropzone, formatBytes, h, handOff, icon, iconButton, note, onPasteFiles, prefs, readFile, toast } from '../ui';
 
 interface Options {
@@ -209,7 +209,8 @@ export function mount(root: HTMLElement, params: URLSearchParams): () => void {
       } else {
         const targets = targetsFor(det.format, { avif });
         item.target = preferred && targets.includes(preferred) ? preferred : (DEFAULT_TARGET[det.format] ?? targets[0] ?? null);
-        if (FORMATS[det.format].kind === 'image' && det.format !== 'svg') item.thumbUrl = URL.createObjectURL(file);
+        // Browsers cannot show TIFF/HEIC/SVG thumbnails directly: those keep the generic icon
+        if (FORMATS[det.format].kind === 'image' && !['svg', 'tiff', 'heic'].includes(det.format)) item.thumbUrl = URL.createObjectURL(file);
       }
       paint(item);
     }
@@ -455,11 +456,16 @@ export function mount(root: HTMLElement, params: URLSearchParams): () => void {
         item.result = files.length === 1 ? { data: files[0].data, name: files[0].name, mime: FORMATS[to].mime } : { data: zipFiles(files), name: `${base}-${to}.zip`, mime: 'application/zip' };
         if (files.length > 1) item.warnings = [`${files.length} страниц сохранены отдельными файлами в ZIP-архиве.`];
       } else if (pipe === 'raster') {
-        const data = await convertImage(item.file, from, to, item.opts.quality);
-        item.result = { data, name: `${base}.${FORMATS[to].ext}`, mime: FORMATS[to].mime };
+        const pages = await convertImage(item.file, from, to, item.opts.quality);
+        if (pages.length === 1) item.result = { data: pages[0], name: `${base}.${FORMATS[to].ext}`, mime: FORMATS[to].mime };
+        else {
+          const files = pages.map((data, i) => ({ name: `${base}-${String(i + 1).padStart(String(pages.length).length, '0')}.${FORMATS[to].ext}`, data }));
+          item.result = { data: zipFiles(files), name: `${base}-${to}.zip`, mime: 'application/zip' };
+          item.warnings = [`${pages.length} страниц сохранены отдельными файлами в ZIP-архиве.`];
+        }
       } else if (pipe === 'images-to-pdf') {
-        const img = await toPdfImage(item.file, from);
-        const data = await engine.run<Uint8Array>({ op: 'imagesToPdf', images: [img], opts: { pageSize: item.opts.imagePage } }, { transfer: [img.data.buffer], signal: ctrl.signal });
+        const imgs = await toPdfImages(item.file, from);
+        const data = await engine.run<Uint8Array>({ op: 'imagesToPdf', images: imgs, opts: { pageSize: item.opts.imagePage } }, { transfer: imgs.map((i) => i.data.buffer), signal: ctrl.signal });
         item.result = { data, name: `${base}.pdf`, mime: FORMATS.pdf.mime };
       } else throw new Error('Неподдерживаемое преобразование.');
       item.status = 'done';
@@ -509,7 +515,7 @@ export function mount(root: HTMLElement, params: URLSearchParams): () => void {
         return;
       }
       const inputs = [];
-      for (const it of images) inputs.push(await toPdfImage(it.file, it.format!));
+      for (const it of images) inputs.push(...(await toPdfImages(it.file, it.format!)));
       const data = await engine.run<Uint8Array>(
         { op: 'imagesToPdf', images: inputs, opts: { pageSize: images[0].opts.imagePage } },
         { transfer: inputs.map((i) => i.data.buffer) },

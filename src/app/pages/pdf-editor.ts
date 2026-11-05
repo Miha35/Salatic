@@ -3,7 +3,7 @@ import type { Annotation, PageSpec } from '../../core/pdf-tools';
 import { bytesToBase64 } from '../../core/util';
 import { engine } from '../engine/client';
 import { openPdf, pdfErrorMessage, renderPage, type PdfDoc } from '../pdfjs';
-import { toPdfImage, zipFiles } from '../raster';
+import { toPdfImage, toPdfImages, zipFiles } from '../raster';
 import { baseName, button, confirmDialog, download, dropzone, h, iconButton, note, onPasteFiles, pickFiles, readFile, takeHandoff, toast } from '../ui';
 
 // ---------------------------------------------------------------------------
@@ -200,7 +200,7 @@ export function mount(root: HTMLElement): () => void {
       }
       if (images.length) {
         const inputs = [];
-        for (const im of images) inputs.push(await toPdfImage(im.file, im.format!));
+        for (const im of images) inputs.push(...(await toPdfImages(im.file, im.format!)));
         const pdfBytes = await engine.run<Uint8Array>({ op: 'imagesToPdf', images: inputs, opts: { pageSize: 'fit' } }, { transfer: inputs.map((i) => i.data.buffer) });
         if (!sources.length) fileName = baseName(images[0].file.name);
         await addPdf('images.pdf', pdfBytes);

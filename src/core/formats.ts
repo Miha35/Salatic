@@ -3,6 +3,7 @@
 import { unzipSync } from 'fflate';
 import { extensionOf } from './util';
 import { Cfb } from './cfb';
+import { isHeic, isTiff } from './image-sniff';
 
 export type FormatId =
   | 'pdf'
@@ -28,7 +29,9 @@ export type FormatId =
   | 'bmp'
   | 'svg'
   | 'ico'
-  | 'avif';
+  | 'avif'
+  | 'tiff'
+  | 'heic';
 
 export type FormatKind = 'document' | 'data' | 'image';
 
@@ -94,14 +97,16 @@ export const FORMATS: Record<FormatId, FormatInfo> = {
   svg: { id: 'svg', label: 'SVG', ext: 'svg', mime: 'image/svg+xml', kind: 'image', description: 'Векторное изображение SVG' },
   ico: { id: 'ico', label: 'ICO', ext: 'ico', mime: 'image/x-icon', kind: 'image', description: 'Иконка ICO' },
   avif: { id: 'avif', label: 'AVIF', ext: 'avif', mime: 'image/avif', kind: 'image', description: 'Изображение AVIF' },
+  tiff: { id: 'tiff', label: 'TIFF', ext: 'tiff', mime: 'image/tiff', kind: 'image', description: 'Изображение TIFF (в т. ч. многостраничное)' },
+  heic: { id: 'heic', label: 'HEIC', ext: 'heic', mime: 'image/heic', kind: 'image', description: 'Фото HEIC/HEIF (iPhone)' },
 };
 
 /** Formats handled by the document/data engine (no canvas required). */
 export const DOC_READABLE: FormatId[] = ['pdf', 'docx', 'doc', 'odt', 'rtf', 'epub', 'pptx', 'txt', 'md', 'html', 'csv', 'tsv', 'json', 'xlsx', 'xls', 'ods'];
 export const DOC_WRITABLE: FormatId[] = ['pdf', 'docx', 'odt', 'rtf', 'epub', 'txt', 'md', 'html', 'csv', 'tsv', 'json', 'xlsx', 'ods'];
-export const IMAGE_INPUTS: FormatId[] = ['png', 'jpg', 'webp', 'gif', 'bmp', 'svg', 'ico', 'avif'];
+export const IMAGE_INPUTS: FormatId[] = ['png', 'jpg', 'webp', 'gif', 'bmp', 'svg', 'ico', 'avif', 'tiff', 'heic'];
 /** Image outputs the browser can always encode (avif is feature-detected at runtime). */
-export const IMAGE_OUTPUTS: FormatId[] = ['png', 'jpg', 'webp', 'bmp', 'ico'];
+export const IMAGE_OUTPUTS: FormatId[] = ['png', 'jpg', 'webp', 'bmp', 'tiff', 'ico'];
 
 const TARGETS: Partial<Record<FormatId, FormatId[]>> = {
   pdf: ['docx', 'odt', 'rtf', 'epub', 'txt', 'md', 'html', 'pdf', 'png', 'jpg'],
@@ -195,13 +200,15 @@ const EXT_MAP: Record<string, FormatId> = {
   svg: 'svg',
   ico: 'ico',
   avif: 'avif',
+  tif: 'tiff',
+  tiff: 'tiff',
+  heic: 'heic',
+  heif: 'heic',
+  hif: 'heic',
 };
 
 const UNSUPPORTED_HINTS: Record<string, string> = {
   ppt: 'Старый формат презентаций .ppt не поддерживается. Откройте файл в PowerPoint или LibreOffice и сохраните как .pptx.',
-  heic: 'Формат HEIC не поддерживается браузером. Сохраните фото как JPG.',
-  tif: 'Формат TIFF не поддерживается браузером. Сохраните изображение как PNG.',
-  tiff: 'Формат TIFF не поддерживается браузером. Сохраните изображение как PNG.',
 };
 
 export interface Detection {
@@ -259,6 +266,8 @@ export function detectFormat(name: string, bytes: Uint8Array): Detection {
   if (startsWith(bytes, [0x52, 0x49, 0x46, 0x46]) && startsWith(bytes, [0x57, 0x45, 0x42, 0x50], 8)) return { format: 'webp' };
   if (startsWith(bytes, [0x00, 0x00, 0x01, 0x00]) && (ext === 'ico' || ext === 'cur' || !ext)) return { format: 'ico' };
   if (startsWith(bytes, [0x66, 0x74, 0x79, 0x70], 4) && (startsWith(bytes, [0x61, 0x76, 0x69], 8) || ext === 'avif')) return { format: 'avif' };
+  if (isHeic(bytes)) return { format: 'heic' };
+  if (isTiff(bytes)) return { format: 'tiff' };
   if (startsWith(bytes, [0x42, 0x4d]) && (ext === 'bmp' || ext === 'dib' || !ext)) return { format: 'bmp' };
   if (startsWith(bytes, [0x7b, 0x5c, 0x72, 0x74, 0x66])) return { format: 'rtf' };
   if (startsWith(bytes, [0xd0, 0xcf, 0x11, 0xe0])) {

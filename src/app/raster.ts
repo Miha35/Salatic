@@ -5,6 +5,27 @@ import { FORMATS } from '../core/formats';
 import type { ImageInput } from '../core/pdf-tools';
 import { imageSize } from '../core/util';
 import { openPdf, pdfErrorMessage, renderPage } from './pdfjs';
+import { engine } from './engine/client';
+import type { RgbaImage } from '../core/image-decode';
+
+/** Formats the browser cannot decode itself (decoded in the engine worker). */
+const OWN_DECODERS = new Set<FormatId>(['tiff', 'heic']);
+
+function rgbaToCanvas(img: RgbaImage): HTMLCanvasElement {
+  const canvas = document.createElement('canvas');
+  canvas.width = img.width;
+  canvas.height = img.height;
+  canvas.getContext('2d')!.putImageData(new ImageData(new Uint8ClampedArray(img.data.buffer as ArrayBuffer, img.data.byteOffset, img.data.byteLength), img.width, img.height), 0, 0);
+  return canvas;
+}
+
+/** Every page/frame of an image (multi-page TIFF, HEIC collections); one canvas for other formats. */
+export async function decodePages(blob: Blob, format: FormatId): Promise<HTMLCanvasElement[]> {
+  if (!OWN_DECODERS.has(format)) return [await decodeToCanvas(blob, format)];
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  const pages = await engine.run<RgbaImage[]>({ op: 'decodeImage', bytes, format: format as 'tiff' | 'heic' }, { transfer: [bytes.buffer] });
+  return pages.map(rgbaToCanvas);
+}
 
 export class RasterError extends Error {}
 
@@ -50,6 +71,7 @@ function loadImageElement(url: string): Promise<HTMLImageElement> {
 
 /** Decode any browser-supported image into a canvas at natural size. */
 export async function decodeToCanvas(blob: Blob, format: FormatId): Promise<HTMLCanvasElement> {
+  if (OWN_DECODERS.has(format)) return (await decodePages(blob, format))[0];
   let source: CanvasImageSource;
   let w: number;
   let h: number;
@@ -182,6 +204,11 @@ export async function encodeCanvas(canvas: HTMLCanvasElement, to: FormatId, qual
     }
     case 'bmp':
       return encodeBmp(canvas);
+    case 'tiff': {
+      const { encodeTiff } = await import('../core/image-decode');
+      const d = canvas.getContext('2d')!.getImageData(0, 0, canvas.width, canvas.height);
+      return encodeTiff({ width: canvas.width, height: canvas.height, data: new Uint8Array(d.data.buffer) });
+    }
     case 'ico':
       return encodeIco(canvas);
     default:
@@ -199,9 +226,11 @@ export function supportsAvifEncoding(): Promise<boolean> {
   return avifSupport;
 }
 
-export async function convertImage(blob: Blob, from: FormatId, to: FormatId, quality: number): Promise<Uint8Array> {
-  const canvas = await decodeToCanvas(blob, from);
-  return encodeCanvas(canvas, to, quality);
+/** Convert an image; multi-page sources produce one output per page. */
+export async function convertImage(blob: Blob, from: FormatId, to: FormatId, quality: number): Promise<Uint8Array[]> {
+  const out: Uint8Array[] = [];
+  for (const canvas of await decodePages(blob, from)) out.push(await encodeCanvas(canvas, to, quality));
+  return out;
 }
 
 /** Prepare images for PDF embedding: JPEG/PNG pass through untouched, others are re-encoded. */
@@ -211,6 +240,25 @@ export async function toPdfImage(blob: Blob, format: FormatId): Promise<ImageInp
     const size = imageSize(bytes);
     if (size) return { data: bytes, mime: format === 'jpg' ? 'image/jpeg' : 'image/png', width: size.width, height: size.height };
   }
+  return (await toPdfImages(blob, format))[0];
+}
+
+/** All pages of an image prepared for PDF (photos as JPEG, everything else lossless PNG). */
+export async function toPdfImages(blob: Blob, format: FormatId): Promise<ImageInput[]> {
+  if (format === 'jpg' || format === 'png') return [await toPdfImageSingle(blob, format)];
+  const out: ImageInput[] = [];
+  for (const canvas of await decodePages(blob, format)) {
+    const photo = format === 'heic';
+    const data = await encodeCanvas(canvas, photo ? 'jpg' : 'png', 0.92);
+    out.push({ data, mime: photo ? 'image/jpeg' : 'image/png', width: canvas.width, height: canvas.height });
+  }
+  return out;
+}
+
+async function toPdfImageSingle(blob: Blob, format: FormatId): Promise<ImageInput> {
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  const size = imageSize(bytes);
+  if (size) return { data: bytes, mime: format === 'jpg' ? 'image/jpeg' : 'image/png', width: size.width, height: size.height };
   const canvas = await decodeToCanvas(blob, format);
   const data = await encodeCanvas(canvas, 'png');
   return { data, mime: 'image/png', width: canvas.width, height: canvas.height };

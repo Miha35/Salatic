@@ -94,7 +94,7 @@ export function mount(root: HTMLElement): () => void {
   const empty = h(
     'div',
     { class: 'empty' },
-    dropzone({ accept: 'image/*,.svg,.ico,.avif', multiple: false, title: 'Откройте изображение', hint: 'JPG, PNG, WebP, GIF, BMP, SVG, ICO, AVIF · перетащите файл или вставьте из буфера (Ctrl+V)', onFiles: (f) => void open(f[0]) }),
+    dropzone({ accept: 'image/*,.svg,.ico,.avif,.tif,.tiff,.heic,.heif', multiple: false, title: 'Откройте изображение', hint: 'JPG, PNG, WebP, GIF, BMP, SVG, ICO, AVIF, TIFF, HEIC · перетащите файл или вставьте из буфера (Ctrl+V)', onFiles: (f) => void open(f[0]) }),
   );
   const workspace = h('div', { class: 'workspace', hidden: true }, toolbar, h('div', { class: 'img-layout' }, stage, panel));
 
@@ -490,7 +490,7 @@ export function mount(root: HTMLElement): () => void {
   function renderToolbar(): void {
     const toolBtn = (t: Tool, icn: string, label: string): HTMLButtonElement => iconButton(icn, label, () => setTool(t), { 'aria-pressed': String(tool === t) });
     toolbar.replaceChildren(
-      button('Открыть', async () => void open((await pickFiles('image/*,.svg,.ico,.avif', false))[0]), { icon: 'folder', small: true }),
+      button('Открыть', async () => void open((await pickFiles('image/*,.svg,.ico,.avif,.tif,.tiff,.heic,.heif', false))[0]), { icon: 'folder', small: true }),
       h('span', { class: 'toolbar__sep' }),
       iconButton('undo', 'Отменить (Ctrl+Z)', undo, { disabled: !history.length }),
       iconButton('redo', 'Повторить (Ctrl+Y)', redo, { disabled: !future.length }),

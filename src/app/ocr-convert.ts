@@ -7,7 +7,7 @@ import { NO_TEXT_LAYER } from '../core/readers/pdf';
 import { engine } from './engine/client';
 import type { ConvertResult, ImagesPdfResult, PdfModelResult } from './engine/protocol';
 import { ocrCanvas, ocrPdfPages, pagesWithoutText, prepareForOcr } from './ocr';
-import { decodeToCanvas, toPdfImage } from './raster';
+import { decodePages, toPdfImages } from './raster';
 
 export type OcrMode = 'auto' | 'on' | 'off';
 type Progress = (v: number, label?: string) => void;
@@ -44,16 +44,24 @@ export async function pdfToDocWithOcr(bytes: Uint8Array, to: FormatId, opts: Con
 /** Image → DOCX/TXT: recognise the text of a photo or scan. */
 export async function imageToDocWithOcr(file: Blob, format: FormatId, to: FormatId, title: string, onProgress: Progress): Promise<ConvertResult> {
   onProgress(0.05, 'Подготовка изображения…');
-  const source = await decodeToCanvas(file, format);
-  const { canvas } = prepareForOcr(source);
-  // Unknown DPI: assume the long side of the picture is an A4 page (842 pt) to estimate font sizes
-  const pxPerPt = Math.max(canvas.width, canvas.height) / 842;
-  const r = await ocrCanvas(canvas, { pxPerPt, onProgress: (v, label) => onProgress(0.1 + v * 0.8, label) });
-  if (!r.blocks.length) throw new Error('Текст на изображении не найден.');
-  const doc: Doc = { title, blocks: r.blocks };
+  const pages = await decodePages(file, format);
+  const blocks: Block[] = [];
+  let confidence = 0;
+  for (let k = 0; k < pages.length; k++) {
+    const { canvas } = prepareForOcr(pages[k]);
+    // Unknown DPI: assume the long side of the picture is an A4 page (842 pt) to estimate font sizes
+    const pxPerPt = Math.max(canvas.width, canvas.height) / 842;
+    const label = pages.length > 1 ? ` (стр. ${k + 1} из ${pages.length})` : '';
+    const r = await ocrCanvas(canvas, { pxPerPt, onProgress: (v, l) => onProgress(0.1 + ((k + v) / pages.length) * 0.8, (l ?? '') + label) });
+    if (r.blocks.length && blocks.length) blocks.push({ type: 'pagebreak' });
+    blocks.push(...r.blocks);
+    confidence += r.confidence / pages.length;
+  }
+  if (!blocks.length) throw new Error('Текст на изображении не найден.');
+  const doc: Doc = { title, blocks };
   const out = await engine.run<ConvertResult>({ op: 'writeDoc', doc, to, opts: {}, title });
   const warnings = [OCR_NOTE];
-  if (r.confidence < 60) warnings.push(`Низкая уверенность распознавания (${Math.round(r.confidence)}%): изображение нечёткое или мелкое.`);
+  if (confidence < 60) warnings.push(`Низкая уверенность распознавания (${Math.round(confidence)}%): изображение нечёткое или мелкое.`);
   return { ...out, warnings: [...warnings, ...out.warnings] };
 }
 
@@ -71,15 +79,19 @@ export async function searchablePdf(bytes: Uint8Array, onProgress: Progress, sig
 
 /** Images → PDF with an invisible text layer (searchable scans). */
 export async function imagesToSearchablePdf(files: { file: Blob; format: FormatId }[], pageSize: 'fit' | 'a4' | 'letter', onProgress: Progress): Promise<Uint8Array> {
+  // Multi-page sources (TIFF) contribute one PDF page per image page
   const inputs = [];
-  for (const f of files) inputs.push(await toPdfImage(f.file, f.format));
+  const sources: HTMLCanvasElement[] = [];
+  for (const f of files) {
+    inputs.push(...(await toPdfImages(f.file, f.format)));
+    sources.push(...(await decodePages(f.file, f.format)));
+  }
   const { pdf, placements } = await engine.run<ImagesPdfResult>({ op: 'imagesToPdf', images: inputs, opts: { pageSize }, placements: true }, { transfer: inputs.map((i) => i.data.buffer) });
   const layers: TextLayer[] = [];
-  for (let k = 0; k < files.length; k++) {
-    const source = await decodeToCanvas(files[k].file, files[k].format);
-    const { canvas } = prepareForOcr(source);
+  for (let k = 0; k < sources.length; k++) {
+    const { canvas } = prepareForOcr(sources[k]);
     const pl = placements[k];
-    const r = await ocrCanvas(canvas, { pxPerPt: canvas.width / pl.w, pdf: true, onProgress: (v, label) => onProgress((k + v) / files.length, `${label} ${k + 1} из ${files.length}`) });
+    const r = await ocrCanvas(canvas, { pxPerPt: canvas.width / pl.w, pdf: true, onProgress: (v, label) => onProgress((k + v) / sources.length, `${label} ${k + 1} из ${sources.length}`) });
     if (!r.pdf) continue;
     // canvas pixels (y down) → page user space of the drawn image
     layers.push({ page: pl.page, pdf: r.pdf, width: canvas.width, height: canvas.height, toUser: [pl.w / canvas.width, 0, 0, -pl.h / canvas.height, pl.x, pl.y + pl.h] });
