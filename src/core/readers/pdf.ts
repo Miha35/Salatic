@@ -6,8 +6,8 @@
  * bold/italic (from font names) and embedded images, and drops repeating
  * headers/footers and page numbers.
  */
-import type { Align, Block, Doc, TableCell, TableRow, TextRun } from '../model';
-import { normalizeRuns, trimRuns } from '../model';
+import type { Align, Block, Doc, FontFamily, TableCell, TableRow, TextRun } from '../model';
+import { forEachRun, normalizeRuns, trimRuns } from '../model';
 import { encodePng } from '../png';
 import { ConvertError, cleanText, maxOf, minOf, tick } from '../util';
 
@@ -33,6 +33,7 @@ interface Frag {
   bold: boolean;
   italic: boolean;
   mono: boolean;
+  family: FontFamily;
 }
 
 interface Seg {
@@ -108,12 +109,19 @@ const median = (a: number[]): number => {
   return s[s.length >> 1];
 };
 
-function styleFromFontName(name: string | undefined, flags: { bold?: boolean; black?: boolean; italic?: boolean; isMonospace?: boolean }): { bold: boolean; italic: boolean; mono: boolean } {
+function styleFromFontName(
+  name: string | undefined,
+  flags: { bold?: boolean; black?: boolean; italic?: boolean; isMonospace?: boolean; isSerifFont?: boolean },
+): { bold: boolean; italic: boolean; mono: boolean; family: FontFamily } {
   const n = (name ?? '').replace(/^[A-Z]{6}\+/, '');
+  const mono = !!flags.isMonospace || /courier|mono|consolas|menlo|code/i.test(n);
+  // PostScript names: TimesNewRomanPSMT, ArialMT, Calibri-Bold, LiberationSerif…
+  const family: FontFamily = mono ? 'mono' : /calibri|carlito/i.test(n) ? 'calibri' : /times|georgia|garamond|cambria|caladea|book|palatino|serif|minion|baskerville|constantia/i.test(n.replace(/sans/i, '')) || (!/sans|arial|helvet|verdana|tahoma|segoe|roboto|open|pt ?sans|noto ?sans|liberationsans|dejavusans/i.test(n) && flags.isSerifFont) ? 'serif' : 'sans';
   return {
+    family,
     bold: !!flags.bold || !!flags.black || /bold|black|heavy|semibold|demibold|demi\b|extrabold|ultrabold|[-,]bd\b|w[6-9]\b/i.test(n),
     italic: !!flags.italic || /italic|oblique|[-,]it\b|kursiv/i.test(n),
-    mono: !!flags.isMonospace || /courier|mono|consolas|menlo|code/i.test(n),
+    mono,
   };
 }
 
@@ -265,7 +273,9 @@ class PdfLayout {
     if (f.bold) r.bold = true;
     if (f.italic) r.italic = true;
     if (f.mono) r.code = true;
+    r.font = f.family;
     if (sup && /^\d{1,3}$|^[*†‡]$/.test(text.trim())) r.sup = true;
+    else r.size = Math.round(f.fs * 2) / 2;
     return r;
   }
 
@@ -752,7 +762,7 @@ function headerFooterFilter(pages: { lines: Line[]; height: number }[]): (line: 
     for (const l of p.lines) if (zone(l, p.height)) seenHere.add(norm(PdfLayout.lineText(l)));
     for (const k of seenHere) counts.set(k, (counts.get(k) ?? 0) + 1);
   }
-  const repeated = new Set([...counts].filter(([, c]) => pages.length >= 3 && c >= pages.length * 0.5).map(([k]) => k));
+  const repeated = new Set([...counts].filter(([, c]) => pages.length >= 2 && c >= Math.max(2, pages.length * 0.5)).map(([k]) => k));
   return (l, i) => {
     if (!zone(l, pages[i].height)) return true;
     const t = PdfLayout.lineText(l).trim();
@@ -802,7 +812,7 @@ export async function pdfToDoc(bytes: Uint8Array, env: PdfReadEnv): Promise<{ do
       const tc = await page.getTextContent();
       // Operator list loads fonts (for bold/italic detection) and images.
       const graphics = await layout.pageGraphics(page as unknown as PdfPageLike, vpm, vp.width * vp.height, tc.items.some((it) => 'str' in it && it.str.trim()), seenImages);
-      const fontCache = new Map<string, { bold: boolean; italic: boolean; mono: boolean }>();
+      const fontCache = new Map<string, ReturnType<typeof styleFromFontName>>();
       const frags: Frag[] = [];
       for (const it of tc.items) {
         if (!('str' in it) || !it.str) continue;
@@ -812,7 +822,7 @@ export async function pdfToDoc(bytes: Uint8Array, env: PdfReadEnv): Promise<{ do
         if (fs < 1) continue;
         let style = fontCache.get(it.fontName);
         if (!style) {
-          let font: { name?: string; bold?: boolean; black?: boolean; italic?: boolean; isMonospace?: boolean } = {};
+          let font: { name?: string; bold?: boolean; black?: boolean; italic?: boolean; isMonospace?: boolean; isSerifFont?: boolean } = {};
           try {
             font = page.commonObjs.get(it.fontName) as typeof font;
           } catch {
@@ -977,5 +987,32 @@ export async function pdfToDoc(bytes: Uint8Array, env: PdfReadEnv): Promise<{ do
     );
   }
   if (!blocks.length) throw new ConvertError('В PDF не найдено ни текста, ни изображений для извлечения.');
-  return { doc: { title, blocks }, warnings };
+  // Document defaults: the dominant family and body size; runs keep only what differs
+  const famChars = new Map<FontFamily, number>();
+  forEachRun(blocks, (r) => r.font && !r.code && famChars.set(r.font, (famChars.get(r.font) ?? 0) + r.text.length));
+  const font = [...famChars].sort((a, b) => b[1] - a[1])[0]?.[0] ?? 'sans';
+  const size = layout.bodyFs;
+  forEachRun(blocks, (r) => {
+    if (r.font === font || (r.code && r.font === 'mono')) delete r.font;
+    if (r.size !== undefined && Math.abs(r.size - size) < 0.6) delete r.size;
+  });
+  const normalized = renormalize(blocks);
+  return { doc: { title, blocks: normalized, font, size }, warnings };
+}
+
+/** Merge runs that became identical after dropping default font/size. */
+function renormalize(blocks: Block[]): Block[] {
+  return blocks.map((b): Block => {
+    switch (b.type) {
+      case 'paragraph':
+      case 'heading':
+        return { ...b, runs: normalizeRuns(b.runs) };
+      case 'list':
+        return { ...b, items: b.items.map((it) => ({ blocks: renormalize(it.blocks) })) };
+      case 'table':
+        return { ...b, rows: b.rows.map((r) => ({ cells: r.cells.map((c) => ({ ...c, blocks: renormalize(c.blocks) })) })) };
+      default:
+        return b;
+    }
+  });
 }

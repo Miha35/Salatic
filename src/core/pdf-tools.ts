@@ -1,6 +1,7 @@
 /** PDF assembly: images → PDF, and page composition for the PDF editor (merge, reorder, rotate, annotate). */
-import { degrees, LineCapStyle, PDFDocument, rgb, type PDFFont, type PDFImage, type PDFPage } from 'pdf-lib';
-import type { FontLoader } from './writers/pdf';
+import { degrees, LineCapStyle, PDFDocument, rgb, type PDFImage, type PDFPage } from 'pdf-lib';
+import { FontManager, type FontKey, type FontLoader } from './pdf-fonts';
+import type { Subsetter } from './hb-subset';
 import { ConvertError } from './util';
 
 export interface ImageInput {
@@ -74,11 +75,38 @@ export interface PageSpec {
   annotations?: Annotation[];
 }
 
-export async function composePdf(sources: Uint8Array[], pages: PageSpec[], fonts?: FontLoader): Promise<Uint8Array> {
+export async function composePdf(sources: Uint8Array[], pages: PageSpec[], fonts?: FontLoader, subsetter?: Subsetter): Promise<Uint8Array> {
   if (!pages.length) throw new ConvertError('В документе не осталось страниц.');
   const out = await PDFDocument.create();
-  // fontkit is large: load it only when text annotations need an embedded font
-  if (pages.some((p) => p.annotations?.some((a) => a.type === 'text'))) out.registerFontkit((await import('@pdf-lib/fontkit')).default);
+  // Text annotations: fonts (with per-character fallback) are prepared and subset up front
+  const texts = pages.flatMap((p) => (p.annotations ?? []).filter((a): a is Extract<Annotation, { type: 'text' }> => a.type === 'text'));
+  let fm: FontManager | null = null;
+  const segmentsOf = new Map<string, { key: FontKey; text: string }[]>();
+  if (texts.length) {
+    if (!fonts) throw new ConvertError('Шрифты недоступны для добавления текста.');
+    out.registerFontkit((await import('@pdf-lib/fontkit')).default);
+    fm = new FontManager(fonts, subsetter);
+    for (const a of texts) {
+      const primary: FontKey = a.bold ? 'sans-bold' : 'sans-regular';
+      await fm.load([primary]);
+      const need = new Set<FontKey>();
+      for (const ch of a.text) for (const k of fm.fallbacksFor(primary, ch.codePointAt(0)!)) need.add(k);
+      await fm.load(need);
+      for (const line of a.text.split('\n')) {
+        const segs: { key: FontKey; text: string }[] = [];
+        for (const ch of line) {
+          const key = fm.resolve(primary, ch.codePointAt(0)!);
+          const c = key ? ch : '?';
+          const k = key ?? primary;
+          fm.markUsed(k, c);
+          if (segs.length && segs[segs.length - 1].key === k) segs[segs.length - 1].text += c;
+          else segs.push({ key: k, text: c });
+        }
+        segmentsOf.set(`${a.bold ? 1 : 0}|${line}`, segs);
+      }
+    }
+    await fm.embedAll(out);
+  }
   out.setCreator('Salatic');
   out.setProducer('Salatic');
   const loaded: PDFDocument[] = [];
@@ -103,8 +131,6 @@ export async function composePdf(sources: Uint8Array[], pages: PageSpec[], fonts
     if (idx.length) copies.set(s, await out.copyPages(loaded[s], idx));
   }
   const cursor = new Map<number, number>();
-  let font: PDFFont | null = null;
-  let boldFont: PDFFont | null = null;
   const imageCache = new Map<Uint8Array, PDFImage>();
 
   for (const spec of pages) {
@@ -120,21 +146,22 @@ export async function composePdf(sources: Uint8Array[], pages: PageSpec[], fonts
     for (const a of spec.annotations ?? []) {
       switch (a.type) {
         case 'text': {
-          if (!fonts) throw new ConvertError('Шрифты недоступны для добавления текста.');
-          const f = a.bold ? (boldFont ??= await out.embedFont(await fonts('bold'), { subset: true })) : (font ??= await out.embedFont(await fonts('regular'), { subset: true }));
-          const lines = a.text.split('\n');
-          lines.forEach((line, i) => {
-            // Successive lines move "down" in the rotated text frame
+          const rad = (a.rotate * Math.PI) / 180;
+          a.text.split('\n').forEach((line, i) => {
+            // Successive lines move "down" in the rotated text frame; segments advance along it
             const dy = i * a.size * 1.25;
-            const rad = (a.rotate * Math.PI) / 180;
-            page.drawText(line, {
-              x: a.x + Math.sin(rad) * dy,
-              y: a.y - Math.cos(rad) * dy,
-              size: a.size,
-              font: f,
-              color: rgb(...a.color),
-              rotate: degrees(a.rotate),
-            });
+            let adv = 0;
+            for (const seg of segmentsOf.get(`${a.bold ? 1 : 0}|${line}`) ?? []) {
+              page.drawText(seg.text, {
+                x: a.x + Math.sin(rad) * dy + Math.cos(rad) * adv,
+                y: a.y - Math.cos(rad) * dy + Math.sin(rad) * adv,
+                size: a.size,
+                font: fm!.pdfFont(seg.key),
+                color: rgb(...a.color),
+                rotate: degrees(a.rotate),
+              });
+              adv += fm!.width(seg.key, seg.text, a.size);
+            }
           });
           break;
         }

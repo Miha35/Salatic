@@ -13,8 +13,8 @@ import { blockText, runsText, type Block, type Doc } from '../../src/core/model'
 import { longPara, sample } from './sample';
 import { PDFDocument } from 'pdf-lib';
 import fontkit from '@pdf-lib/fontkit';
-import { FONT_FILES, hasCmd, loadFonts, loadPdfjs, pdfToText, renderPages, soffice, text } from './helpers';
-import type { FontKey } from '../../src/core/writers/pdf';
+import { FONT_FILES, hasCmd, loadFonts, loadPdfjs, loadSubsetter, pdfToText, renderPages, soffice, text } from './helpers';
+import type { FontKey } from '../../src/core/pdf-fonts';
 
 const flatText = (d: Doc): string => d.blocks.map(blockText).join('\n');
 
@@ -78,25 +78,32 @@ describe('DOCX writer/reader', () => {
 });
 
 describe('PDF writer', () => {
-  // Regression: some fonts (e.g. PT Sans) lose most glyph outlines when subset by
-  // @pdf-lib/fontkit, while the text layer stays intact – only a renderer notices.
-  it.skipIf(!hasCmd('pdftoppm'))('every shipped font renders identically when subset', async () => {
-    const pangram = 'Съешь же ещё этих мягких французских булок ЁЙЩЪ №1 «»— The quick brown fox 0123 {}[]';
+  // Regression: @pdf-lib/fontkit's subsetter corrupts many fonts (Carlito, PT Sans, CFF/CID fonts) while
+  // the text layer stays intact – only a renderer notices. Every shipped font must survive HarfBuzz subsetting.
+  it.skipIf(!hasCmd('pdftoppm'))('every shipped font renders identically after HarfBuzz subsetting', async () => {
+    const subsetter = await loadSubsetter();
+    const fontkit = (await import('@pdf-lib/fontkit')).default;
     for (const key of Object.keys(FONT_FILES) as FontKey[]) {
+      const pangram =
+        key === 'cjk' ? '漢字 中文测试 かなカナ 한국어 테스트 Ж' : key === 'emoji' ? '😀 👍 ❤ ✅ ⭐' : 'Съешь же ещё этих мягких булок ЁЙЩЪ №1 «»— The quick fox 0123 {}[] → ✓';
+      const full = await loadFonts(key);
+      const f = fontkit.create(full) as unknown as { hasGlyphForCodePoint(cp: number): boolean };
+      const text = [...pangram].filter((c) => c === ' ' || f.hasGlyphForCodePoint(c.codePointAt(0)!)).join('');
       const renders: Buffer[] = [];
-      for (const subset of [true, false]) {
+      for (const data of [subsetter(full, [...text].map((c) => c.codePointAt(0)!)), full]) {
         const doc = await PDFDocument.create();
         doc.registerFontkit(fontkit);
-        const font = await doc.embedFont(await loadFonts(key), { subset });
-        doc.addPage([700, 40]).drawText(pangram, { x: 8, y: 14, size: 14, font });
+        const font = await doc.embedFont(data, { subset: false });
+        doc.addPage([700, 40]).drawText(text, { x: 8, y: 14, size: 14, font });
         renders.push(renderPages(await doc.save(), 72)[0]);
       }
       expect(renders[0].equals(renders[1]), `${key} subset differs from the full font`).toBe(true);
     }
-  });
+  }, 120_000);
 
   it.skipIf(!hasCmd('pdftoppm'))('generated documents look the same as with fully embedded fonts', async () => {
-    const sub = renderPages((await docToPdf(sample, { fonts: loadFonts })).data);
+    const subsetter = await loadSubsetter();
+    const sub = renderPages((await docToPdf(sample, { fonts: loadFonts, subsetter })).data);
     const full = renderPages((await docToPdf(sample, { fonts: loadFonts }, { subsetFonts: false })).data);
     expect(sub.length).toBe(full.length);
     sub.forEach((page, i) => expect(page.equals(full[i]), `page ${i + 1}`).toBe(true));
@@ -116,17 +123,17 @@ describe('PDF writer', () => {
     }
   });
 
-  it('flows long documents over many pages and replaces unsupported characters', async () => {
+  it('flows long documents over many pages and draws any script with fallback fonts', async () => {
     const blocks: Block[] = [];
     for (let i = 0; i < 120; i++) blocks.push({ type: 'paragraph', runs: [{ text: `Абзац ${i + 1}. ${longPara}` }] });
-    blocks.push({ type: 'paragraph', runs: [{ text: 'Иероглифы 漢字, стрелка → и галочка ✓' }] });
-    const { data, warnings } = await docToPdf({ blocks }, { fonts: loadFonts });
-    expect(warnings.some((w) => w.includes('символы'))).toBe(true);
+    blocks.push({ type: 'paragraph', runs: [{ text: 'Иероглифы 漢字かな한국어, греческий αβγ, иврит שלום, стрелка → ⇒, галочка ✓, эмодзи 😀👍' }] });
+    const { data, warnings } = await docToPdf({ blocks }, { fonts: loadFonts, subsetter: await loadSubsetter() });
+    expect(warnings).toEqual([]);
+    expect(data.length).toBeLessThan(400_000); // CJK font subset, not 16 MB
     if (hasCmd('pdftotext')) {
       const t = pdfToText(data);
       expect(t).toContain('Абзац 120.');
-      expect(t).toMatch(/стрелка (→|->) и галочка (✓|v)/);
-      expect(t).toContain('Иероглифы ??');
+      for (const s of ['漢字かな한국어', 'αβγ', 'стрелка → ⇒', 'галочка ✓', '😀👍']) expect(t).toContain(s);
       expect(t.split('\f').length).toBeGreaterThan(10);
     }
   });

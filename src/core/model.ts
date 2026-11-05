@@ -6,6 +6,12 @@
 
 export type Align = 'left' | 'center' | 'right' | 'justify';
 
+/**
+ * Font families with metric-compatible free fonts:
+ * sans ≈ Arial/Helvetica, serif ≈ Times New Roman, mono ≈ Courier New, calibri ≈ Calibri.
+ */
+export type FontFamily = 'sans' | 'serif' | 'mono' | 'calibri';
+
 export interface TextRun {
   text: string;
   bold?: boolean;
@@ -19,6 +25,36 @@ export interface TextRun {
   link?: string;
   /** Hex colour without '#', e.g. "FF0000". */
   color?: string;
+  /** Background highlight, hex without '#'. */
+  highlight?: string;
+  /** Font family when it differs from the document default. */
+  font?: FontFamily;
+  /** Font size in points when it differs from the document default. */
+  size?: number;
+  /** Dynamic field rendered by page-aware writers (headers/footers). */
+  field?: 'page' | 'pages';
+  /** Footnote: this run is the reference mark (numbered by writers), `note` is its text. */
+  note?: Block[];
+}
+
+/** Paragraph formatting (all lengths in points). */
+export interface ParaFormat {
+  align?: Align;
+  /** Left indent. */
+  indent?: number;
+  /** First-line indent; negative values mean a hanging indent. */
+  firstLine?: number;
+  spaceBefore?: number;
+  spaceAfter?: number;
+  /** Line spacing as a multiple of single spacing. */
+  lineHeight?: number;
+}
+
+export interface PageSetup {
+  /** Page size in points. */
+  width: number;
+  height: number;
+  margins: { top: number; right: number; bottom: number; left: number };
 }
 
 export interface ListItem {
@@ -36,8 +72,8 @@ export interface TableRow {
 }
 
 export type Block =
-  | { type: 'paragraph'; runs: TextRun[]; align?: Align }
-  | { type: 'heading'; level: 1 | 2 | 3 | 4 | 5 | 6; runs: TextRun[]; align?: Align }
+  | ({ type: 'paragraph'; runs: TextRun[] } & ParaFormat)
+  | ({ type: 'heading'; level: 1 | 2 | 3 | 4 | 5 | 6; runs: TextRun[] } & ParaFormat)
   | { type: 'list'; ordered: boolean; items: ListItem[]; start?: number }
   | { type: 'table'; rows: TableRow[] }
   /** width/height are the intended display size in CSS pixels (96 dpi). */
@@ -50,6 +86,15 @@ export type Block =
 export interface Doc {
   title?: string;
   blocks: Block[];
+  /** Default font family and size (pt) of body text. */
+  font?: FontFamily;
+  size?: number;
+  /** Paragraph formatting applied when a block does not specify its own. */
+  defaults?: ParaFormat;
+  /** Repeated on every page by page-aware writers. */
+  header?: Block[];
+  footer?: Block[];
+  page?: PageSetup;
 }
 
 export type CellValue = string | number | boolean | null;
@@ -100,6 +145,13 @@ export function blockText(b: Block): string {
 }
 
 const sameStyle = (a: TextRun, b: TextRun): boolean =>
+  !a.note &&
+  !b.note &&
+  !a.field &&
+  !b.field &&
+  a.font === b.font &&
+  a.size === b.size &&
+  a.highlight === b.highlight &&
   !!a.bold === !!b.bold &&
   !!a.italic === !!b.italic &&
   !!a.underline === !!b.underline &&
@@ -114,7 +166,7 @@ const sameStyle = (a: TextRun, b: TextRun): boolean =>
 export function normalizeRuns(runs: TextRun[]): TextRun[] {
   const out: TextRun[] = [];
   for (const r of runs) {
-    if (!r.text) continue;
+    if (!r.text && !r.note && !r.field) continue;
     const prev = out[out.length - 1];
     if (prev && sameStyle(prev, r)) prev.text += r.text;
     else out.push({ ...r });
@@ -125,8 +177,9 @@ export function normalizeRuns(runs: TextRun[]): TextRun[] {
 /** Trim leading/trailing whitespace of a run list (not inside). */
 export function trimRuns(runs: TextRun[]): TextRun[] {
   const out = normalizeRuns(runs);
-  while (out.length && !out[0].text.replace(/^[ \t\r\n]+/, '')) out.shift();
-  while (out.length && !out[out.length - 1].text.replace(/[ \t\r\n]+$/, '')) out.pop();
+  const blank = (r: TextRun): boolean => !r.note && !r.field && !r.text.replace(/^[ \t\r\n]+/, '');
+  while (out.length && blank(out[0])) out.shift();
+  while (out.length && blank(out[out.length - 1])) out.pop();
   if (out.length) {
     out[0] = { ...out[0], text: out[0].text.replace(/^[ \t\r\n]+/, '') };
     const last = out.length - 1;
@@ -188,4 +241,29 @@ export function docToBook(doc: Doc): Workbook {
       return { name: `Таблица ${i + 1}`, rows, header: t.rows[0]?.cells.every((c) => c.header) ?? false };
     }),
   };
+}
+
+/** Map a font name (Word, CSS, PDF) to the closest supported family. */
+export function familyOf(name: string | undefined): FontFamily | undefined {
+  if (!name) return undefined;
+  const n = name.toLowerCase();
+  if (/calibri|carlito/.test(n)) return 'calibri';
+  if (/courier|consolas|mono|menlo|monaco|lucida console|source code|fira code/.test(n)) return 'mono';
+  if (/sans/.test(n)) return 'sans';
+  if (/times|georgia|garamond|cambria|caladea|book antiqua|palatino|serif|minion|baskerville|constantia|bookman|century schoolbook|didot|bodoni/.test(n)) return 'serif';
+  return 'sans';
+}
+
+/** Visit every run in a list of blocks (including nested lists, tables, quotes and notes). */
+export function forEachRun(blocks: Block[] | undefined, fn: (r: TextRun, b: Block) => void): void {
+  for (const b of blocks ?? []) {
+    if (b.type === 'paragraph' || b.type === 'heading') {
+      for (const r of b.runs) {
+        fn(r, b);
+        if (r.note) forEachRun(r.note, fn);
+      }
+    } else if (b.type === 'list') b.items.forEach((i) => forEachRun(i.blocks, fn));
+    else if (b.type === 'table') b.rows.forEach((row) => row.cells.forEach((c) => forEachRun(c.blocks, fn)));
+    else if (b.type === 'quote') forEachRun(b.blocks, fn);
+  }
 }

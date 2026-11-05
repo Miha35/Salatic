@@ -1,5 +1,5 @@
-import type { Align, Block, Doc, ListItem, TableRow, TextRun } from '../model';
-import { trimRuns } from '../model';
+import type { Align, Block, Doc, ListItem, ParaFormat, TableRow, TextRun } from '../model';
+import { familyOf, trimRuns } from '../model';
 import { findTag, htmlText, parseHtml, parseStyle, type HNode } from '../html';
 import { imageSize, parseDataUri, sniffImageMime } from '../util';
 
@@ -104,8 +104,76 @@ function styleFor(node: HNode, parent: InlineStyle): InlineStyle {
     const c = parseColor(st.color);
     s.color = c;
   }
-  if (st['font-family']?.includes('monospace')) s.code = true;
+  const face = st['font-family'] ?? (node.tag === 'font' ? node.attrs.face?.toLowerCase() : undefined);
+  if (face) {
+    s.font = familyOf(face);
+    if (s.font === 'mono' && /monospace|courier|consolas/.test(face)) s.code = true;
+  }
+  const size = st['font-size'] ? lengthPt(st['font-size']) : node.tag === 'font' && node.attrs.size ? FONT_TAG_SIZES[+node.attrs.size] : undefined;
+  if (size && size > 2 && size < 200) s.size = size;
+  const bg = st['background-color'] ?? (st.background && !/url\(/.test(st.background) ? st.background.split(/\s+/)[0] : undefined);
+  if (bg && !/transparent|inherit|initial|none|^#fff(fff)?$|white/.test(bg)) {
+    const c = parseColor(bg) ?? (/^#?0{3,6}$|black/.test(bg) ? '000000' : undefined);
+    if (c) s.highlight = c;
+  }
+  if (node.tag === 'mark') s.highlight ??= 'FFFF00';
   return s;
+}
+
+const FONT_TAG_SIZES: Record<number, number> = { 1: 7.5, 2: 10, 3: 12, 4: 13.5, 5: 18, 6: 24, 7: 36 };
+
+/** CSS length → points (relative units against a 12pt base). */
+export function lengthPt(v: string | undefined): number | undefined {
+  if (!v) return undefined;
+  const named: Record<string, number> = { 'xx-small': 7, 'x-small': 7.5, small: 10, medium: 12, large: 13.5, 'x-large': 18, 'xx-large': 24, 'xxx-large': 36 };
+  if (named[v]) return named[v];
+  const m = /^(-?[\d.]+)\s*(pt|px|em|rem|cm|mm|in|pc|%)?$/.exec(v.trim());
+  if (!m) return undefined;
+  const n = parseFloat(m[1]);
+  if (!Number.isFinite(n)) return undefined;
+  switch (m[2]) {
+    case 'px':
+      return Math.round(n * 0.75 * 100) / 100;
+    case 'em':
+    case 'rem':
+      return n * 12;
+    case '%':
+      return (n / 100) * 12;
+    case 'cm':
+      return n * 28.3465;
+    case 'mm':
+      return n * 2.83465;
+    case 'in':
+      return n * 72;
+    case 'pc':
+      return n * 12;
+    case 'pt':
+      return n;
+    default:
+      return n === 0 ? 0 : n * 0.75; // unitless lengths in HTML attributes are pixels
+  }
+}
+
+/** Paragraph formatting from an element's inline style. */
+function paraFormatOf(node: HNode): ParaFormat {
+  const st = parseStyle(node.attrs.style);
+  const f: ParaFormat = {};
+  const a = alignOf(node);
+  if (a) f.align = a;
+  const ml = lengthPt(st['margin-left'] ?? st['padding-left']);
+  if (ml) f.indent = ml;
+  const ti = lengthPt(st['text-indent']);
+  if (ti) f.firstLine = ti;
+  const mt = lengthPt(st['margin-top']);
+  if (mt !== undefined && st['margin-top']) f.spaceBefore = mt;
+  const mb = lengthPt(st['margin-bottom']);
+  if (mb !== undefined && st['margin-bottom']) f.spaceAfter = mb;
+  const lh = st['line-height'];
+  if (lh && lh !== 'normal') {
+    const m = /^([\d.]+)(%)?$/.exec(lh);
+    if (m) f.lineHeight = Math.round(((m[2] ? +m[1] / 100 : +m[1]) / 1.15) * 100) / 100;
+  }
+  return f;
 }
 
 function alignOf(node: HNode): Align | undefined {
@@ -148,6 +216,17 @@ function imageFromNode(node: HNode): Block | null {
 
 class Ctx {
   title?: string;
+  header?: Block[];
+  footer?: Block[];
+  /** Footnote bodies by element id (pandoc/markdown-it/our own HTML). */
+  notes = new Map<string, HNode>();
+}
+
+let currentCtx: Ctx | null = null;
+
+function noteFor(href: string | undefined): HNode | undefined {
+  if (!href?.startsWith('#') || !currentCtx) return undefined;
+  return currentCtx.notes.get(href.slice(1));
 }
 
 /** Fix whitespace across runs: collapse, drop spaces around line breaks. */
@@ -155,6 +234,11 @@ function tidyRuns(runs: TextRun[]): TextRun[] {
   const out: TextRun[] = [];
   let prevEndsSpace = true;
   for (const r of runs) {
+    if (r.note || r.field) {
+      out.push(r);
+      prevEndsSpace = false;
+      continue;
+    }
     let t = r.text;
     if (!r.code || !t.includes('\n')) {
       if (prevEndsSpace) t = t.replace(/^ +/, '');
@@ -178,6 +262,22 @@ function inlineRuns(node: HNode, style: InlineStyle, runs: TextRun[], pre: boole
     runs.push({ text: '\n', ...clean(style) });
     return;
   }
+  if (node.attrs['data-field'] === 'page' || node.attrs['data-field'] === 'pages') {
+    runs.push({ text: '', ...clean(style), field: node.attrs['data-field'] });
+    return;
+  }
+  if (node.tag === 'a') {
+    const li = noteFor(node.attrs.href);
+    if (li && currentCtx) {
+      const { sup: _s, link: _l, ...rest } = clean(style);
+      const ctx = currentCtx;
+      ctx.notes.delete(node.attrs.href!.slice(1)); // a note body is used once
+      const body = collectBlocks(li.children.filter((c) => !(c.tag === 'a' && /^#fnref|footnote-back/.test((c.attrs.href ?? '') + ' ' + (c.attrs.class ?? '')))), {}, ctx);
+      runs.push({ text: '', ...rest, note: stripBackrefs(body) });
+      return;
+    }
+    if (/^#fnref/.test(node.attrs.href ?? '') || /footnote-back/.test(node.attrs.class ?? '')) return;
+  }
   if (node.tag === 'img') {
     const img = imageFromNode(node);
     if (img) sink(img);
@@ -199,12 +299,19 @@ function clean(s: InlineStyle): InlineStyle {
   return o;
 }
 
-function collectBlocks(children: HNode[], style: InlineStyle, ctx: Ctx, align?: Align): Block[] {
+function stripBackrefs(blocks: Block[]): Block[] {
+  return blocks
+    .map((b) => (b.type === 'paragraph' ? { ...b, runs: trimRuns(b.runs.filter((r) => r.text.trim() !== '↩' && r.text.trim() !== '↩︎')) } : b))
+    .filter((b) => b.type !== 'paragraph' || b.runs.length);
+}
+
+function collectBlocks(children: HNode[], style: InlineStyle, ctx: Ctx, fmt?: ParaFormat | Align): Block[] {
   const out: Block[] = [];
   let runs: TextRun[] = [];
+  const f: ParaFormat = typeof fmt === 'string' ? { align: fmt } : (fmt ?? {});
   const flush = (): void => {
     const r = tidyRuns(runs);
-    if (r.length) out.push(align ? { type: 'paragraph', runs: r, align } : { type: 'paragraph', runs: r });
+    if (r.length) out.push({ type: 'paragraph', runs: r, ...f });
     runs = [];
   };
   const sink = (b: Block): void => {
@@ -215,7 +322,7 @@ function collectBlocks(children: HNode[], style: InlineStyle, ctx: Ctx, align?: 
     if (INLINE.has(c.tag)) inlineRuns(c, style, runs, false, sink);
     else {
       flush();
-      blockFrom(c, style, ctx, out, align);
+      blockFrom(c, style, ctx, out, f.align);
     }
   }
   flush();
@@ -248,7 +355,7 @@ function blockFrom(node: HNode, style: InlineStyle, ctx: Ctx, out: Block[], inhe
     case 'h6': {
       const { runs, images } = headingRuns(node, st);
       if (runs.length) {
-        const h: Block = { type: 'heading', level: +tag[1] as 1, runs };
+        const h: Block = { type: 'heading', level: +tag[1] as 1, runs, ...paraFormatOf(node) };
         if (align) h.align = align;
         out.push(h);
       }
@@ -262,7 +369,7 @@ function blockFrom(node: HNode, style: InlineStyle, ctx: Ctx, out: Block[], inhe
     case 'dd':
     case 'address': {
       const extra = tag === 'dt' ? { bold: true } : tag === 'figcaption' ? { italic: true } : {};
-      out.push(...collectBlocks(node.children, { ...st, ...extra }, ctx, align));
+      out.push(...collectBlocks(node.children, { ...st, ...extra }, ctx, { ...paraFormatOf(node), ...(align ? { align } : {}) }));
       break;
     }
     case 'ul':
@@ -334,6 +441,24 @@ function blockFrom(node: HNode, style: InlineStyle, ctx: Ctx, out: Block[], inhe
       if (img) out.push(img);
       break;
     }
+    case 'header':
+    case 'footer':
+    case 'section':
+    case 'div':
+    case 'aside': {
+      const cls = node.attrs.class ?? '';
+      if (/\bdoc-header\b/.test(cls)) {
+        ctx.header = collectBlocks(node.children, st, ctx);
+        break;
+      }
+      if (/\bdoc-footer\b/.test(cls)) {
+        ctx.footer = collectBlocks(node.children, st, ctx);
+        break;
+      }
+      if (/\bfootnotes\b/.test(cls) || node.attrs.role === 'doc-endnotes') break; // bodies were attached to their references
+      out.push(...collectBlocks(node.children, st, ctx, align));
+      break;
+    }
     default:
       out.push(...collectBlocks(node.children, st, ctx, align));
   }
@@ -346,7 +471,41 @@ export function htmlToDoc(html: string): Doc {
   const ctx = new Ctx();
   const titleNode = findTag(tree, 'title');
   if (titleNode) ctx.title = htmlText(titleNode).trim() || undefined;
+  // Footnote bodies: <li id="fn1"> inside a .footnotes container
+  const visit = (n: HNode, inNotes: boolean): void => {
+    const here = inNotes || /\bfootnotes\b/.test(n.attrs.class ?? '') || n.attrs.role === 'doc-endnotes';
+    if (here && n.tag === 'li' && n.attrs.id) ctx.notes.set(n.attrs.id, n);
+    for (const c of n.children) visit(c, here);
+  };
+  visit(tree, false);
   const body = findTag(tree, 'body') ?? tree;
-  const blocks = collectBlocks(body.children, {}, ctx);
-  return { title: ctx.title, blocks };
+  // Base font from a body{...} rule or the body's own style
+  let base: Record<string, string> = {};
+  const styleTag = findAllTags(tree, 'style').map((n) => htmlText(n)).join('\n');
+  for (const m of styleTag.matchAll(/(?:^|[}\s])body\s*\{([^}]*)\}/g)) base = { ...base, ...parseStyle(m[1]) };
+  base = { ...base, ...parseStyle(body.attrs.style) };
+  const saved = currentCtx;
+  currentCtx = ctx;
+  let blocks: Block[];
+  try {
+    blocks = collectBlocks(body.children, {}, ctx);
+  } finally {
+    currentCtx = saved;
+  }
+  const doc: Doc = { title: ctx.title, blocks };
+  const family = base['font-family'] ? familyOf(base['font-family']) : undefined;
+  if (family) doc.font = family;
+  const size = lengthPt(base['font-size']);
+  if (size && size > 4 && size < 72) doc.size = size;
+  if (ctx.header?.length) doc.header = ctx.header;
+  if (ctx.footer?.length) doc.footer = ctx.footer;
+  return doc;
+}
+
+function findAllTags(node: HNode, tag: string, out: HNode[] = []): HNode[] {
+  for (const c of node.children) {
+    if (c.tag === tag) out.push(c);
+    findAllTags(c, tag, out);
+  }
+  return out;
 }

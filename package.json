@@ -20,11 +20,15 @@
   "dependencies": {
     "@pdf-lib/fontkit": "^1.1.1",
     "fflate": "^0.8.3",
+    "harfbuzzjs": "1.6.4",
     "pdf-lib": "^1.17.1",
     "pdfjs-dist": "^6.5.438"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261104.1",
+    "@docx-editor.dev/fonts": "2.34.0",
+    "@docx-editor.dev/fonts-cjk": "2.34.0",
+    "@expo-google-fonts/noto-emoji": "0.4.8",
     "@types/node": "^22.20.5",
     "dejavu-fonts-ttf": "2.37.3",
     "playwright": "1.63.0",

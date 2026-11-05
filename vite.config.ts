@@ -31,6 +31,13 @@ function pdfjsAssets(): Plugin {
 
 export default defineConfig({
   plugins: [pdfjsAssets()],
+  resolve: {
+    // Font packages hide their files behind "exports"; reach them by path
+    alias: {
+      'office-fonts': resolve(import.meta.dirname, 'node_modules/@docx-editor.dev/fonts/assets'),
+      'cjk-fonts': resolve(import.meta.dirname, 'node_modules/@docx-editor.dev/fonts-cjk/assets'),
+    },
+  },
   build: {
     target: 'es2022',
     outDir: 'dist',

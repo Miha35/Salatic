@@ -18,7 +18,7 @@ import { docToHtml, docToMarkdown, docToText } from './writers/text';
 import { ConvertError, decodeText, utf8 } from './util';
 
 export interface ConvertOptions {
-  pageSize?: 'a4' | 'letter';
+  pageSize?: 'auto' | 'a4' | 'letter';
   /** CSV output delimiter. */
   csvDelimiter?: ',' | ';';
 }

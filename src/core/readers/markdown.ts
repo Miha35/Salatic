@@ -314,6 +314,9 @@ function parseLinkTarget(s: string, start: number): { url: string; end: number }
   return null;
 }
 
+/** Footnote definitions of the document being parsed ([^id]: text). */
+let footnoteDefs: Map<string, string[]> | null = null;
+
 /** Parse inline Markdown into runs. Block images are pushed into `images` when given. */
 export function parseInline(src: string, style: Style = {}, images?: Block[]): TextRun[] {
   const index = new InlineIndex(src);
@@ -352,6 +355,21 @@ export function parseInline(src: string, style: Style = {}, images?: Block[]): T
       buf += tick;
       i += tl;
       continue;
+    }
+    if (ch === '[' && src[i + 1] === '^' && footnoteDefs) {
+      const m = /^\[\^([^\]\s]+)\]/.exec(src.slice(i, i + 200));
+      const def = m ? footnoteDefs.get(m[1].toLowerCase()) : undefined;
+      if (m && def) {
+        emit();
+        const defs = footnoteDefs;
+        footnoteDefs = null; // no nested notes
+        const note = parseBlocks(def);
+        footnoteDefs = defs;
+        const { sup: _s, ...rest } = style;
+        runs.push({ text: '', ...rest, note });
+        i += m[0].length;
+        continue;
+      }
     }
     if ((ch === '!' && src[i + 1] === '[') || ch === '[') {
       const open = ch === '!' ? i + 1 : i;
@@ -453,7 +471,26 @@ export function markdownToDoc(md: string, title?: string): Doc {
       lines.splice(0, end + 1);
     }
   }
-  const blocks = parseBlocks(lines);
+  // Footnote definitions: "[^id]: text" plus indented continuation lines
+  const defs = new Map<string, string[]>();
+  for (let i = 0; i < lines.length; i++) {
+    const m = /^ {0,3}\[\^([^\]\s]+)\]:\s?(.*)$/.exec(lines[i]);
+    if (!m) continue;
+    const body = [m[2]];
+    let j = i + 1;
+    while (j < lines.length && (/^( {4}|\t)/.test(lines[j]) || (lines[j].trim() === '' && j + 1 < lines.length && /^( {4}|\t)/.test(lines[j + 1])))) body.push(lines[j++].replace(/^( {4}|\t)/, ''));
+    defs.set(m[1].toLowerCase(), body);
+    lines.splice(i, j - i);
+    i--;
+  }
+  const saved = footnoteDefs;
+  footnoteDefs = defs.size ? defs : null;
+  let blocks: Block[];
+  try {
+    blocks = parseBlocks(lines);
+  } finally {
+    footnoteDefs = saved;
+  }
   const firstHeading = blocks.find((b) => b.type === 'heading');
   if (!title && firstHeading && firstHeading.type === 'heading') title = firstHeading.runs.map((r) => r.text).join('');
   return { title, blocks };

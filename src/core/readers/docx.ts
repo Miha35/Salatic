@@ -1,13 +1,15 @@
 /** DOCX (WordprocessingML) → Doc. */
 import { unzipSync } from 'fflate';
-import type { Align, Block, Doc, ListItem, TableCell, TableRow, TextRun } from '../model';
-import { normalizeRuns } from '../model';
-import { child, childrenNamed, elements, find, parseXml, rootElement, textContent, type XNode } from '../xml';
+import type { Align, Block, Doc, FontFamily, ListItem, PageSetup, ParaFormat, TableCell, TableRow, TextRun } from '../model';
+import { familyOf, normalizeRuns, trimRuns } from '../model';
+import { child, childrenNamed, elements, find, findAll, parseXml, rootElement, textContent, type XNode } from '../xml';
 import { ConvertError, imageSize, sniffImageMime, unzipOffice } from '../util';
 
 type RStyle = Omit<TextRun, 'text'>;
 
 interface StyleDef {
+  type: string;
+  isDefault: boolean;
   name: string;
   basedOn?: string;
   rPr?: XNode;
@@ -38,13 +40,26 @@ function resolvePath(base: string, target: string): string {
   return parts.join('/');
 }
 
+const HIGHLIGHT: Record<string, string> = {
+  yellow: 'FFFF00', green: '00FF00', cyan: '00FFFF', magenta: 'FF00FF', blue: '0000FF', red: 'FF0000', darkBlue: '000080', darkCyan: '008080',
+  darkGreen: '008000', darkMagenta: '800080', darkRed: '800000', darkYellow: '808000', darkGray: '808080', lightGray: 'C0C0C0', black: '000000', white: 'FFFFFF',
+};
+
+const twip = (v: string | undefined): number | undefined => (v === undefined || v === '' || !Number.isFinite(+v) ? undefined : +v / 20);
+
 class DocxReader {
   private files: Record<string, Uint8Array>;
   private rels = new Map<string, Rel>();
+  private themeFonts = { major: '', minor: '' };
+  private defFont: FontFamily = 'calibri';
+  private defSize = 11;
+  private defPara: ParaFormat = {};
+  private footnotes = new Map<string, XNode>();
+  private notesPath = '';
   private styles = new Map<string, StyleDef>();
   private numFormats = new Map<string, Map<number, string>>(); // numId → ilvl → numFmt
   private mainPath = 'word/document.xml';
-  private fieldStack: { phase: 'instr' | 'result'; instr: string; link?: string }[] = [];
+  private fieldStack: { phase: 'instr' | 'result'; instr: string; link?: string; page?: 'page' | 'pages'; emitted?: boolean }[] = [];
   warnings: string[] = [];
 
   constructor(bytes: Uint8Array) {
@@ -61,9 +76,11 @@ class DocxReader {
       }
     }
     if (!this.files[this.mainPath]) throw new ConvertError('В архиве нет основного документа Word (word/document.xml).');
-    this.loadRels();
+    this.rels = this.loadRels(this.mainPath);
+    this.loadTheme();
     this.loadStyles();
     this.loadNumbering();
+    this.loadDefaults();
   }
 
   private xml(path: string): XNode | undefined {
@@ -71,14 +88,102 @@ class DocxReader {
     return f ? parseXml(decoder.decode(f)) : undefined;
   }
 
-  private loadRels(): void {
-    const dir = this.mainPath.slice(0, this.mainPath.lastIndexOf('/') + 1);
-    const name = this.mainPath.slice(dir.length);
+  private loadRels(partPath: string): Map<string, Rel> {
+    const map = new Map<string, Rel>();
+    const dir = partPath.slice(0, partPath.lastIndexOf('/') + 1);
+    const name = partPath.slice(dir.length);
     const rels = this.xml(`${dir}_rels/${name}.rels`);
     for (const r of childrenNamed(rootElement(rels ?? { name: '', attrs: {}, children: [] }), 'Relationship')) {
       const external = r.attrs.TargetMode === 'External';
-      this.rels.set(r.attrs.Id, { target: external ? r.attrs.Target : resolvePath(this.mainPath, r.attrs.Target), external });
+      map.set(r.attrs.Id, { target: external ? r.attrs.Target : resolvePath(partPath, r.attrs.Target), external });
+      (map as Map<string, Rel> & { types?: Map<string, string> }).types ??= new Map();
+      (map as Map<string, Rel> & { types: Map<string, string> }).types.set(r.attrs.Id, r.attrs.Type ?? '');
     }
+    return map;
+  }
+
+  private relOfType(type: string): Rel | undefined {
+    const types = (this.rels as Map<string, Rel> & { types?: Map<string, string> }).types;
+    for (const [id, t] of types ?? []) if (t.endsWith(`/${type}`)) return this.rels.get(id);
+    return undefined;
+  }
+
+  /** Run `fn` with the relationships of another part (header, footer, footnotes). */
+  private inPart<T>(path: string, fn: () => T): T {
+    const saved = this.rels;
+    this.rels = this.loadRels(path);
+    try {
+      return fn();
+    } finally {
+      this.rels = saved;
+    }
+  }
+
+  private loadTheme(): void {
+    const rel = this.relOfType('theme');
+    const theme = rel ? this.xml(rel.target) : undefined;
+    if (!theme) return;
+    this.themeFonts.major = find(find(theme, 'a:majorFont'), 'a:latin')?.attrs.typeface ?? '';
+    this.themeFonts.minor = find(find(theme, 'a:minorFont'), 'a:latin')?.attrs.typeface ?? '';
+  }
+
+  private fontName(rFonts: XNode | undefined): string | undefined {
+    if (!rFonts) return undefined;
+    const a = rFonts.attrs;
+    const theme = a['w:asciiTheme'] ?? a['w:hAnsiTheme'];
+    if (theme) return /major/i.test(theme) ? this.themeFonts.major || 'Calibri Light' : this.themeFonts.minor || 'Calibri';
+    return a['w:ascii'] ?? a['w:hAnsi'] ?? a['w:cs'] ?? a['w:eastAsia'];
+  }
+
+  /** Document defaults: docDefaults + the default paragraph style. */
+  private loadDefaults(): void {
+    const styles = this.xml(resolvePath(this.mainPath, 'styles.xml'));
+    const dd = find(styles, 'w:docDefaults');
+    const rPr = find(find(dd, 'w:rPrDefault'), 'w:rPr');
+    const pPr = find(find(dd, 'w:pPrDefault'), 'w:pPr');
+    let font = this.fontName(child(rPr, 'w:rFonts')) ?? (this.themeFonts.minor || 'Calibri');
+    let size = child(rPr, 'w:sz')?.attrs['w:val'];
+    let para = this.paraFormat(pPr, {});
+    const normal = [...this.styles.entries()].find(([, d]) => d.isDefault && d.type === 'paragraph')?.[1];
+    if (normal) {
+      font = this.fontName(child(normal.rPr, 'w:rFonts')) ?? font;
+      size = child(normal.rPr, 'w:sz')?.attrs['w:val'] ?? size;
+      para = this.paraFormat(normal.pPr, para);
+    }
+    this.defFont = familyOf(font) ?? 'calibri';
+    this.defSize = size ? +size / 2 : 10;
+    delete para.align;
+    this.defPara = para;
+  }
+
+  /** Paragraph formatting from a w:pPr, on top of `base`. */
+  private paraFormat(pPr: XNode | undefined, base: ParaFormat, size = this.defSize): ParaFormat {
+    const f: ParaFormat = { ...base };
+    if (!pPr) return f;
+    const sp = child(pPr, 'w:spacing');
+    if (sp) {
+      const before = twip(sp.attrs['w:before']);
+      const after = twip(sp.attrs['w:after']);
+      if (before !== undefined && sp.attrs['w:beforeAutospacing'] !== '1') f.spaceBefore = before;
+      if (after !== undefined && sp.attrs['w:afterAutospacing'] !== '1') f.spaceAfter = after;
+      const line = sp.attrs['w:line'];
+      if (line && Number.isFinite(+line)) {
+        const rule = sp.attrs['w:lineRule'] ?? 'auto';
+        f.lineHeight = rule === 'auto' ? +line / 240 : Math.max(0.6, +line / 20 / (size * 1.15));
+      }
+    }
+    const ind = child(pPr, 'w:ind');
+    if (ind) {
+      const left = twip(ind.attrs['w:left'] ?? ind.attrs['w:start']);
+      if (left !== undefined) f.indent = left;
+      const first = twip(ind.attrs['w:firstLine']);
+      const hanging = twip(ind.attrs['w:hanging']);
+      if (hanging) f.firstLine = -hanging;
+      else if (first !== undefined) f.firstLine = first;
+    }
+    const jc = child(pPr, 'w:jc')?.attrs['w:val'];
+    if (jc) f.align = jc === 'center' ? 'center' : jc === 'right' || jc === 'end' ? 'right' : jc === 'both' || jc === 'distribute' ? 'justify' : 'left';
+    return f;
   }
 
   private loadStyles(): void {
@@ -88,6 +193,8 @@ class DocxReader {
       const id = s.attrs['w:styleId'];
       if (!id) continue;
       this.styles.set(id, {
+        type: s.attrs['w:type'] ?? 'paragraph',
+        isDefault: s.attrs['w:default'] === '1',
         name: (child(s, 'w:name')?.attrs['w:val'] ?? id).toLowerCase(),
         basedOn: child(s, 'w:basedOn')?.attrs['w:val'],
         rPr: child(s, 'w:rPr'),
@@ -147,9 +254,18 @@ class DocxReader {
     const color = child(rPr, 'w:color')?.attrs['w:val'];
     if (color && /^[0-9a-fA-F]{6}$/.test(color) && color !== '000000') s.color = color.toUpperCase();
     else if (color === 'auto' || color === '000000') delete s.color;
-    const fonts = child(rPr, 'w:rFonts');
-    const face = fonts?.attrs['w:ascii'] ?? fonts?.attrs['w:hAnsi'] ?? '';
-    if (/courier|consolas|mono|menlo/i.test(face)) s.code = true;
+    const face = this.fontName(child(rPr, 'w:rFonts'));
+    if (face) {
+      s.font = familyOf(face);
+      if (s.font === 'mono') s.code = true;
+    }
+    const sz = child(rPr, 'w:sz')?.attrs['w:val'];
+    if (sz && Number.isFinite(+sz)) s.size = +sz / 2;
+    const hl = child(rPr, 'w:highlight')?.attrs['w:val'];
+    const shd = child(rPr, 'w:shd')?.attrs['w:fill'];
+    if (hl && HIGHLIGHT[hl]) s.highlight = HIGHLIGHT[hl];
+    else if (hl === 'none') delete s.highlight;
+    else if (shd && /^[0-9a-fA-F]{6}$/.test(shd) && shd.toUpperCase() !== 'FFFFFF') s.highlight = shd.toUpperCase();
     if (onOff(child(rPr, 'w:vanish'))) (s as RStyle & { hidden?: boolean }).hidden = true;
     return s;
   }
@@ -233,7 +349,15 @@ class DocxReader {
           break;
         }
         case 'w:fldSimple': {
-          const m = /HYPERLINK\s+"([^"]+)"/.exec(n.attrs['w:instr'] ?? '');
+          const instr = n.attrs['w:instr'] ?? '';
+          const pf = /^\s*(PAGE|NUMPAGES|SECTIONPAGES)\b/.exec(instr);
+          if (pf) {
+            const r0 = find(n, 'w:r');
+            const st = this.applyRPr({ ...base }, child(r0, 'w:rPr'));
+            out.push({ text: '', ...this.clean(st), field: pf[1] === 'PAGE' ? 'page' : 'pages' });
+            break;
+          }
+          const m = /HYPERLINK\s+"([^"]+)"/.exec(instr);
           this.inline(n.children, base, m ? m[1] : link, out, extra);
           break;
         }
@@ -263,7 +387,13 @@ class DocxReader {
     if (link ?? fieldLink) style = { ...style, link: link ?? fieldLink };
     const push = (text: string): void => {
       if (field?.phase === 'instr') return;
-      out.push({ text, ...style });
+      // Result of a PAGE/NUMPAGES field: replaced by a live field (drawn per page)
+      if (field?.phase === 'result' && field.page) {
+        if (!field.emitted) out.push({ text: '', ...this.clean(style), field: field.page });
+        field.emitted = true;
+        return;
+      }
+      out.push({ text, ...this.clean(style) });
     };
     for (const c of r.children) {
       if (typeof c === 'string') continue;
@@ -281,6 +411,8 @@ class DocxReader {
             field.phase = 'result';
             const m = /HYPERLINK\s+"([^"]+)"/.exec(field.instr);
             if (m && /^(https?:|mailto:)/i.test(m[1])) field.link = m[1];
+            const pf = /^\s*(PAGE|NUMPAGES|SECTIONPAGES)\b/.exec(field.instr);
+            if (pf) field.page = pf[1] === 'PAGE' ? 'page' : 'pages';
           } else if (t === 'end') this.fieldStack.pop();
           break;
         }
@@ -288,6 +420,9 @@ class DocxReader {
         case 'w:ptab':
           push('\t');
           break;
+        case 'w:footnoteRef':
+        case 'w:endnoteRef':
+          break; // the number mark inside a note body
         case 'w:br':
         case 'w:cr':
           if (c.attrs['w:type'] === 'page') out.push({ type: 'pagebreak' });
@@ -296,6 +431,12 @@ class DocxReader {
         case 'w:noBreakHyphen':
           push('-');
           break;
+        case 'w:footnoteReference':
+        case 'w:endnoteReference': {
+          const note = this.footnote(c.attrs['w:id'], c.name === 'w:endnoteReference');
+          if (note) out.push({ text: '', ...this.clean(style), note });
+          break;
+        }
         case 'w:sym': {
           const code = parseInt(c.attrs['w:char'] ?? '', 16);
           if (code >= 0xf020 && code <= 0xf0ff && /symbol|wingdings/i.test(c.attrs['w:font'] ?? '')) push('•');
@@ -339,9 +480,16 @@ class DocxReader {
     // Paragraph mark properties (w:pPr/w:rPr) apply to the mark only, not the runs → ignored.
     const level = this.headingLevel(styleId, pPr);
     if (level) delete base.bold; // headings are bold by definition; avoid redundant flags
-    const jcRaw = child(pPr, 'w:jc')?.attrs['w:val'];
-    const align: Align | undefined =
-      jcRaw === 'center' ? 'center' : jcRaw === 'right' || jcRaw === 'end' ? 'right' : jcRaw === 'both' || jcRaw === 'distribute' ? 'justify' : undefined;
+    // Paragraph formatting: style chain, then direct formatting; keep only what differs from defaults
+    let fmt: ParaFormat = { ...this.defPara };
+    for (const def of this.styleChain(styleId)) fmt = this.paraFormat(def.pPr, fmt);
+    fmt = this.paraFormat(pPr, fmt);
+    const own: ParaFormat = {};
+    for (const k of ['indent', 'firstLine', 'spaceBefore', 'spaceAfter', 'lineHeight'] as const) {
+      const v = fmt[k];
+      if (v !== undefined && Math.abs(v - (this.defPara[k] ?? 0)) > 0.01 && !(v === 0 && this.defPara[k] === undefined)) own[k] = Math.round(v * 100) / 100;
+    }
+    const align: Align | undefined = fmt.align && fmt.align !== 'left' ? fmt.align : undefined;
     const items: (TextRun | Block)[] = [];
     const extra: Block[] = [];
     this.inline(p.children, base, undefined, items, extra);
@@ -354,11 +502,11 @@ class DocxReader {
     const flush = (force: boolean): void => {
       const r = normalizeRuns(runs);
       runs = [];
-      const hasText = r.some((x) => x.text.trim());
+      const hasText = r.some((x) => x.text.trim() || x.note || x.field);
       if (!hasText && !force) return;
       let b: Block;
       if (level && hasText) b = { type: 'heading', level: level as 1, runs: r };
-      else b = { type: 'paragraph', runs: hasText ? r : [] };
+      else b = { type: 'paragraph', runs: hasText ? r : [], ...(num ? {} : own) };
       if (align) (b as { align?: Align }).align = align;
       blocks.push(isQuote && hasText ? { type: 'quote', blocks: [b] } : b);
       emittedText = true;
@@ -461,7 +609,57 @@ class DocxReader {
     let title: string | undefined;
     const core = this.xml('docProps/core.xml');
     if (core) title = textContent(find(core, 'dc:title')).trim() || undefined;
-    return { title, blocks };
+    const result: Doc = { title, blocks, font: this.defFont, size: this.defSize, defaults: this.defPara };
+    const sect = childrenNamed(body, 'w:sectPr').pop() ?? findAll(body, 'w:sectPr').pop();
+    if (sect) {
+      const pg = child(sect, 'w:pgSz');
+      const mar = child(sect, 'w:pgMar');
+      const w = twip(pg?.attrs['w:w']);
+      const h = twip(pg?.attrs['w:h']);
+      if (w && h) {
+        const m = (k: string, d: number): number => Math.abs(twip(mar?.attrs[`w:${k}`]) ?? d);
+        result.page = { width: w, height: h, margins: { top: m('top', 72), right: m('right', 72), bottom: m('bottom', 72), left: m('left', 72) } } satisfies PageSetup;
+      }
+      const part = (tag: 'w:headerReference' | 'w:footerReference'): Block[] | undefined => {
+        const refs = childrenNamed(sect, tag);
+        const ref = refs.find((r) => r.attrs['w:type'] === 'default') ?? refs[0];
+        const rel = ref ? this.rels.get(ref.attrs['r:id']) : undefined;
+        const xml = rel ? this.xml(rel.target) : undefined;
+        if (!rel || !xml) return undefined;
+        const blocksOf = this.inPart(rel.target, () => this.body(elements(rootElement(xml))));
+        return blocksOf.some((b) => b.type !== 'paragraph' || b.runs.length) ? blocksOf : undefined;
+      };
+      result.header = part('w:headerReference');
+      result.footer = part('w:footerReference');
+    }
+    return result;
+  }
+
+  /** Drop properties equal to the document defaults so runs stay compact. */
+  private clean(style: RStyle): RStyle {
+    const s = { ...style };
+    if (s.font === this.defFont) delete s.font;
+    if (s.size !== undefined && Math.abs(s.size - this.defSize) < 0.01) delete s.size;
+    delete (s as { hidden?: boolean }).hidden;
+    return s;
+  }
+
+  private footnote(id: string | undefined, endnote: boolean): Block[] | null {
+    if (!id) return null;
+    const kind = endnote ? 'endnotes' : 'footnotes';
+    const key = `${kind}:${id}`;
+    if (!this.footnotes.has(key)) {
+      const rel = this.relOfType(kind);
+      const xml = rel ? this.xml(rel.target) : undefined;
+      for (const n of childrenNamed(rootElement(xml ?? { name: '', attrs: {}, children: [] }), endnote ? 'w:endnote' : 'w:footnote')) this.footnotes.set(`${kind}:${n.attrs['w:id']}`, n);
+      this.notesPath = rel?.target ?? '';
+      if (!this.footnotes.has(key)) return null;
+    }
+    const node = this.footnotes.get(key)!;
+    const parse = (): Block[] => this.body(elements(node));
+    const blocks = this.notesPath ? this.inPart(this.notesPath, parse) : parse();
+    // Word puts a space after the number mark; trim it
+    return blocks.map((b) => (b.type === 'paragraph' ? { ...b, runs: trimRuns(b.runs) } : b)).filter((b) => b.type !== 'paragraph' || b.runs.length);
   }
 }
 

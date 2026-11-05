@@ -1,39 +1,44 @@
 /**
  * Doc → PDF layout engine on top of pdf-lib.
  *
- * Blocks are laid out into "boxes" (lists of drawing ops with coordinates relative
- * to the box top). Boxes are then placed onto pages; a box that does not fit is
- * sliced at a position where no atomic op (text line, image) is cut, so paragraphs
- * and table rows flow naturally across pages.
+ * Blocks are laid out into "boxes" (drawing ops with coordinates relative to the box
+ * top). Boxes are placed onto pages; a box that does not fit is sliced where no atomic
+ * op (text line, image) is cut, so paragraphs and table rows flow across pages.
+ * Footnotes are reserved at the bottom of the page that references them; headers and
+ * footers (with page-number fields) are drawn on every page once the total is known.
+ *
+ * Typography: metric-compatible fonts per family (Liberation Sans/Serif/Mono, Carlito),
+ * per-character fallback (DejaVu Sans → Noto Sans CJK → Noto Emoji), Word-style line
+ * spacing from the fonts' Windows metrics, subsetting with HarfBuzz.
  */
-import { PDFDocument, PDFName, PDFString, rgb, type PDFFont, type PDFImage, type PDFPage } from 'pdf-lib';
-import type { Align, Block, Doc, TextRun } from '../model';
+import { PDFDocument, PDFName, PDFString, rgb, type PDFImage, type PDFPage } from 'pdf-lib';
+import type { Align, Block, Doc, FontFamily, ParaFormat, TextRun } from '../model';
+import { FontManager, styleOf, type FontKey, type FontLoader } from '../pdf-fonts';
+import type { Subsetter } from '../hb-subset';
 import { cleanText, maxOf } from '../util';
 
-export type FontKey = 'regular' | 'bold' | 'italic' | 'boldItalic' | 'mono';
-
-/**
- * Loads a TrueType font by style. Fonts must subset cleanly with @pdf-lib/fontkit
- * (Liberation Sans + DejaVu Sans Mono do; PT Sans, for example, does not — see tests).
- */
-export type FontLoader = (key: FontKey) => Promise<Uint8Array>;
+export type { FontKey, FontLoader };
 
 export interface PdfWriteEnv {
   fonts: FontLoader;
-  /** Convert images pdf-lib cannot embed (GIF, BMP, WebP) to PNG/JPEG. */
+  /** HarfBuzz subsetter; without it fonts are embedded whole (correct but larger). */
+  subsetter?: Subsetter;
+  /** Convert images pdf-lib cannot embed (GIF, BMP, WebP, TIFF…) to PNG/JPEG. */
   transcodeImage?: (data: Uint8Array, mime: string) => Promise<{ data: Uint8Array; mime: string } | null>;
   onProgress?: (fraction: number) => void;
 }
 
 export interface PdfOptions {
-  pageSize?: 'a4' | 'letter';
-  /** Embed only used glyphs (default). Disabled in tests to compare renderings. */
+  /** 'auto' keeps the document's own page setup (DOCX), A4 otherwise. */
+  pageSize?: 'auto' | 'a4' | 'letter';
+  /** Subset embedded fonts (default). Disabled in tests to compare renderings. */
   subsetFonts?: boolean;
 }
+
 type Color = [number, number, number];
 
 type Op =
-  | { k: 'text'; x: number; y: number; top: number; bottom: number; text: string; font: FontKey; size: number; color: Color }
+  | { k: 'text'; x: number; y: number; top: number; bottom: number; text: string; font: FontKey; size: number; color: Color; field?: 'page' | 'pages'; fieldW?: number; anchor?: Align; noteRef?: number }
   | { k: 'line'; x1: number; y1: number; x2: number; y2: number; w: number; color: Color; top: number; bottom: number }
   | { k: 'rect'; x: number; y: number; w: number; h: number; fill?: Color; stroke?: Color; clip: true; top: number; bottom: number }
   | { k: 'image'; x: number; y: number; w: number; h: number; img: PDFImage; top: number; bottom: number }
@@ -55,160 +60,208 @@ interface Token {
   width: number;
   space: boolean;
   newline: boolean;
+  /** No line-break opportunity before this token (same word, different font). */
+  join: boolean;
   run: TextRun;
+  noteRef?: number;
+}
+
+/** Inherited layout context. */
+interface Ctx {
+  family: FontFamily;
+  size: number;
+  bold?: boolean;
+  italic?: boolean;
+  color?: Color;
+}
+
+interface Note {
+  num: number;
+  blocks: Block[];
+  boxes: Box[];
+  height: number;
 }
 
 const BLACK: Color = [0.1, 0.1, 0.12];
 const GRAY: Color = [0.45, 0.45, 0.5];
 const LINK: Color = [0.02, 0.39, 0.76];
-const BODY = 11;
-const LINE = 1.38;
-const HEADING_SIZES = [0, 22, 18, 15, 13, 12, 11];
-const FALLBACK_CHARS: Record<string, string> = {
-  '→': '->', '←': '<-', '↔': '<->', '⇒': '=>', '✓': 'v', '✔': 'v', '✕': 'x', '✗': 'x',
-  '☐': '[ ]', '☑': '[x]', '☒': '[x]', '◦': '-', '▪': '-', '●': '•', '○': 'o', '−': '-',
-  ' ': ' ', ' ': ' ', ' ': ' ', ' ': ' ', ' ': ' ', '‑': '-', '‐': '-', '\u2028': ' ',
-};
+const HEADING_SCALE = [0, 2, 1.64, 1.36, 1.18, 1.09, 1];
+const MM = 72 / 25.4;
+const FALLBACK_CHARS: Record<string, string> = { '\u2028': ' ', '\u2029': ' ' };
 
 const hexColor = (hex: string): Color => [parseInt(hex.slice(0, 2), 16) / 255, parseInt(hex.slice(2, 4), 16) / 255, parseInt(hex.slice(4, 6), 16) / 255];
 
 class PdfWriter {
   private pdf!: PDFDocument;
-  private fonts = new Map<FontKey, PDFFont>();
-  private charsets = new Map<FontKey, Set<number>>();
-  private widthCache = new Map<FontKey, Map<number, number>>();
+  private fm: FontManager;
   private images = new Map<Uint8Array, PDFImage | null>();
   warnings = new Set<string>();
-  private pageW: number;
-  private pageH: number;
-  private margin = 56.7;
+  private pageW = 595.28;
+  private pageH = 841.89;
+  private margins = { top: 20 * MM, right: 20 * MM, bottom: 20 * MM, left: 20 * MM };
+  private headerDist = 12.5 * MM;
+  private footerDist = 12.5 * MM;
+  private contentTop = 0;
+  private contentBottom = 0;
   private pages: PDFPage[] = [];
   private page!: PDFPage;
   private cursor = 0;
+  private base: Ctx = { family: 'sans', size: 11 };
+  private defaults: ParaFormat = {};
+  private notes: Note[] = [];
+  private placedNotes = new Set<number>();
+  private pageNotes: Note[] = [];
+  private headerBoxes: Box[] = [];
+  private footerBoxes: Box[] = [];
+  private headerBlocks: Block[] = [];
+  private footerBlocks: Block[] = [];
 
   constructor(
     private env: PdfWriteEnv,
     private opts: PdfOptions,
   ) {
-    const letter = opts.pageSize === 'letter';
-    this.pageW = letter ? 612 : 595.28;
-    this.pageH = letter ? 792 : 841.89;
+    this.fm = new FontManager(env.fonts, env.subsetter);
   }
 
-  private get contentW(): number {
-    return this.pageW - 2 * this.margin;
-  }
-
-  private get bottom(): number {
-    return this.pageH - this.margin;
+  get contentW(): number {
+    return this.pageW - this.margins.left - this.margins.right;
   }
 
   async init(doc: Doc): Promise<void> {
     this.pdf = await PDFDocument.create();
     this.pdf.registerFontkit((await import('@pdf-lib/fontkit')).default);
-    const needed = new Set<FontKey>(['regular', 'bold']);
-    const scan = (blocks: Block[]): void => {
-      for (const b of blocks) {
-        if (b.type === 'paragraph' || b.type === 'heading') for (const r of b.runs) needed.add(this.fontKey(r, b.type === 'heading'));
-        else if (b.type === 'list') b.items.forEach((i) => scan(i.blocks));
-        else if (b.type === 'table') b.rows.forEach((r) => r.cells.forEach((c) => scan(c.blocks)));
-        else if (b.type === 'quote') {
-          needed.add('italic');
-          scan(b.blocks);
-        } else if (b.type === 'code') needed.add('mono');
-      }
-    };
-    scan(doc.blocks);
-    const keys = [...needed];
-    const data = await Promise.all(keys.map((k) => this.env.fonts(k)));
-    for (const [i, key] of keys.entries()) {
-      const font = await this.pdf.embedFont(data[i], { subset: this.opts.subsetFonts !== false });
-      this.fonts.set(key, font);
-      this.charsets.set(key, new Set(font.getCharacterSet()));
-      this.widthCache.set(key, new Map());
+    const size = this.opts.pageSize ?? 'auto';
+    if (size === 'auto' && doc.page) {
+      this.pageW = doc.page.width;
+      this.pageH = doc.page.height;
+      this.margins = { ...doc.page.margins };
+    } else if (size === 'letter') {
+      this.pageW = 612;
+      this.pageH = 792;
     }
+    if (doc.page) this.margins = { ...doc.page.margins };
+    this.contentTop = this.margins.top;
+    this.contentBottom = this.pageH - this.margins.bottom;
+    this.base = { family: doc.font ?? 'sans', size: doc.size ?? 11 };
+    this.defaults = doc.defaults ?? {};
     if (doc.title) this.pdf.setTitle(doc.title);
     this.pdf.setCreator('Salatic');
     this.pdf.setProducer('Salatic');
     this.pdf.setLanguage('ru-RU');
   }
 
-  private fontKey(r: Omit<TextRun, 'text'>, forceBold = false): FontKey {
-    if (r.code) return 'mono';
-    const bold = forceBold || !!r.bold;
-    if (bold && r.italic) return 'boldItalic';
-    if (bold) return 'bold';
-    if (r.italic) return 'italic';
-    return 'regular';
+  // ------------------------------------------------------------------ text
+
+  private keyFor(r: TextRun, ctx: Ctx): FontKey {
+    const family: FontFamily = r.code ? 'mono' : (r.font ?? ctx.family);
+    return `${family}-${styleOf(!!(r.bold || ctx.bold), !!(r.italic || ctx.italic))}`;
   }
 
-  /** Replace characters missing from the font. */
-  private sanitize(text: string, font: FontKey): string {
-    const cs = this.charsets.get(font)!;
-    let out = '';
-    for (const ch of text) {
-      const cp = ch.codePointAt(0)!;
-      if (cs.has(cp) || cp === 32 || ch === '\n') out += ch;
-      else if (ch === '\t') out += '    ';
-      else if (ch === ' ') out += cs.has(0xa0) ? ch : ' ';
-      else if (FALLBACK_CHARS[ch] && [...FALLBACK_CHARS[ch]].every((c) => cs.has(c.codePointAt(0)!) || c === ' ')) out += FALLBACK_CHARS[ch];
-      else if (cp < 32) continue;
-      else {
-        out += '?';
-        this.warnings.add('Некоторые символы отсутствуют во встроенном шрифте и заменены на «?».');
-      }
-    }
-    return out;
+  private sizeFor(r: TextRun, ctx: Ctx): number {
+    const s = r.size ?? (r.code && !r.font ? ctx.size * 0.92 : ctx.size);
+    return r.sup || r.sub || r.note ? s * 0.68 : s;
   }
 
-  private measure(text: string, font: FontKey, size: number): number {
-    const cache = this.widthCache.get(font)!;
-    const f = this.fonts.get(font)!;
-    let w = 0;
-    for (const ch of text) {
-      const cp = ch.codePointAt(0)!;
-      let cw = cache.get(cp);
-      if (cw === undefined) {
-        cw = f.widthOfTextAtSize(ch, 1000);
-        cache.set(cp, cw);
-      }
-      w += cw;
-    }
-    return (w * size) / 1000;
-  }
-
-  private tokens(runs: TextRun[], baseSize: number, forceBold: boolean): Token[] {
+  /** Split runs into tokens; each token is drawn with a single font. */
+  private async tokens(runs: TextRun[], ctx: Ctx): Promise<Token[]> {
     const out: Token[] = [];
     for (const r of runs) {
-      const font = this.fontKey(r, forceBold);
-      const size = r.sup || r.sub ? baseSize * 0.68 : r.code ? baseSize * 0.92 : baseSize;
-      const text = this.sanitize(cleanText(r.text).replace(/\r/g, ''), font);
+      const primary = this.keyFor(r, ctx);
+      const size = this.sizeFor(r, ctx);
+      await this.fm.load([primary]);
+      if (!this.fm.loaded(primary)) throw new Error(`Шрифт ${primary} недоступен`);
+      if (r.note) {
+        const num = this.notes.length + 1;
+        this.notes.push({ num, blocks: r.note, boxes: [], height: 0 });
+        const text = String(num);
+        this.fm.markUsed(primary, text);
+        out.push({ text, font: primary, size, width: this.fm.width(primary, text, size), space: false, newline: false, join: true, run: r, noteRef: num });
+        continue;
+      }
+      if (r.field) {
+        const text = '00';
+        this.fm.markUsed(primary, '0123456789');
+        out.push({ text, font: primary, size, width: this.fm.width(primary, text, size), space: false, newline: false, join: false, run: r });
+        continue;
+      }
+      let text = cleanText(r.text).replace(/\r/g, '').replace(/\t/g, '    ');
+      text = text.replace(/[\u2028\u2029]/g, (c) => FALLBACK_CHARS[c]);
+      // Load fallback fonts needed for this text before measuring
+      const need = new Set<FontKey>();
+      for (const ch of text) for (const k of this.fm.fallbacksFor(primary, ch.codePointAt(0)!)) need.add(k);
+      if (need.size) await this.fm.load(need);
       for (const part of text.split(/(\n| +)/)) {
         if (!part) continue;
-        if (part === '\n') out.push({ text: '', font, size, width: 0, space: false, newline: true, run: r });
-        else if (part[0] === ' ') out.push({ text: part, font, size, width: this.measure(part, font, size), space: true, newline: false, run: r });
-        else out.push({ text: part, font, size, width: this.measure(part, font, size), space: false, newline: false, run: r });
+        if (part === '\n') {
+          out.push({ text: '', font: primary, size, width: 0, space: false, newline: true, join: false, run: r });
+          continue;
+        }
+        if (part[0] === ' ') {
+          const font = this.fm.has(primary, 32) ? primary : (this.fm.resolve(primary, 32) ?? primary);
+          this.fm.markUsed(font, part);
+          out.push({ text: part, font, size, width: this.fm.width(font, part, size), space: true, newline: false, join: false, run: r });
+          continue;
+        }
+        // Split the word where the font changes; CJK characters are break opportunities
+        let seg = '';
+        let segFont: FontKey | null = null;
+        // A word glued to the previous run (e.g. "**bold**text") must not break between them
+        const prev = out[out.length - 1];
+        let join = !!prev && !prev.space && !prev.newline;
+        const flush = (): void => {
+          if (!seg || !segFont) return;
+          this.fm.markUsed(segFont, seg);
+          out.push({ text: seg, font: segFont, size, width: this.fm.width(segFont, seg, size), space: false, newline: false, join, run: r });
+          seg = '';
+          join = true;
+        };
+        for (const ch of part) {
+          const cp = ch.codePointAt(0)!;
+          let font = this.fm.resolve(primary, cp);
+          let c = ch;
+          if (!font) {
+            this.fm.missing = true;
+            font = primary;
+            c = '?';
+          }
+          const cjk = font === 'cjk';
+          if (font !== segFont || cjk) {
+            flush();
+            segFont = font;
+            if (cjk) join = false;
+          }
+          seg += c;
+          if (cjk) {
+            flush();
+            join = false; // a CJK character may be followed by a line break
+          }
+        }
+        flush();
       }
     }
     return out;
   }
 
-  /** Break tokens into lines no wider than `width`. */
-  private breakLines(tokens: Token[], width: number, keepIndent = false): Token[][] {
+  /** Group tokens into unbreakable units (a word possibly made of several fonts). */
+  private breakLines(tokens: Token[], firstWidth: number, width: number, keepIndent = false): Token[][] {
     const lines: Token[][] = [];
     let line: Token[] = [];
     let w = 0;
     let afterNewline = true;
+    const lineWidth = (): number => (lines.length ? width : firstWidth);
     const push = (): void => {
       while (line.length && line[line.length - 1].space) line.pop();
       lines.push(line);
       line = [];
       w = 0;
     };
-    for (const t of tokens) {
+    let i = 0;
+    while (i < tokens.length) {
+      const t = tokens[i];
       if (t.newline) {
         push();
         afterNewline = true;
+        i++;
         continue;
       }
       if (t.space) {
@@ -216,79 +269,126 @@ class PdfWriter {
           line.push(t);
           w += t.width;
         }
+        i++;
         continue;
       }
       afterNewline = false;
-      if (w + t.width <= width + 0.01 || !line.length || line.every((x) => x.space)) {
-        if (t.width > width && !line.length) {
-          // Hard-break a word that is wider than the line
-          let chunk = '';
-          for (const ch of t.text) {
-            const cw = this.measure(chunk + ch, t.font, t.size);
-            if (cw > width && chunk) {
-              line.push({ ...t, text: chunk, width: this.measure(chunk, t.font, t.size) });
-              push();
-              chunk = ch;
-            } else chunk += ch;
+      // Collect the unit
+      const unit: Token[] = [t];
+      let j = i + 1;
+      while (j < tokens.length && tokens[j].join && !tokens[j].space && !tokens[j].newline) unit.push(tokens[j++]);
+      const uw = unit.reduce((s, x) => s + x.width, 0);
+      const limit = lineWidth();
+      if (w + uw <= limit + 0.01 || !line.length || line.every((x) => x.space)) {
+        if (uw > limit && !line.some((x) => !x.space)) {
+          // Hard-break a unit wider than the line, character by character
+          line = [];
+          w = 0;
+          for (const u of unit) {
+            let chunk = '';
+            for (const ch of u.text) {
+              const cw = this.fm.width(u.font, chunk + ch, u.size);
+              if (w + cw > lineWidth() && (chunk || line.length)) {
+                if (chunk) line.push({ ...u, text: chunk, width: this.fm.width(u.font, chunk, u.size) });
+                push();
+                chunk = ch;
+              } else chunk += ch;
+            }
+            if (chunk) {
+              const cw = this.fm.width(u.font, chunk, u.size);
+              line.push({ ...u, text: chunk, width: cw });
+              w += cw;
+            }
           }
-          if (chunk) {
-            const cw = this.measure(chunk, t.font, t.size);
-            line.push({ ...t, text: chunk, width: cw });
-            w = cw;
-          }
-          continue;
+        } else {
+          line.push(...unit);
+          w += uw;
         }
-        line.push(t);
-        w += t.width;
       } else {
         push();
-        line.push(t);
-        w = t.width;
+        line.push(...unit);
+        w = uw;
       }
+      i = j;
     }
     if (line.length || !lines.length) push();
     return lines;
   }
 
-  /** Lay out a run list as a paragraph box. */
-  private textBox(runs: TextRun[], x: number, width: number, opts: { size?: number; bold?: boolean; align?: Align; color?: Color; spaceBefore?: number; spaceAfter?: number; italic?: boolean; keepIndent?: boolean }): Box {
-    const size = opts.size ?? BODY;
-    const effRuns = opts.italic ? runs.map((r) => ({ ...r, italic: true })) : runs;
-    const lines = this.breakLines(this.tokens(effRuns, size, !!opts.bold), width, opts.keepIndent);
+  private para(b: ParaFormat | undefined, fallback: ParaFormat): Required<Omit<ParaFormat, 'align'>> & { align?: Align } {
+    const d = this.defaults;
+    return {
+      align: b?.align ?? fallback.align,
+      indent: b?.indent ?? fallback.indent ?? 0,
+      firstLine: b?.firstLine ?? fallback.firstLine ?? d.firstLine ?? 0,
+      spaceBefore: b?.spaceBefore ?? fallback.spaceBefore ?? d.spaceBefore ?? 0,
+      spaceAfter: b?.spaceAfter ?? fallback.spaceAfter ?? d.spaceAfter ?? this.base.size * 0.55,
+      lineHeight: b?.lineHeight ?? fallback.lineHeight ?? d.lineHeight ?? 1.2,
+    };
+  }
+
+  /** Lay out runs as a paragraph box. */
+  private async textBox(runs: TextRun[], x: number, width: number, ctx: Ctx, p: ReturnType<PdfWriter['para']>, keepIndent = false): Promise<Box> {
+    const tokens = await this.tokens(runs, ctx);
+    const left = x + p.indent;
+    const firstX = left + p.firstLine;
+    const lines = this.breakLines(tokens, width - p.indent - p.firstLine, width - p.indent, keepIndent);
     const ops: Op[] = [];
     let y = 0;
+    const baseKey = this.keyFor({ text: '' }, ctx);
+    await this.fm.load([baseKey]);
     lines.forEach((line, li) => {
-      const maxSize = line.reduce((m, t) => Math.max(m, t.run.sup || t.run.sub ? t.size / 0.68 : t.size), size);
-      const lh = maxSize * LINE;
-      const baseline = y + maxSize * 1.02;
-      const lineW = line.reduce((s, t) => s + t.width, 0);
-      let cx = x;
-      let extraPerSpace = 0;
-      if (opts.align === 'center') cx = x + (width - lineW) / 2;
-      else if (opts.align === 'right') cx = x + width - lineW;
-      else if (opts.align === 'justify' && li < lines.length - 1) {
-        const spaces = line.filter((t) => t.space).length;
-        if (spaces) extraPerSpace = (width - lineW) / spaces;
+      const lx = li === 0 ? firstX : left;
+      const lw = li === 0 ? width - p.indent - p.firstLine : width - p.indent;
+      // Line box from the tallest font on the line
+      let asc = 0;
+      let desc = 0;
+      let natural = 0;
+      const measureSet = line.length ? line : [{ font: baseKey, size: ctx.size, run: {} as TextRun } as Token];
+      for (const t of measureSet) {
+        const m = this.fm.metrics(t.font);
+        const s = t.run.sup || t.run.sub || t.run.note ? t.size / 0.68 : t.size;
+        asc = Math.max(asc, m.ascent * s);
+        desc = Math.max(desc, m.descent * s);
+        natural = Math.max(natural, m.line * s);
       }
-      // Merge adjacent tokens with identical style into a single text op
+      const lh = Math.max(natural * p.lineHeight, natural * 0.8);
+      const baseline = y + asc;
+      const lineW = line.reduce((s, t) => s + t.width, 0);
+      let cx = lx;
+      let extraPerSpace = 0;
+      if (p.align === 'center') cx = lx + (lw - lineW) / 2;
+      else if (p.align === 'right') cx = lx + lw - lineW;
+      else if (p.align === 'justify' && li < lines.length - 1) {
+        const spaces = line.filter((t) => t.space).length;
+        if (spaces && lineW > lw * 0.6) extraPerSpace = Math.max(0, (lw - lineW) / spaces);
+      }
       let pending: { x: number; text: string; t: Token; w: number } | null = null;
       const flush = (): void => {
         if (!pending) return;
         const t = pending.t;
         const r = t.run;
         let by = baseline;
-        if (r.sup) by -= maxSize * 0.33;
-        if (r.sub) by += maxSize * 0.14;
-        const color = r.link ? LINK : r.color ? hexColor(r.color) : (opts.color ?? BLACK);
-        if (pending.text.trim()) ops.push({ k: 'text', x: pending.x, y: by, top: y, bottom: y + lh, text: pending.text, font: t.font, size: t.size, color });
-        if (r.underline || r.link) ops.push({ k: 'line', x1: pending.x, y1: by + t.size * 0.12, x2: pending.x + pending.w, y2: by + t.size * 0.12, w: Math.max(0.5, t.size * 0.05), color, top: y, bottom: y + lh });
-        if (r.strike) ops.push({ k: 'line', x1: pending.x, y1: by - t.size * 0.3, x2: pending.x + pending.w, y2: by - t.size * 0.3, w: Math.max(0.5, t.size * 0.05), color, top: y, bottom: y + lh });
-        if (r.link) ops.push({ k: 'link', x: pending.x, y: y, w: pending.w, h: lh, url: r.link, top: y, bottom: y + lh });
+        const full = t.size / (r.sup || r.sub || r.note ? 0.68 : 1);
+        if (r.sup || r.note) by -= full * 0.33;
+        if (r.sub) by += full * 0.14;
+        const color = r.link ? LINK : r.color ? hexColor(r.color) : (ctx.color ?? BLACK);
+        if (r.highlight) ops.push({ k: 'rect', x: pending.x, y, w: pending.w, h: lh, fill: hexColor(r.highlight), clip: true, top: y, bottom: y + lh });
+        if (pending.text.trim()) {
+          const op: Op = { k: 'text', x: pending.x, y: by, top: y, bottom: y + lh, text: pending.text, font: t.font, size: t.size, color };
+          if (r.field) Object.assign(op, { field: r.field, fieldW: pending.w, anchor: p.align ?? 'left' });
+          if (t.noteRef) op.noteRef = t.noteRef;
+          ops.push(op);
+        }
+        const thick = Math.max(0.5, t.size * 0.05);
+        if (r.underline || r.link) ops.push({ k: 'line', x1: pending.x, y1: by + t.size * 0.12, x2: pending.x + pending.w, y2: by + t.size * 0.12, w: thick, color, top: y, bottom: y + lh });
+        if (r.strike) ops.push({ k: 'line', x1: pending.x, y1: by - t.size * 0.3, x2: pending.x + pending.w, y2: by - t.size * 0.3, w: thick, color, top: y, bottom: y + lh });
+        if (r.link) ops.push({ k: 'link', x: pending.x, y, w: pending.w, h: lh, url: r.link, top: y, bottom: y + lh });
         pending = null;
       };
       for (const t of line) {
         const w = t.width + (t.space ? extraPerSpace : 0);
-        if (pending && pending.t.run === t.run && pending.t.font === t.font && !extraPerSpace) {
+        if (pending && pending.t.run === t.run && pending.t.font === t.font && !extraPerSpace && !t.noteRef && !pending.t.noteRef) {
           pending.text += t.text;
           pending.w += w;
         } else {
@@ -300,8 +400,10 @@ class PdfWriter {
       flush();
       y += lh;
     });
-    return { height: y, ops, spaceBefore: opts.spaceBefore ?? 0, spaceAfter: opts.spaceAfter ?? size * 0.55 };
+    return { height: y, ops, spaceBefore: p.spaceBefore, spaceAfter: p.spaceAfter };
   }
+
+  // ------------------------------------------------------------------ blocks
 
   private async image(b: Extract<Block, { type: 'image' }>): Promise<PDFImage | null> {
     if (this.images.has(b.data)) return this.images.get(b.data)!;
@@ -310,7 +412,7 @@ class PdfWriter {
     if (mime !== 'image/png' && mime !== 'image/jpeg') {
       const t = this.env.transcodeImage ? await this.env.transcodeImage(data, mime).catch(() => null) : null;
       if (!t) {
-        this.warnings.add('Некоторые изображения пропущены: формат не поддерживается.');
+        this.warnings.add('Некоторые изображения пропущены: формат не поддерживается в этой среде.');
         this.images.set(b.data, null);
         return null;
       }
@@ -328,72 +430,72 @@ class PdfWriter {
   }
 
   private shift(box: Box, dx: number, dy: number): Op[] {
-    return box.ops.map((o) => {
-      switch (o.k) {
-        case 'line':
-          return { ...o, x1: o.x1 + dx, x2: o.x2 + dx, y1: o.y1 + dy, y2: o.y2 + dy, top: o.top + dy, bottom: o.bottom + dy };
-        default:
-          return { ...o, x: o.x + dx, y: o.y + dy, top: o.top + dy, bottom: o.bottom + dy } as Op;
-      }
-    });
+    return box.ops.map((o) =>
+      o.k === 'line'
+        ? { ...o, x1: o.x1 + dx, x2: o.x2 + dx, y1: o.y1 + dy, y2: o.y2 + dy, top: o.top + dy, bottom: o.bottom + dy }
+        : ({ ...o, x: o.x + dx, y: o.y + dy, top: o.top + dy, bottom: o.bottom + dy } as Op),
+    );
   }
 
-  private markerFor(ordered: boolean, index: number, depth: number): string {
-    if (ordered) return `${index}.`;
-    const cs = this.charsets.get('regular')!;
-    const pick = ['•', '◦', '▪'][depth % 3];
-    return cs.has(pick.codePointAt(0)!) ? pick : depth % 2 ? '–' : '•';
-  }
-
-  async layout(blocks: Block[], x: number, width: number, depth = 0): Promise<Box[]> {
+  private async layout(blocks: Block[], x: number, width: number, ctx: Ctx, depth = 0): Promise<Box[]> {
     const boxes: Box[] = [];
     for (const b of blocks) {
       switch (b.type) {
-        case 'paragraph':
-          if (!b.runs.some((r) => r.text.trim())) boxes.push({ height: BODY * LINE * 0.6, ops: [], spaceBefore: 0, spaceAfter: 0 });
-          else boxes.push(this.textBox(b.runs, x, width, { align: b.align }));
+        case 'paragraph': {
+          const p = this.para(b, {});
+          if (!b.runs.some((r) => r.text.trim() || r.note || r.field)) {
+            const key = this.keyFor(b.runs[0] ?? { text: '' }, ctx);
+            await this.fm.load([key]);
+            const s = b.runs[0]?.size ?? ctx.size;
+            boxes.push({ height: this.fm.metrics(key).line * s * p.lineHeight, ops: [], spaceBefore: p.spaceBefore, spaceAfter: p.spaceAfter });
+          } else boxes.push(await this.textBox(b.runs, x, width, ctx, p));
           break;
+        }
         case 'heading': {
-          const size = HEADING_SIZES[b.level];
-          const box = this.textBox(b.runs, x, width, { size, bold: true, align: b.align, spaceBefore: size * 0.85, spaceAfter: size * 0.45 });
+          const size = b.runs.find((r) => r.size)?.size ?? Math.round(this.base.size * HEADING_SCALE[b.level] * 2) / 2;
+          const p = this.para(b, { spaceBefore: size * 0.8, spaceAfter: size * 0.4, lineHeight: 1.1 });
+          const box = await this.textBox(b.runs, x, width, { ...ctx, size, bold: true }, p);
           box.keepWithNext = true;
           boxes.push(box);
           break;
         }
         case 'list': {
           let n = b.start ?? 1;
-          const markerW = b.ordered ? this.measure(`${n + b.items.length - 1}.`, 'regular', BODY) + 7 : 14;
+          const key = this.keyFor({ text: '' }, ctx);
+          await this.fm.load([key]);
+          const markerW = b.ordered ? this.fm.width(key, `${n + b.items.length - 1}.`, ctx.size) + 7 : ctx.size * 1.3;
           for (const it of b.items) {
-            const inner = await this.layout(it.blocks.length ? it.blocks : [{ type: 'paragraph', runs: [{ text: ' ' }] }], x + markerW + 4, width - markerW - 4, depth + 1);
+            const inner = await this.layout(it.blocks.length ? it.blocks : [{ type: 'paragraph', runs: [{ text: ' ' }] }], x + markerW + 4, width - markerW - 4, ctx, depth + 1);
             inner.forEach((ib, k) => {
               if (k < inner.length - 1) ib.spaceAfter = Math.min(ib.spaceAfter, 3);
             });
             const first = inner[0];
             if (first) {
               const firstText = first.ops.find((o): o is Extract<Op, { k: 'text' }> => o.k === 'text');
-              const baseline = firstText ? firstText.y : BODY * 1.02;
-              const marker = this.markerFor(b.ordered, n, depth);
-              const mw = this.measure(marker, 'regular', BODY);
-              // The marker goes first in the content stream so text extractors read it before the item text
-              first.ops.unshift({ k: 'text', x: b.ordered ? x + markerW - mw - 3 : x + 3, y: baseline, top: 0, bottom: firstText ? firstText.bottom : BODY * LINE, text: marker, font: 'regular', size: BODY, color: BLACK });
-              const last = inner[inner.length - 1];
-              last.spaceAfter = 3;
+              const baseline = firstText ? firstText.y : ctx.size;
+              const pick = b.ordered ? `${n}.` : ['•', '◦', '▪'][depth % 3];
+              const marker = this.fm.has(key, pick.codePointAt(0)!) ? pick : '•';
+              this.fm.markUsed(key, marker);
+              const mw = this.fm.width(key, marker, ctx.size);
+              // Marker first in the content stream so text extractors read it before the item text
+              first.ops.unshift({ k: 'text', x: b.ordered ? x + markerW - mw - 3 : x + 3, y: baseline, top: 0, bottom: firstText ? firstText.bottom : ctx.size * 1.3, text: marker, font: key, size: ctx.size, color: ctx.color ?? BLACK });
+              inner[inner.length - 1].spaceAfter = 3;
             }
             boxes.push(...inner);
             n++;
           }
-          if (boxes.length) boxes[boxes.length - 1].spaceAfter = BODY * 0.55;
+          if (boxes.length) boxes[boxes.length - 1].spaceAfter = this.para(undefined, {}).spaceAfter;
           break;
         }
         case 'table':
-          boxes.push(...(await this.table(b, x, width, depth)));
+          boxes.push(...(await this.table(b, x, width, ctx, depth)));
           break;
         case 'image': {
           const img = await this.image(b);
           if (!img) break;
           let w = (b.width * 72) / 96;
           let h = (b.height * 72) / 96;
-          const maxH = this.bottom - this.margin - 20;
+          const maxH = this.contentBottom - this.contentTop - 20;
           const k = Math.min(1, width / w, maxH / h);
           w *= k;
           h *= k;
@@ -402,9 +504,8 @@ class PdfWriter {
           break;
         }
         case 'code': {
-          const size = 9.5;
           const pad = 6;
-          const inner = this.textBox([{ text: b.text, code: true }], x + pad, width - 2 * pad, { size: size / 0.92, spaceAfter: 0, keepIndent: true });
+          const inner = await this.textBox([{ text: b.text, font: 'mono', size: Math.max(7, ctx.size - 1.5) }], x + pad, width - 2 * pad, ctx, this.para(undefined, { spaceAfter: 0, spaceBefore: 0, lineHeight: 1.1, firstLine: 0 }), true);
           const h = inner.height + 2 * pad;
           boxes.push({
             height: h,
@@ -415,11 +516,8 @@ class PdfWriter {
           break;
         }
         case 'quote': {
-          const inner = await this.layout(b.blocks, x + 14, width - 14, depth);
-          for (const ib of inner) {
-            ib.ops = ib.ops.map((o) => (o.k === 'text' && o.color === BLACK ? { ...o, color: [0.27, 0.27, 0.3] as Color } : o));
-            ib.ops.unshift({ k: 'rect', x, y: -ib.spaceBefore, w: 3, h: ib.height + ib.spaceBefore + ib.spaceAfter, fill: [0.8, 0.8, 0.84], clip: true, top: 0, bottom: ib.height });
-          }
+          const inner = await this.layout(b.blocks, x + 14, width - 14, { ...ctx, color: [0.27, 0.27, 0.3] }, depth);
+          for (const ib of inner) ib.ops.unshift({ k: 'rect', x, y: -ib.spaceBefore, w: 3, h: ib.height + ib.spaceBefore + ib.spaceAfter, fill: [0.8, 0.8, 0.84], clip: true, top: 0, bottom: ib.height });
           boxes.push(...inner);
           break;
         }
@@ -434,10 +532,9 @@ class PdfWriter {
     return boxes;
   }
 
-  private async table(b: Extract<Block, { type: 'table' }>, x: number, width: number, depth: number): Promise<Box[]> {
+  private async table(b: Extract<Block, { type: 'table' }>, x: number, width: number, ctx: Ctx, depth: number): Promise<Box[]> {
     const cols = maxOf(b.rows.map((r) => r.cells.reduce((s, c) => s + (c.colspan ?? 1), 0)), 1);
     const pad = 4;
-    // Natural (max) and minimum widths per column from single-span cells
     const maxW = new Array(cols).fill(20);
     const minW = new Array(cols).fill(20);
     for (const r of b.rows) {
@@ -448,10 +545,20 @@ class PdfWriter {
           for (const blk of cell.blocks) {
             if (blk.type !== 'paragraph' && blk.type !== 'heading') continue;
             for (const run of blk.runs) {
-              const font = this.fontKey(run, !!cell.header);
-              const text = this.sanitize(run.text, font);
-              for (const line of text.split('\n')) maxW[c] = Math.max(maxW[c], this.measure(line, font, BODY) + 2 * pad);
-              for (const word of text.split(/\s+/)) minW[c] = Math.max(minW[c], Math.min(width / cols, this.measure(word, font, BODY) + 2 * pad));
+              const cctx = { ...ctx, bold: ctx.bold || cell.header };
+              const key = this.keyFor(run, cctx);
+              await this.fm.load([key]);
+              const s = this.sizeFor(run, cctx);
+              const measure = (t: string): number => {
+                let w = 0;
+                for (const ch of t) {
+                  const k = this.fm.resolve(key, ch.codePointAt(0)!) ?? key;
+                  w += this.fm.advance(k, this.fm.has(k, ch.codePointAt(0)!) ? ch.codePointAt(0)! : 63);
+                }
+                return (w * s) / 1000;
+              };
+              for (const line of run.text.split('\n')) maxW[c] = Math.max(maxW[c], measure(line) + 2 * pad);
+              for (const word of run.text.split(/\s+/)) minW[c] = Math.max(minW[c], Math.min(width / cols, measure(word) + 2 * pad));
             }
           }
         }
@@ -472,6 +579,7 @@ class PdfWriter {
     }
     const boxes: Box[] = [];
     const border: Color = [0.62, 0.62, 0.66];
+    const cellPara = { spaceAfter: 2, spaceBefore: 0, firstLine: 0, indent: 0 };
     for (const r of b.rows) {
       let c = 0;
       const cellBoxes: { x: number; w: number; boxes: Box[]; header: boolean }[] = [];
@@ -480,17 +588,14 @@ class PdfWriter {
         const span = Math.min(cell.colspan ?? 1, cols - c);
         const cx = x + widths.slice(0, c).reduce((a, v) => a + v, 0);
         const cw = widths.slice(c, c + span).reduce((a, v) => a + v, 0);
-        const blocks = cell.header
-          ? cell.blocks.map((bl) => (bl.type === 'paragraph' ? { ...bl, runs: bl.runs.map((rr) => ({ ...rr, bold: true })) } : bl))
-          : cell.blocks;
-        cellBoxes.push({ x: cx, w: cw, boxes: await this.layout(blocks, cx + pad, cw - 2 * pad, depth + 1), header: !!cell.header });
+        const blocks = cell.blocks.map((bl) => (bl.type === 'paragraph' ? { ...cellPara, ...bl } : bl));
+        cellBoxes.push({ x: cx, w: cw, boxes: await this.layout(blocks, cx + pad, cw - 2 * pad, { ...ctx, bold: ctx.bold || cell.header }, depth + 1), header: !!cell.header });
         c += span;
       }
       if (c < cols) {
         const cx = x + widths.slice(0, c).reduce((a, v) => a + v, 0);
         cellBoxes.push({ x: cx, w: width - (cx - x), boxes: [], header: false });
       }
-      // Stack each cell's boxes vertically
       let rowH = 0;
       const ops: Op[] = [];
       const cellOps: Op[][] = cellBoxes.map((cb) => {
@@ -504,7 +609,7 @@ class PdfWriter {
         rowH = Math.max(rowH, y + pad);
         return out;
       });
-      rowH = Math.max(rowH, BODY * LINE + 2 * pad);
+      rowH = Math.max(rowH, ctx.size * 1.3 + 2 * pad);
       cellBoxes.forEach((cb, i) => {
         if (cb.header) ops.push({ k: 'rect', x: cb.x, y: 0, w: cb.w, h: rowH, fill: [0.95, 0.95, 0.96], clip: true, top: 0, bottom: rowH });
         ops.push({ k: 'rect', x: cb.x, y: 0, w: cb.w, h: rowH, stroke: border, clip: true, top: 0, bottom: rowH });
@@ -519,26 +624,108 @@ class PdfWriter {
     return boxes;
   }
 
-  private newPage(): void {
-    this.page = this.pdf.addPage([this.pageW, this.pageH]);
-    this.pages.push(this.page);
-    this.cursor = this.margin;
+  // ------------------------------------------------------------------ headers, footers, notes
+
+  async prepare(doc: Doc): Promise<Box[]> {
+    const ctx = { ...this.base };
+    const w = this.contentW;
+    const x = this.margins.left;
+    const strip = (boxes: Box[]): Box[] => {
+      if (boxes.length) {
+        boxes[0].spaceBefore = 0;
+        boxes[boxes.length - 1].spaceAfter = 0;
+      }
+      return boxes;
+    };
+    const small = { ...ctx, size: Math.max(7, ctx.size - 1) };
+    this.headerBlocks = doc.header ?? [];
+    this.footerBlocks = doc.footer ?? [];
+    if (this.headerBlocks.length) this.headerBoxes = strip(await this.layout(this.headerBlocks, x, w, small));
+    if (this.footerBlocks.length) this.footerBoxes = strip(await this.layout(this.footerBlocks, x, w, small));
+    const stack = (boxes: Box[]): number => boxes.reduce((s, b, i) => s + b.height + (i ? b.spaceBefore : 0) + (i < boxes.length - 1 ? b.spaceAfter : 0), 0);
+    this.contentTop = Math.max(this.margins.top, this.headerBoxes.length ? this.headerDist + stack(this.headerBoxes) + 6 : 0);
+    this.contentBottom = Math.min(this.pageH - this.margins.bottom, this.footerBoxes.length ? this.pageH - this.footerDist - stack(this.footerBoxes) - 6 : Infinity);
+    // Main flow (footnotes are numbered while laying it out)
+    const main = await this.layout(doc.blocks.length ? doc.blocks : [{ type: 'paragraph', runs: [] }], x, w, ctx);
+    // Footnote bodies
+    const noteCtx = { ...ctx, size: Math.max(7, ctx.size * 0.8) };
+    for (let i = 0; i < this.notes.length; i++) {
+      const n = this.notes[i];
+      const blocks = n.blocks.length ? [...n.blocks] : [{ type: 'paragraph', runs: [] } as Block];
+      const first = blocks[0];
+      const mark: TextRun = { text: `${n.num} `, sup: false };
+      blocks[0] = first.type === 'paragraph' ? { ...first, runs: [mark, ...first.runs], firstLine: 0, indent: 0, spaceBefore: 0 } : first;
+      if (first.type !== 'paragraph') blocks.unshift({ type: 'paragraph', runs: [mark] });
+      n.boxes = strip(await this.layout(blocks, x, w, noteCtx));
+      n.boxes.forEach((b) => (b.spaceAfter = Math.min(b.spaceAfter, 2)));
+      n.height = stack(n.boxes) + 2;
+    }
+    if (this.fm.missing) this.warnings.add('Некоторые символы отсутствуют во всех встроенных шрифтах и заменены на «?».');
+    // Page numbers when the document has no footer of its own
+    this.fm.markUsed(this.keyFor({ text: '' }, ctx), '0123456789');
+    await this.fm.embedAll(this.pdf, this.opts.subsetFonts !== false);
+    return main;
   }
 
-  private draw(ops: Op[], offset: number, from: number, to: number): void {
+  // ------------------------------------------------------------------ placement
+
+  private newPage(): void {
+    if (this.page) this.flushNotes();
+    this.page = this.pdf.addPage([this.pageW, this.pageH]);
+    this.pages.push(this.page);
+    this.cursor = this.contentTop;
+    this.pageNotes = [];
+  }
+
+  private notesHeight(list: Note[]): number {
+    if (!list.length) return 0;
+    return list.reduce((s, n) => s + n.height, 0) + (this.pageNotes.length ? 0 : 10);
+  }
+
+  private get limit(): number {
+    return this.contentBottom - this.notesHeight(this.pageNotes);
+  }
+
+  private notesIn(box: Box, from: number, to: number): Note[] {
+    const out: Note[] = [];
+    for (const o of box.ops) {
+      if (o.k === 'text' && o.noteRef && o.top >= from - 0.01 && o.bottom <= to + 0.01 && !this.placedNotes.has(o.noteRef)) {
+        const n = this.notes[o.noteRef - 1];
+        if (n && !out.includes(n)) out.push(n);
+      }
+    }
+    return out;
+  }
+
+  private flushNotes(): void {
+    if (!this.pageNotes.length) return;
+    const total = this.notesHeight(this.pageNotes);
+    let y = this.contentBottom - total;
+    this.page.drawLine({ start: { x: this.margins.left, y: this.pageH - (y + 4) }, end: { x: this.margins.left + this.contentW / 3, y: this.pageH - (y + 4) }, thickness: 0.5, color: rgb(...GRAY) });
+    y += 10;
+    for (const n of this.pageNotes) {
+      let by = y;
+      n.boxes.forEach((b, i) => {
+        if (i) by += b.spaceBefore;
+        this.draw(b.ops, by, 0, b.height);
+        by += b.height + b.spaceAfter;
+      });
+      y += n.height;
+    }
+  }
+
+  private draw(ops: Op[], offset: number, from: number, to: number, page = this.page, pageNo = 0, total = 0): void {
     const H = this.pageH;
     for (const o of ops) {
       if (o.k === 'rect') {
         const top = Math.max(o.y, from);
         const bot = Math.min(o.y + o.h, to);
         if (bot <= top) continue;
-        const y = H - (offset + bot - from);
-        const h = bot - top;
-        this.page.drawRectangle({
+        page.drawRectangle({
           x: o.x,
-          y,
+          y: H - (offset + bot - from),
           width: o.w,
-          height: h,
+          height: bot - top,
           color: o.fill ? rgb(...o.fill) : undefined,
           borderColor: o.stroke ? rgb(...o.stroke) : undefined,
           borderWidth: o.stroke ? 0.6 : 0,
@@ -547,46 +734,44 @@ class PdfWriter {
       }
       if (o.top < from - 0.01 || o.bottom > to + 0.01) continue;
       switch (o.k) {
-        case 'text':
-          this.page.drawText(o.text, { x: o.x, y: H - (offset + o.y - from), size: o.size, font: this.fonts.get(o.font)!, color: rgb(...o.color) });
+        case 'text': {
+          let text = o.text;
+          let x = o.x;
+          if (o.field) {
+            text = String(o.field === 'page' ? pageNo : total);
+            const aw = this.fm.width(o.font, text, o.size);
+            const pw = o.fieldW ?? aw;
+            if (o.anchor === 'center') x += (pw - aw) / 2;
+            else if (o.anchor === 'right') x += pw - aw;
+          }
+          page.drawText(text, { x, y: H - (offset + o.y - from), size: o.size, font: this.fm.pdfFont(o.font), color: rgb(...o.color) });
           break;
+        }
         case 'line':
-          this.page.drawLine({ start: { x: o.x1, y: H - (offset + o.y1 - from) }, end: { x: o.x2, y: H - (offset + o.y2 - from) }, thickness: o.w, color: rgb(...o.color) });
+          page.drawLine({ start: { x: o.x1, y: H - (offset + o.y1 - from) }, end: { x: o.x2, y: H - (offset + o.y2 - from) }, thickness: o.w, color: rgb(...o.color) });
           break;
         case 'image':
-          this.page.drawImage(o.img, { x: o.x, y: H - (offset + o.y + o.h - from), width: o.w, height: o.h });
+          page.drawImage(o.img, { x: o.x, y: H - (offset + o.y + o.h - from), width: o.w, height: o.h });
           break;
         case 'link': {
           const y1 = H - (offset + o.y + o.h - from);
-          const annot = this.pdf.context.obj({
-            Type: 'Annot',
-            Subtype: 'Link',
-            Rect: [o.x, y1, o.x + o.w, y1 + o.h],
-            Border: [0, 0, 0],
-            A: { Type: 'Action', S: 'URI', URI: PDFString.of(o.url) },
-          });
-          this.page.node.addAnnot(this.pdf.context.register(annot));
+          const annot = this.pdf.context.obj({ Type: 'Annot', Subtype: 'Link', Rect: [o.x, y1, o.x + o.w, y1 + o.h], Border: [0, 0, 0], A: { Type: 'Action', S: 'URI', URI: PDFString.of(o.url) } });
+          page.node.addAnnot(this.pdf.context.register(annot));
           break;
         }
       }
     }
   }
 
-  /** Largest y ≤ limit where no atomic op is cut. */
-  private cutAt(box: Box, from: number, limit: number): number {
-    const candidates = new Set<number>();
-    for (const o of box.ops) if (o.k !== 'rect' && o.bottom > from && o.bottom <= limit) candidates.add(o.bottom);
-    const sorted = [...candidates].sort((a, b) => b - a);
-    for (const y of sorted) {
-      if (!box.ops.some((o) => o.k !== 'rect' && o.top < y - 0.01 && o.bottom > y + 0.01)) return y;
-    }
-    return from;
+  private candidates(box: Box, from: number, limit: number): number[] {
+    const set = new Set<number>();
+    for (const o of box.ops) if (o.k !== 'rect' && o.bottom > from && o.bottom <= limit) set.add(o.bottom);
+    return [...set].sort((a, b) => b - a).filter((y) => !box.ops.some((o) => o.k !== 'rect' && o.top < y - 0.01 && o.bottom > y + 0.01));
   }
 
   place(boxes: Box[]): void {
     this.newPage();
-    const contentH = this.bottom - this.margin;
-    // A page break only takes effect when more content follows (no empty trailing pages)
+    const contentH = this.contentBottom - this.contentTop;
     let pendingBreak = false;
     for (let i = 0; i < boxes.length; i++) {
       const box = boxes[i];
@@ -596,9 +781,9 @@ class PdfWriter {
       }
       if (pendingBreak) {
         pendingBreak = false;
-        if (this.cursor > this.margin) this.newPage();
+        if (this.cursor > this.contentTop) this.newPage();
       }
-      const atTop = this.cursor <= this.margin + 0.01;
+      const atTop = this.cursor <= this.contentTop + 0.01;
       if (!atTop) this.cursor += box.spaceBefore;
       let need = box.height;
       if (box.keepWithNext && boxes[i + 1] && !boxes[i + 1].pageBreak) {
@@ -606,53 +791,127 @@ class PdfWriter {
         const firstLine = next.ops.filter((o) => o.k !== 'rect').reduce((m, o) => Math.min(m, o.bottom), next.height);
         need += next.spaceBefore + Math.min(firstLine, contentH / 3);
       }
-      if (this.cursor + need > this.bottom && !atTop && need <= contentH) this.newPage();
-      // Place, slicing across pages when needed
+      if (this.cursor + need > this.limit && !atTop && need <= contentH) this.newPage();
       let from = 0;
       while (from < box.height - 0.01) {
-        const avail = this.bottom - this.cursor;
-        if (box.height - from <= avail + 0.01) {
+        const rest = this.notesIn(box, from, box.height);
+        if (this.cursor + (box.height - from) + this.notesHeight([...this.pageNotes, ...rest]) - this.notesHeight(this.pageNotes) <= this.limit + 0.01) {
           this.draw(box.ops, this.cursor, from, box.height);
+          this.addNotes(rest);
           this.cursor += box.height - from;
           break;
         }
-        let cut = this.cutAt(box, from, from + avail);
+        let cut = from;
+        for (const c of this.candidates(box, from, from + (this.limit - this.cursor))) {
+          const notes = this.notesIn(box, from, c);
+          if (this.cursor + (c - from) + this.notesHeight([...this.pageNotes, ...notes]) - this.notesHeight(this.pageNotes) <= this.limit + 0.01) {
+            cut = c;
+            break;
+          }
+        }
         if (cut <= from) {
-          if (this.cursor > this.margin + 0.01) {
+          if (this.cursor > this.contentTop + 0.01 || this.pageNotes.length) {
             this.newPage();
             continue;
           }
-          cut = from + avail; // a single atomic op taller than a page: clip it
+          cut = Math.min(box.height, from + (this.limit - this.cursor)); // an atomic op taller than the page: clip
+          if (cut <= from) cut = box.height;
         }
+        const notes = this.notesIn(box, from, cut);
         this.draw(box.ops, this.cursor, from, cut);
+        this.addNotes(notes);
+        const drawn = cut - from;
         from = cut;
-        this.newPage();
+        if (from < box.height - 0.01) this.newPage();
+        else this.cursor += drawn;
       }
       this.cursor += box.spaceAfter;
     }
   }
 
-  async finish(): Promise<Uint8Array> {
-    if (this.pages.length > 1) {
-      const font = this.fonts.get('regular')!;
-      this.pages.forEach((p, i) => {
-        const label = String(i + 1);
-        const w = font.widthOfTextAtSize(label, 9);
-        p.drawText(label, { x: (this.pageW - w) / 2, y: this.margin / 2 - 3, size: 9, font, color: rgb(...GRAY) });
-      });
+  private addNotes(list: Note[]): void {
+    for (const n of list) {
+      this.placedNotes.add(n.num);
+      this.pageNotes.push(n);
     }
-    // Hint viewers to open with page-width zoom
+  }
+
+  async finish(): Promise<Uint8Array> {
+    this.flushNotes();
+    this.pageNotes = [];
+    const total = this.pages.length;
+    const small = { ...this.base, size: Math.max(7, this.base.size - 1) };
+    const strip = (boxes: Box[]): Box[] => {
+      if (boxes.length) {
+        boxes[0].spaceBefore = 0;
+        boxes[boxes.length - 1].spaceAfter = 0;
+      }
+      return boxes;
+    };
+    // Headers/footers with page fields are laid out per page once the page count is known
+    const perPage = async (blocks: Block[], boxes: Box[], no: number): Promise<Box[]> =>
+      hasFields(blocks) ? strip(await this.layout(fillFields(blocks, no, total), this.margins.left, this.contentW, small)) : boxes;
+    const headers: Box[][] = [];
+    const footers: Box[][] = [];
+    for (let i = 0; i < total; i++) {
+      headers.push(await perPage(this.headerBlocks, this.headerBoxes, i + 1));
+      footers.push(await perPage(this.footerBlocks, this.footerBoxes, i + 1));
+    }
+    const drawStack = (boxes: Box[], top: number, page: PDFPage, no: number): void => {
+      let y = top;
+      boxes.forEach((b, i) => {
+        if (i) y += b.spaceBefore;
+        this.draw(b.ops, y, 0, b.height, page, no, total);
+        y += b.height + b.spaceAfter;
+      });
+    };
+    const stackH = (boxes: Box[]): number => boxes.reduce((s, b, i) => s + b.height + (i ? b.spaceBefore : 0) + (i < boxes.length - 1 ? b.spaceAfter : 0), 0);
+    this.pages.forEach((p, i) => {
+      if (headers[i].length) drawStack(headers[i], this.headerDist, p, i + 1);
+      if (footers[i].length) drawStack(footers[i], this.pageH - this.footerDist - stackH(footers[i]), p, i + 1);
+      else if (total > 1) {
+        const key = this.keyFor({ text: '' }, this.base);
+        const label = String(i + 1);
+        const w = this.fm.width(key, label, 9);
+        p.drawText(label, { x: (this.pageW - w) / 2, y: Math.min(this.margins.bottom / 2, 28) - 3, size: 9, font: this.fm.pdfFont(key), color: rgb(...GRAY) });
+      }
+    });
     this.pdf.catalog.set(PDFName.of('PageLayout'), PDFName.of('OneColumn'));
     return this.pdf.save({ useObjectStreams: true });
   }
 }
 
+function mapRuns(blocks: Block[], fn: (r: TextRun) => TextRun): Block[] {
+  return blocks.map((b): Block => {
+    switch (b.type) {
+      case 'paragraph':
+      case 'heading':
+        return { ...b, runs: b.runs.map(fn) };
+      case 'list':
+        return { ...b, items: b.items.map((it) => ({ blocks: mapRuns(it.blocks, fn) })) };
+      case 'table':
+        return { ...b, rows: b.rows.map((r) => ({ cells: r.cells.map((c) => ({ ...c, blocks: mapRuns(c.blocks, fn) })) })) };
+      case 'quote':
+        return { ...b, blocks: mapRuns(b.blocks, fn) };
+      default:
+        return b;
+    }
+  });
+}
+
+function hasFields(blocks: Block[]): boolean {
+  let found = false;
+  mapRuns(blocks, (r) => ((found ||= !!r.field), r));
+  return found;
+}
+
+const fillFields = (blocks: Block[], page: number, total: number): Block[] =>
+  mapRuns(blocks, (r) => (r.field ? { ...r, field: undefined, text: String(r.field === 'page' ? page : total) } : r));
+
 export async function docToPdf(doc: Doc, env: PdfWriteEnv, opts: PdfOptions = {}): Promise<{ data: Uint8Array; warnings: string[] }> {
   const w = new PdfWriter(env, opts);
   await w.init(doc);
-  const margin = 56.7;
-  const pageW = opts.pageSize === 'letter' ? 612 : 595.28;
-  const boxes = await w.layout(doc.blocks.length ? doc.blocks : [{ type: 'paragraph', runs: [] }], margin, pageW - 2 * margin);
+  const boxes = await w.prepare(doc);
   env.onProgress?.(0.6);
   w.place(boxes);
   const data = await w.finish();

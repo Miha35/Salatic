@@ -3,24 +3,36 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSy
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ConvertEnv } from '../../src/core/convert';
-import type { FontKey, FontLoader } from '../../src/core/writers/pdf';
+import type { FontKey, FontLoader } from '../../src/core/pdf-fonts';
+import { createSubsetter, type Subsetter } from '../../src/core/hb-subset';
 
 const root = join(__dirname, '../..');
 const nm = (p: string): Uint8Array => new Uint8Array(readFileSync(join(root, 'node_modules', p)));
 
-export const FONT_FILES: Record<FontKey, string> = {
-  regular: 'pdfjs-dist/standard_fonts/LiberationSans-Regular.ttf',
-  bold: 'pdfjs-dist/standard_fonts/LiberationSans-Bold.ttf',
-  italic: 'pdfjs-dist/standard_fonts/LiberationSans-Italic.ttf',
-  boldItalic: 'pdfjs-dist/standard_fonts/LiberationSans-BoldItalic.ttf',
-  mono: 'dejavu-fonts-ttf/ttf/DejaVuSansMono.ttf',
-};
+const OFFICE = '@docx-editor.dev/fonts/assets/';
+const STYLE_FILE = { regular: 'Regular', bold: 'Bold', italic: 'Italic', boldItalic: 'BoldItalic' } as const;
+const FAMILY_FILE = { sans: 'LiberationSans', serif: 'LiberationSerif', mono: 'LiberationMono', calibri: 'Carlito' } as const;
+
+export const FONT_FILES = {
+  ...Object.fromEntries(
+    Object.entries(FAMILY_FILE).flatMap(([fam, file]) => Object.entries(STYLE_FILE).map(([st, sf]) => [`${fam}-${st}`, `${OFFICE}${file}-${sf}.ttf`])),
+  ),
+  'fallback-regular': 'dejavu-fonts-ttf/ttf/DejaVuSans.ttf',
+  'fallback-bold': 'dejavu-fonts-ttf/ttf/DejaVuSans-Bold.ttf',
+  cjk: '@docx-editor.dev/fonts-cjk/assets/NotoSansCJKjp-Regular.otf',
+  emoji: '@expo-google-fonts/noto-emoji/400Regular/NotoEmoji_400Regular.ttf',
+} as Record<FontKey, string>;
 
 export const loadFonts: FontLoader = async (key) => nm(FONT_FILES[key]);
+
+let subsetterPromise: Promise<Subsetter> | null = null;
+export const loadSubsetter = (): Promise<Subsetter> => (subsetterPromise ??= createSubsetter(readFileSync(join(root, 'node_modules/harfbuzzjs/dist/harfbuzz-subset.wasm'))));
 
 export const loadPdfjs = async () => (await import('pdfjs-dist/legacy/build/pdf.mjs')) as unknown as typeof import('pdfjs-dist');
 
 export const env: ConvertEnv = { pdfjs: loadPdfjs, fonts: loadFonts };
+/** Same as the browser engine: HarfBuzz subsetting enabled. */
+export const envWithSubsetter = async (): Promise<ConvertEnv> => ({ ...env, subsetter: await loadSubsetter() });
 
 export const hasCmd = (cmd: string): boolean => {
   try {

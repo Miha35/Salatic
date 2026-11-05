@@ -2,14 +2,16 @@
  * Conversion engine running off the main thread. Heavy libraries (pdf.js, pdf-lib,
  * fonts) are loaded on first use only.
  */
-import monoUrl from 'dejavu-fonts-ttf/ttf/DejaVuSansMono.ttf?url';
+import hbSubsetUrl from 'harfbuzzjs/dist/harfbuzz-subset.wasm?url';
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { convert, readContent, writeContent, type ConvertEnv } from '../../core/convert';
 import { asDoc } from '../../core/convert-lite';
 import { htmlToDoc } from '../../core/readers/html';
 import { blocksToHtml } from '../../core/writers/text';
 import { encodePng } from '../../core/png';
-import type { FontKey } from '../../core/writers/pdf';
+import type { FontKey } from '../../core/pdf-fonts';
+import { createSubsetter, type Subsetter } from '../../core/hb-subset';
+import { FONT_URLS } from './fonts';
 import type { EngineRequest, WorkerMessage } from './protocol';
 
 interface WorkerScope {
@@ -21,17 +23,19 @@ declare const self: WorkerScope;
 
 const abs = (u: string): string => new URL(u, self.location.href).href;
 
-// Liberation Sans ships with pdf.js (standard_fonts) and is already deployed under /pdfjs/.
-const FONT_URLS: Record<FontKey, string> = {
-  regular: '/pdfjs/standard_fonts/LiberationSans-Regular.ttf',
-  bold: '/pdfjs/standard_fonts/LiberationSans-Bold.ttf',
-  italic: '/pdfjs/standard_fonts/LiberationSans-Italic.ttf',
-  boldItalic: '/pdfjs/standard_fonts/LiberationSans-BoldItalic.ttf',
-  mono: monoUrl,
-};
 const fontCache = new Map<FontKey, Promise<Uint8Array>>();
 
-/** Fetch a font style on first use only (most documents never need italic or mono). */
+let subsetterPromise: Promise<Subsetter | undefined> | null = null;
+/** HarfBuzz subsetter (wasm, ~680 KB) – loaded once; PDFs still work without it, just larger. */
+function loadSubsetter(): Promise<Subsetter | undefined> {
+  subsetterPromise ??= fetch(abs(hbSubsetUrl))
+    .then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(new Error(String(r.status)))))
+    .then((buf) => createSubsetter(buf))
+    .catch(() => undefined);
+  return subsetterPromise;
+}
+
+/** Fetch a font on first use only (most documents need one or two styles). */
 function loadFont(key: FontKey): Promise<Uint8Array> {
   let p = fontCache.get(key);
   if (!p) {
@@ -87,8 +91,9 @@ async function transcodeImage(data: Uint8Array, mime: string): Promise<{ data: U
   return { data: new Uint8Array(await blob.arrayBuffer()), mime: 'image/png' };
 }
 
-function env(id: number): ConvertEnv {
+function env(id: number, subsetter?: Subsetter): ConvertEnv {
   return {
+    subsetter,
     pdfjs: loadPdfjs,
     pdfDocParams: {
       cMapUrl: abs('/pdfjs/cmaps/'),
@@ -114,7 +119,7 @@ function post(msg: WorkerMessage, transfer: Transferable[] = []): void {
 async function handle(id: number, req: EngineRequest): Promise<{ result: unknown; transfer: Transferable[] }> {
   switch (req.op) {
     case 'convert': {
-      const r = await convert(req.bytes, req.from, req.to, env(id), req.opts, req.title);
+      const r = await convert(req.bytes, req.from, req.to, env(id, req.to === 'pdf' ? await loadSubsetter() : undefined), req.opts, req.title);
       return { result: r, transfer: [r.data.buffer] };
     }
     case 'toHtml': {
@@ -125,7 +130,7 @@ async function handle(id: number, req: EngineRequest): Promise<{ result: unknown
     case 'fromHtml': {
       const doc = htmlToDoc(req.html);
       doc.title = req.title || doc.title;
-      const r = await writeContent({ kind: 'doc', doc }, req.to, env(id), req.opts, req.title);
+      const r = await writeContent({ kind: 'doc', doc }, req.to, env(id, req.to === 'pdf' ? await loadSubsetter() : undefined), req.opts, req.title);
       return { result: r, transfer: [r.data.buffer] };
     }
     case 'imagesToPdf': {
@@ -135,7 +140,8 @@ async function handle(id: number, req: EngineRequest): Promise<{ result: unknown
     }
     case 'composePdf': {
       const { composePdf } = await import('../../core/pdf-tools');
-      const data = await composePdf(req.sources, req.pages, loadFont);
+      const needsFonts = req.pages.some((p) => p.annotations?.some((a) => a.type === 'text'));
+      const data = await composePdf(req.sources, req.pages, loadFont, needsFonts ? await loadSubsetter() : undefined);
       return { result: data, transfer: [data.buffer] };
     }
   }

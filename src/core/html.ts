@@ -220,7 +220,7 @@ export function parseHtml(src: string): HNode {
     if (RAW.has(tag)) {
       const close = src.toLowerCase().indexOf(`</${tag}`, i);
       const end = close < 0 ? n : close;
-      if (tag === 'textarea' || tag === 'title') node.children.push({ tag: '#text', attrs: {}, children: [], text: decodeHtmlEntities(src.slice(i, end)), parent: node });
+      if (tag === 'textarea' || tag === 'title' || tag === 'style') node.children.push({ tag: '#text', attrs: {}, children: [], text: decodeHtmlEntities(src.slice(i, end)), parent: node });
       const gt = close < 0 ? n : src.indexOf('>', close);
       i = gt < 0 ? n : gt + 1;
       continue;

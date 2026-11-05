@@ -5,7 +5,8 @@
 import type { FormatId } from './formats';
 import { FORMATS, targetsFor } from './formats';
 import type { Content, Doc } from './model';
-import type { FontLoader } from './writers/pdf';
+import type { FontLoader } from './pdf-fonts';
+import type { Subsetter } from './hb-subset';
 import { asDoc, readLite, writeLite, type ConvertOptions, type ConvertOutput } from './convert-lite';
 import { ConvertError } from './util';
 
@@ -17,6 +18,8 @@ export interface ConvertEnv {
   pdfjs?: () => Promise<PdfJs>;
   pdfDocParams?: Record<string, unknown>;
   fonts?: FontLoader;
+  /** HarfBuzz font subsetter (smaller PDFs); fonts are embedded whole without it. */
+  subsetter?: Subsetter;
   encodeImage?: (pixels: Uint8Array | Uint8ClampedArray, width: number, height: number, channels: 1 | 3 | 4) => Promise<{ data: Uint8Array; mime: string }>;
   transcodeImage?: (data: Uint8Array, mime: string) => Promise<{ data: Uint8Array; mime: string } | null>;
   onProgress?: (fraction: number) => void;
@@ -43,7 +46,7 @@ export async function writeContent(content: Content, to: FormatId, env: ConvertE
     if (!env.fonts) throw new ConvertError('Создание PDF недоступно в этой среде.', 'unsupported');
     const { docToPdf } = await import('./writers/pdf');
     const doc: Doc = asDoc(content, title);
-    const r = await docToPdf({ ...doc, title: doc.title ?? title }, { fonts: env.fonts, transcodeImage: env.transcodeImage }, { pageSize: opts.pageSize });
+    const r = await docToPdf({ ...doc, title: doc.title ?? title }, { fonts: env.fonts, subsetter: env.subsetter, transcodeImage: env.transcodeImage }, { pageSize: opts.pageSize });
     return { data: r.data, mime: FORMATS.pdf.mime, ext: 'pdf', warnings: r.warnings };
   }
   return writeLite(content, to, opts, title);
