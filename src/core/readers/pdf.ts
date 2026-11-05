@@ -753,6 +753,101 @@ export function detectGrids(hRaw: HSeg[], vRaw: VSeg[]): Grid[] {
   return grids;
 }
 
+/** A run of lines in reading order with its own horizontal extent (a column, or the full width). */
+interface Chunk {
+  lines: Line[];
+  left: number;
+  right: number;
+}
+
+const lineWidth = (l: Line): number => l.x1 - l.x0;
+
+function splitLine(l: Line, segs: Seg[]): Line {
+  return { y: l.y, fs: l.fs, segs, x0: minOf(segs.map((s) => s.x0)), x1: maxOf(segs.map((s) => s.x1)) };
+}
+
+/**
+ * Reading order for multi-column pages (a recursive X-Y cut restricted to text columns):
+ * find a vertical gutter that few lines cross, cut the page into horizontal bands at the
+ * lines that do cross it (titles, full-width figures captions), and read each band that
+ * really is set in columns column by column. Tables are protected by requiring both
+ * sides to look like running text (aligned left edges, lines filling the column).
+ */
+export function columnChunks(lines: Line[], depth = 0): Chunk[] {
+  const whole = (ls: Line[]): Chunk[] => (ls.length ? [{ lines: ls, left: minOf(ls.map((l) => l.x0)), right: maxOf(ls.map((l) => l.x1)) }] : []);
+  if (lines.length < 6 || depth > 2) return whole(lines);
+  const L = minOf(lines.map((l) => l.x0));
+  const R = maxOf(lines.map((l) => l.x1));
+  const W = R - L;
+  const fs = median(lines.map((l) => l.fs));
+  if (W < fs * 20) return whole(lines);
+  // Horizontal coverage profile at 1 pt resolution
+  const cover = new Uint16Array(Math.ceil(W) + 1);
+  for (const l of lines) for (const s of l.segs) for (let x = Math.max(0, Math.floor(s.x0 - L)); x <= Math.min(cover.length - 1, Math.ceil(s.x1 - L)); x++) cover[x]++;
+  const limit = Math.max(1, Math.floor(lines.length * 0.12));
+  let best: { a: number; b: number; c: number } | null = null;
+  for (let x = Math.floor(W * 0.2); x < W * 0.8; x++) {
+    if (cover[x] > limit) continue;
+    let e = x;
+    let c = cover[x];
+    while (e + 1 < cover.length && e + 1 < W * 0.85 && cover[e + 1] <= limit) c = Math.max(c, cover[++e]);
+    const width = e - x + 1;
+    if (width >= Math.max(6, fs * 0.6) && (!best || c < best.c || (c === best.c && width > best.b - best.a))) best = { a: x + L, b: e + L, c };
+    x = e;
+  }
+  if (!best) return whole(lines);
+  const { a, b } = best;
+  const sorted = [...lines].sort((p, q) => p.y - q.y);
+  type Band = { cross: boolean; lines: Line[] };
+  const bands: Band[] = [];
+  // Typical distance between successive baselines; a much larger gap ends a column region
+  const steps = sorted.slice(1).map((l, i) => l.y - sorted[i].y).filter((d) => d > fs * 0.3);
+  const step = steps.length ? median(steps) : fs * 1.2;
+  for (const l of sorted) {
+    const cross = l.segs.some((s) => s.x0 < a - 2 && s.x1 > b + 2);
+    const last = bands[bands.length - 1];
+    const prevLine = last?.lines[last.lines.length - 1];
+    const gapBreak = !!prevLine && l.y - prevLine.y > Math.max(step * 2.2, fs * 2.5);
+    if (last && last.cross === cross && !cross && !gapBreak) last.lines.push(l);
+    else bands.push({ cross, lines: [l] });
+  }
+  const textLike = (side: Line[], x0: number, x1: number): boolean => {
+    if (side.length < 3) return false;
+    const width = x1 - x0;
+    const widths = side.map(lineWidth);
+    const lefts = side.map((l) => l.x0);
+    const margin = minOf(lefts);
+    const aligned = lefts.filter((x) => x < margin + fs * 2.5).length / side.length;
+    return median(widths) >= width * 0.55 && aligned >= 0.6;
+  };
+  const chunks: Chunk[] = [];
+  let split = false;
+  for (const band of bands) {
+    if (band.cross) {
+      chunks.push(...whole(band.lines));
+      continue;
+    }
+    const left: Line[] = [];
+    const right: Line[] = [];
+    for (const l of band.lines) {
+      // Each segment belongs to the side of the gutter its centre is on (nothing is dropped)
+      const mid = (a + b) / 2;
+      const ls = l.segs.filter((s) => (s.x0 + s.x1) / 2 < mid);
+      const rs = l.segs.filter((s) => (s.x0 + s.x1) / 2 >= mid);
+      if (ls.length) left.push(ls.length === l.segs.length ? l : splitLine(l, ls));
+      if (rs.length) right.push(rs.length === l.segs.length ? l : splitLine(l, rs));
+    }
+    const bandL = minOf(band.lines.map((l) => l.x0));
+    const bandR = maxOf(band.lines.map((l) => l.x1));
+    if (textLike(left, bandL, a) && textLike(right, b, bandR)) {
+      split = true;
+      chunks.push(...columnChunks(left, depth + 1), ...columnChunks(right, depth + 1));
+    } else chunks.push(...whole(band.lines));
+  }
+  // Without a real column band keep the original (content-stream) order untouched
+  return split ? chunks : whole(lines);
+}
+
 const itemTop = (it: PageItem): number => (it.type === 'para' ? it.p.top : it.type === 'table' ? it.top : it.type === 'grid' ? it.table.top : it.img.top);
 
 function headerFooterFilter(pages: { lines: Line[]; height: number }[]): (line: Line, pageIdx: number) => boolean {
@@ -869,18 +964,29 @@ export async function pdfToDoc(bytes: Uint8Array, env: PdfReadEnv): Promise<{ do
       ...p.grids.map((t) => ({ top: t.top, item: { type: 'grid', table: t } as PageItem })),
     ].sort((a, b) => a.top - b.top);
     if (!lines.length) return extras.map((e) => e.item);
-    const left = minOf(lines.map((l) => l.x0));
-    const right = maxOf(lines.map((l) => l.x1));
+    const chunks = columnChunks(lines);
+
     const items: PageItem[] = [];
-    const tables = layout.findTables(lines);
-    let cursor = 0;
-    for (const t of [...tables, { start: lines.length, end: lines.length, cols: [] }]) {
-      if (t.start > cursor) for (const para of layout.buildParas(lines.slice(cursor, t.start), left, right)) items.push({ type: 'para', p: para });
-      if (t.end > t.start) {
-        const tl = lines.slice(t.start, t.end);
-        items.push({ type: 'table', lines: tl, top: tl[0].y - tl[0].fs, cols: t.cols });
+    for (const chunk of chunks) {
+      const before = items.length;
+      const cl = chunk.lines;
+      const tables = layout.findTables(cl);
+      let cursor = 0;
+      for (const t of [...tables, { start: cl.length, end: cl.length, cols: [] }]) {
+        if (t.start > cursor) for (const para of layout.buildParas(cl.slice(cursor, t.start), chunk.left, chunk.right)) items.push({ type: 'para', p: para });
+        if (t.end > t.start) {
+          const tl = cl.slice(t.start, t.end);
+          items.push({ type: 'table', lines: tl, top: tl[0].y - tl[0].fs, cols: t.cols });
+        }
+        cursor = t.end;
       }
-      cursor = t.end;
+      // A paragraph flowing from the bottom of one column to the top of the next is one paragraph
+      const prev = items[before - 1];
+      const first = items[before];
+      if (chunks.length > 1 && prev?.type === 'para' && first?.type === 'para' && prev.p.kind === 'para' && first.p.kind === 'para' && Math.abs(prev.p.fs - first.p.fs) < 0.5 && !/[.!?:…»"”]$/.test(prev.p.runs.map((r) => r.text).join('').trim()) && /^\p{Ll}/u.test(first.p.runs[0]?.text ?? '')) {
+        prev.p.runs = normalizeRuns([...prev.p.runs, { text: ' ' }, ...first.p.runs]);
+        items.splice(before, 1);
+      }
     }
     // Insert images and ruled tables by vertical position
     for (const e of extras) {
