@@ -3,6 +3,7 @@ import type { ConvertOptions } from '../../core/convert-lite';
 import { engine, EngineError } from '../engine/client';
 import type { ConvertResult } from '../engine/protocol';
 import { convertImage, pdfToImages, supportsAvifEncoding, toPdfImages, zipFiles } from '../raster';
+import { unlockPdf } from '../pdf-unlock';
 import { baseName, button, download, dropzone, formatBytes, h, handOff, icon, iconButton, note, onPasteFiles, prefs, readFile, toast } from '../ui';
 
 interface Options {
@@ -33,6 +34,8 @@ interface Item {
   opts: Options;
   showOptions: boolean;
   thumbUrl?: string;
+  /** The source PDF was encrypted and has been decrypted for processing. */
+  unlocked?: boolean;
   el: HTMLElement;
 }
 
@@ -203,6 +206,21 @@ export function mount(root: HTMLElement, params: URLSearchParams): () => void {
       }
       const det = detectFormat(file.name, item.bytes);
       item.format = det.format;
+      if (det.format === 'pdf') {
+        try {
+          const plain = await unlockPdf(item.bytes, file.name);
+          if (plain !== item.bytes) {
+            item.bytes = plain;
+            item.file = new File([plain as BlobPart], file.name, { type: 'application/pdf' });
+            item.unlocked = true;
+          }
+        } catch (e) {
+          item.error = (e as Error).message;
+          item.status = 'error';
+          paint(item);
+          continue;
+        }
+      }
       if (!det.format) {
         item.error = det.error;
         item.status = 'error';
@@ -468,6 +486,7 @@ export function mount(root: HTMLElement, params: URLSearchParams): () => void {
         const data = await engine.run<Uint8Array>({ op: 'imagesToPdf', images: imgs, opts: { pageSize: item.opts.imagePage } }, { transfer: imgs.map((i) => i.data.buffer), signal: ctrl.signal });
         item.result = { data, name: `${base}.pdf`, mime: FORMATS.pdf.mime };
       } else throw new Error('Неподдерживаемое преобразование.');
+      if (item.unlocked) item.warnings = [...(item.warnings ?? []), 'Исходный PDF был защищён: результат сохранён без пароля.'];
       item.status = 'done';
       item.el.dataset.ms = String(Math.round(performance.now() - t0));
     } catch (e) {

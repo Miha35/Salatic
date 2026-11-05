@@ -1,4 +1,5 @@
 import { acceptFor, detectFormat, DOC_READABLE, FORMATS, type FormatId } from '../../core/formats';
+import { unlockPdf } from '../pdf-unlock';
 import { htmlToDoc } from '../../core/readers/html';
 import { blocksToHtml, CSS_FONT, docToHtmlFragment } from '../../core/writers/text';
 import { familyOf, type FontFamily } from '../../core/model';
@@ -458,8 +459,16 @@ export function mount(root: HTMLElement): () => void {
 
   async function openFile(file: File): Promise<void> {
     if (editor.textContent?.trim() && dirty && !(await confirmDialog('Открыть файл', 'Несохранённые изменения будут заменены содержимым файла. Продолжить?', 'Открыть'))) return;
-    const bytes = await readFile(file);
+    let bytes = await readFile(file);
     const det = detectFormat(file.name, bytes);
+    if (det.format === 'pdf') {
+      try {
+        bytes = await unlockPdf(bytes, file.name);
+      } catch (e) {
+        toast((e as Error).message, 'error');
+        return;
+      }
+    }
     if (!det.format || FORMATS[det.format].kind === 'image') {
       toast(det.error ?? 'Этот формат нельзя открыть в редакторе документов. Изображения откройте в редакторе изображений.', 'error');
       return;

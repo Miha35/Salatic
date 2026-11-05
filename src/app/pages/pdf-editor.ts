@@ -1,9 +1,13 @@
 import { detectFormat, FORMATS } from '../../core/formats';
 import type { Annotation, PageSpec } from '../../core/pdf-tools';
+import type { FontFamily } from '../../core/model';
+import { registerEditorFonts } from '../editor-fonts';
+import { buildSegments, familyFor, type TextSeg } from '../../core/text-lines';
 import { bytesToBase64 } from '../../core/util';
 import { engine } from '../engine/client';
 import { openPdf, pdfErrorMessage, renderPage, type PdfDoc } from '../pdfjs';
 import { toPdfImage, toPdfImages, zipFiles } from '../raster';
+import { unlockPdf } from '../pdf-unlock';
 import { baseName, button, confirmDialog, download, dropzone, h, iconButton, note, onPasteFiles, pickFiles, readFile, takeHandoff, toast } from '../ui';
 
 // ---------------------------------------------------------------------------
@@ -75,9 +79,21 @@ interface PageItem {
   selected: boolean;
   thumb?: HTMLCanvasElement;
   dirty: boolean;
+  /** Ids of original text lines replaced with the "edit text" tool. */
+  replaced?: string[];
 }
 
-type Tool = 'select' | 'text' | 'whiteout' | 'highlight' | 'pen' | 'image';
+const CSS_FAMILY: Record<FontFamily, string> = {
+  sans: '"Liberation Sans", Arial, sans-serif',
+  serif: '"Liberation Serif", "Times New Roman", serif',
+  mono: '"Liberation Mono", "Courier New", monospace',
+  calibri: 'Carlito, Calibri, sans-serif',
+};
+const cssFont = (a: { font?: FontFamily }): string => CSS_FAMILY[a.font ?? 'sans'];
+
+
+
+type Tool = 'select' | 'edittext' | 'text' | 'whiteout' | 'highlight' | 'pen' | 'image';
 
 const A4: [number, number] = [595.28, 841.89];
 
@@ -127,7 +143,7 @@ function paintAnnotations(ctx: CanvasRenderingContext2D, vp: Viewport, anns: Ann
       const s = vp.scale;
       if (a.type === 'text') {
         ctx.fillStyle = rgbCss(a.color);
-        ctx.font = `${a.bold ? 700 : 400} ${a.size * s}px "Liberation Sans", Arial, sans-serif`;
+        ctx.font = `${a.italic ? 'italic ' : ''}${a.bold ? 700 : 400} ${a.size * s}px ${cssFont(a)}`;
         a.text.split('\n').forEach((line, i) => ctx.fillText(line, 0, i * a.size * 1.25 * s));
       } else if (a.type === 'rect') {
         ctx.globalAlpha = a.opacity;
@@ -194,7 +210,9 @@ export function mount(root: HTMLElement): () => void {
         const det = detectFormat(file.name, bytes);
         if (det.format === 'pdf') {
           if (!sources.length) fileName = baseName(file.name);
-          await addPdf(file.name, bytes);
+          const plain = await unlockPdf(bytes, file.name);
+          if (plain !== bytes) toast(`${file.name}: защита снята — сохранённый файл будет без пароля.`);
+          await addPdf(file.name, plain);
         } else if (det.format && FORMATS[det.format].kind === 'image') images.push({ file, format: det.format });
         else toast(`${file.name}: ${det.error ?? 'поддерживаются только PDF и изображения'}`, 'error');
       }
@@ -224,7 +242,7 @@ export function mount(root: HTMLElement): () => void {
     try {
       pdf = await openPdf(bytes);
     } catch (e) {
-      const msg = (e as Error)?.name === 'PasswordException' ? `${name}: PDF защищён паролем — редактирование невозможно.` : `${name}: ${pdfErrorMessage(e)}`;
+      const msg = (e as Error)?.name === 'PasswordException' ? `${name}: PDF защищён паролем.` : `${name}: ${pdfErrorMessage(e)}`;
       throw new Error(msg);
     }
     const src = sources.push({ name, bytes, pdf }) - 1;
@@ -488,15 +506,18 @@ export function mount(root: HTMLElement): () => void {
   let fontSize = 14;
   let strokeWidth = 2;
   let zoom = 1.4;
-  let undoStack: Annotation[][] = [];
+  let undoStack: { annotations: Annotation[]; replaced: string[] }[] = [];
   let selectedIdx = -1;
   let viewport: Viewport | null = null;
   let svg: SVGSVGElement | null = null;
   let stage: HTMLElement | null = null;
   let textEditor: HTMLTextAreaElement | null = null;
+  let pageCanvas: HTMLCanvasElement | null = null;
+  let segments: TextSeg[] = [];
 
   function openEditor(p: PageItem): void {
     loadDisplayFonts();
+    registerEditorFonts();
     editing = p;
     undoStack = [];
     selectedIdx = -1;
@@ -517,7 +538,7 @@ export function mount(root: HTMLElement): () => void {
 
   function snapshot(): void {
     if (!editing) return;
-    undoStack.push(editing.annotations.map(cloneAnn));
+    undoStack.push({ annotations: editing.annotations.map(cloneAnn), replaced: [...(editing.replaced ?? [])] });
     if (undoStack.length > 100) undoStack.shift();
   }
 
@@ -564,7 +585,8 @@ export function mount(root: HTMLElement): () => void {
       iconButton('chevron-right', 'Следующая страница', () => switchPage(idx + 1), { disabled: idx >= pages.length - 1 }),
       h('span', { class: 'toolbar__sep' }),
       toolBtn('select', 'pointer', 'Выбор и перемещение'),
-      toolBtn('text', 'type', 'Текст'),
+      toolBtn('edittext', 'edit-text', 'Править текст страницы'),
+      toolBtn('text', 'type', 'Добавить текст'),
       toolBtn('whiteout', 'eraser', 'Закрасить (замазка)'),
       toolBtn('highlight', 'highlighter', 'Выделить маркером'),
       toolBtn('pen', 'pen', 'Рисовать'),
@@ -582,6 +604,12 @@ export function mount(root: HTMLElement): () => void {
     );
     const hint = {
       select: 'Нажмите на пометку, чтобы выбрать; перетащите для перемещения; двойной щелчок по тексту — правка; угол — изменение размера.',
+      edittext:
+        p.src < 0
+          ? 'На пустой странице нет текста для правки — используйте «Добавить текст».'
+          : rot !== 0
+            ? 'Правка текста доступна на неповёрнутых страницах: верните поворот страницы к 0°.'
+            : 'Нажмите на строку текста страницы, исправьте её и нажмите Ctrl+Enter или щёлкните вне поля. Старая строка закрывается цветом фона, новая подбирает шрифт, размер и цвет.',
       text: 'Нажмите на страницу, введите текст. Ctrl+Enter или щелчок вне поля — готово.',
       whiteout: 'Протяните прямоугольник, чтобы закрыть часть страницы белым (или выбранным) цветом.',
       highlight: 'Протяните прямоугольник поверх текста, чтобы выделить его маркером.',
@@ -591,6 +619,8 @@ export function mount(root: HTMLElement): () => void {
 
     stage = h('div', { class: 'page-stage' });
     const canvas = document.createElement('canvas');
+    pageCanvas = canvas;
+    segments = [];
     viewport = new Viewport(p.view, zoom, rot);
     stage.style.width = `${viewport.width}px`;
     stage.style.height = `${viewport.height}px`;
@@ -614,11 +644,85 @@ export function mount(root: HTMLElement): () => void {
       }
       canvas.style.width = `${viewport.width}px`;
       canvas.style.height = `${viewport.height}px`;
+      if (tool === 'edittext' && p.src >= 0 && rot === 0) segments = await loadSegments(p);
     } catch (e) {
       toast(pdfErrorMessage(e), 'error');
     }
     await ensureImages(p.annotations);
     drawOverlay();
+  }
+
+  /** Lines of the page's own text (pdf.js text layer), with fonts identified from the rendered page. */
+  async function loadSegments(p: PageItem): Promise<TextSeg[]> {
+    const page = await sources[p.src].pdf.getPage(p.index + 1);
+    const tc = await page.getTextContent();
+    const objs = page.commonObjs as { has(id: string): boolean; get(id: string): { name?: string; bold?: boolean; italic?: boolean; isSerifFont?: boolean; isMonospace?: boolean } };
+    const styles = tc.styles as Record<string, { fontFamily?: string }>;
+    const info = (name: string): { family: FontFamily; bold: boolean; italic: boolean } => {
+      let f: { name?: string; bold?: boolean; italic?: boolean; isSerifFont?: boolean; isMonospace?: boolean } = {};
+      try {
+        if (objs.has(name)) f = objs.get(name) ?? {};
+      } catch {
+        f = {};
+      }
+      const fname = f.name ?? '';
+      const generic = styles[name]?.fontFamily ?? '';
+      return {
+        family: familyFor(fname, f.isSerifFont || generic === 'serif', f.isMonospace || generic === 'monospace'),
+        bold: !!f.bold || /bold|black|heavy|semibold|demi/i.test(fname),
+        italic: !!f.italic || /italic|oblique/i.test(fname),
+      };
+    };
+    const items = tc.items.filter((i): i is (typeof tc.items)[number] & { str: string; transform: number[]; width: number; fontName: string; hasEOL: boolean } => 'str' in i);
+    return buildSegments(items, info).filter((s) => !p.replaced?.includes(s.id));
+  }
+
+  /** Background and text colours of a page area, sampled from the rendered canvas. */
+  function sampleColors(box: { x: number; y: number; w: number; h: number }): { bg: [number, number, number]; fg: [number, number, number] } {
+    const white: [number, number, number] = [1, 1, 1];
+    const canvas = pageCanvas;
+    if (!canvas || !viewport) return { bg: white, fg: [0, 0, 0] };
+    const k = canvas.width / viewport.width;
+    const x0 = Math.max(0, Math.floor((box.x - 3) * k));
+    const y0 = Math.max(0, Math.floor((box.y - 3) * k));
+    const x1 = Math.min(canvas.width, Math.ceil((box.x + box.w + 3) * k));
+    const y1 = Math.min(canvas.height, Math.ceil((box.y + box.h + 3) * k));
+    if (x1 <= x0 || y1 <= y0) return { bg: white, fg: [0, 0, 0] };
+    const data = canvas.getContext('2d')!.getImageData(x0, y0, x1 - x0, y1 - y0).data;
+    const w = x1 - x0;
+    const hgt = y1 - y0;
+    // Background: median of the border ring
+    const ring: number[][] = [];
+    for (let x = 0; x < w; x++) for (const y of [0, hgt - 1]) ring.push([...data.subarray((y * w + x) * 4, (y * w + x) * 4 + 3)]);
+    for (let y = 0; y < hgt; y++) for (const x of [0, w - 1]) ring.push([...data.subarray((y * w + x) * 4, (y * w + x) * 4 + 3)]);
+    const med = (ch: number): number => ring.map((p) => p[ch]).sort((a, b) => a - b)[ring.length >> 1] / 255;
+    const bg: [number, number, number] = [med(0), med(1), med(2)];
+    // Text: the pixels farthest from the background
+    const px: { d: number; c: number[] }[] = [];
+    for (let i = 0; i < data.length; i += 4) {
+      const c = [data[i] / 255, data[i + 1] / 255, data[i + 2] / 255];
+      px.push({ d: Math.abs(c[0] - bg[0]) + Math.abs(c[1] - bg[1]) + Math.abs(c[2] - bg[2]), c });
+    }
+    px.sort((a, b) => b.d - a.d);
+    const top = px.slice(0, Math.max(1, Math.floor(px.length * 0.05)));
+    const fg = [0, 1, 2].map((ch) => top.reduce((s, p) => s + p.c[ch], 0) / top.length) as [number, number, number];
+    return { bg, fg: top[0].d < 0.15 ? [0, 0, 0] : fg };
+  }
+
+  function segBox(seg: TextSeg): { x: number; y: number; w: number; h: number } {
+    const s = viewport!.scale;
+    const [vx, vy] = viewport!.toView(seg.x, seg.y);
+    return { x: vx - 1, y: vy - seg.size * 0.92 * s, w: seg.w * s + 2, h: seg.size * 1.18 * s };
+  }
+
+  function editSegment(seg: TextSeg): void {
+    if (!viewport || !editing) return;
+    const box = segBox(seg);
+    const { bg, fg } = sampleColors(box);
+    const s = viewport.scale;
+    const [vx, vy] = viewport.toView(seg.x, seg.y);
+    const pseudo: Extract<Annotation, { type: 'text' }> = { type: 'text', x: seg.x, y: seg.y, size: Math.round(seg.size * 10) / 10, color: fg, text: seg.text, rotate: viewport.rotation, bold: seg.bold, italic: seg.italic, font: seg.font };
+    startText([vx - 1, vy - seg.size * s * 0.95], pseudo, { seg, bg });
   }
 
   function switchPage(i: number): void {
@@ -640,7 +744,8 @@ export function mount(root: HTMLElement): () => void {
   function undo(): void {
     const prev = undoStack.pop();
     if (!prev || !editing) return;
-    editing.annotations = prev;
+    editing.annotations = prev.annotations;
+    editing.replaced = prev.replaced;
     selectedIdx = -1;
     void renderEditor();
   }
@@ -701,7 +806,7 @@ export function mount(root: HTMLElement): () => void {
         const g = svgEl('g', { transform: `translate(${px} ${py}) rotate(${vp.rotation - a.rotate})` });
         const s = vp.scale;
         if (a.type === 'text') {
-          const t = svgEl('text', { x: 0, y: 0, fill: rgbCss(a.color), 'font-size': a.size * s, 'font-family': '"Liberation Sans", Arial, sans-serif', 'font-weight': a.bold ? 700 : 400, 'xml:space': 'preserve' });
+          const t = svgEl('text', { x: 0, y: 0, fill: rgbCss(a.color), 'font-size': a.size * s, 'font-family': cssFont(a), 'font-weight': a.bold ? 700 : 400, 'font-style': a.italic ? 'italic' : 'normal', 'xml:space': 'preserve' });
           a.text.split('\n').forEach((line, k) => {
             const span = svgEl('tspan', { x: 0, dy: k ? `${1.25}em` : 0 });
             span.textContent = line || ' ';
@@ -720,6 +825,15 @@ export function mount(root: HTMLElement): () => void {
       el.style.pointerEvents = tool === 'select' ? 'all' : 'none';
       svg!.append(el);
     });
+    if (tool === 'edittext') {
+      for (const seg of segments) {
+        const b = segBox(seg);
+        const r = svgEl('rect', { x: b.x, y: b.y, width: Math.max(4, b.w), height: b.h, class: 'text-seg', 'data-seg': seg.id });
+        r.append(svgEl('title', {}));
+        r.firstChild!.textContent = 'Править: ' + seg.text;
+        svg.append(r);
+      }
+    }
     // Selection outline + resize handle
     const sel = editing.annotations[selectedIdx];
     if (sel && tool === 'select') {
@@ -749,6 +863,19 @@ export function mount(root: HTMLElement): () => void {
       if (!editing || !viewport || e.button !== 0) return;
       if ((e.target as HTMLElement).tagName === 'TEXTAREA') return;
       const pt = localPoint(e);
+      if (tool === 'edittext') {
+        if (textEditor) {
+          commitText();
+          return;
+        }
+        const id = ((e.target as SVGElement).closest?.('[data-seg]') as SVGElement | null)?.dataset.seg;
+        const seg = segments.find((x) => x.id === id);
+        if (seg) {
+          e.preventDefault();
+          editSegment(seg);
+        }
+        return;
+      }
       if (tool === 'text') {
         if (textEditor) {
           commitText();
@@ -884,13 +1011,22 @@ export function mount(root: HTMLElement): () => void {
     return out;
   }
 
-  function startText(pt: [number, number], existing?: Extract<Annotation, { type: 'text' }>): void {
+  function startText(pt: [number, number], existing?: Extract<Annotation, { type: 'text' }>, replace?: { seg: TextSeg; bg: [number, number, number] }): void {
     if (!stage || !viewport) return;
     const s = viewport.scale;
     const size = existing?.size ?? fontSize;
-    const ta = h('textarea', { class: 'text-edit', 'aria-label': 'Текст пометки', rows: 1 });
+    const ta = h('textarea', { class: 'text-edit', 'aria-label': replace ? 'Исправленный текст строки' : 'Текст пометки', rows: 1 });
     ta.value = existing?.text ?? '';
-    Object.assign(ta.style, { left: `${pt[0]}px`, top: `${pt[1]}px`, fontSize: `${size * s}px`, color: existing ? rgbCss(existing.color) : color, fontWeight: existing?.bold ? '700' : '400' });
+    Object.assign(ta.style, {
+      left: `${pt[0]}px`,
+      top: `${pt[1]}px`,
+      fontSize: `${size * s}px`,
+      color: existing ? rgbCss(existing.color) : color,
+      fontWeight: existing?.bold ? '700' : '400',
+      fontStyle: existing?.italic ? 'italic' : 'normal',
+      fontFamily: cssFont(existing ?? {}),
+      background: replace ? rgbCss(replace.bg) : '',
+    });
     const fit = (): void => {
       ta.style.height = 'auto';
       ta.style.height = `${ta.scrollHeight}px`;
@@ -906,7 +1042,7 @@ export function mount(root: HTMLElement): () => void {
       e.stopPropagation();
     });
     ta.addEventListener('blur', () => setTimeout(commitText, 0));
-    (ta as HTMLTextAreaElement & { _meta?: unknown })._meta = { pt, size, color: existing?.color ?? hexToRgb(color), bold: existing?.bold, existing: !!existing };
+    (ta as HTMLTextAreaElement & { _meta?: unknown })._meta = { pt, size, color: existing?.color ?? hexToRgb(color), bold: existing?.bold, italic: existing?.italic, font: existing?.font, existing: !!existing, replace };
     stage.append(ta);
     textEditor = ta;
     fit();
@@ -917,15 +1053,31 @@ export function mount(root: HTMLElement): () => void {
     const ta = textEditor;
     if (!ta || !editing || !viewport) return;
     textEditor = null;
-    const meta = (ta as HTMLTextAreaElement & { _meta?: { pt: [number, number]; size: number; color: [number, number, number]; bold?: boolean; existing: boolean } })._meta!;
+    type Meta = { pt: [number, number]; size: number; color: [number, number, number]; bold?: boolean; italic?: boolean; font?: FontFamily; existing: boolean; replace?: { seg: TextSeg; bg: [number, number, number] } };
+    const meta = (ta as HTMLTextAreaElement & { _meta?: Meta })._meta!;
     const text = ta.value.replace(/\s+$/, '');
     ta.remove();
+    if (meta.replace) {
+      // Editing the page's own text: cover the old line, write the new one in its place
+      const seg = meta.replace.seg;
+      if (text !== seg.text) {
+        snapshot();
+        const pad = seg.size * 0.08;
+        editing.annotations.push({ type: 'rect', x: seg.x - pad, y: seg.y - seg.size * 0.26, w: seg.w + 2 * pad, h: seg.size * 1.2, color: meta.replace.bg, opacity: 1, rotate: viewport.rotation });
+        if (text) editing.annotations.push({ type: 'text', x: seg.x, y: seg.y, size: meta.size, color: meta.color, text, rotate: viewport.rotation, bold: meta.bold, italic: meta.italic, font: meta.font });
+        editing.replaced = [...(editing.replaced ?? []), seg.id];
+        segments = segments.filter((x) => x !== seg);
+      }
+      drawOverlay();
+      refreshToolbarState();
+      return;
+    }
     if (text) {
       if (!meta.existing) snapshot();
       const s = viewport.scale;
       // Baseline of the first line ≈ top + ascent
       const [x, y] = viewport.toPdf(meta.pt[0] + 1, meta.pt[1] + meta.size * s * 0.95);
-      editing.annotations.push({ type: 'text', x, y, size: meta.size, color: meta.color, text, rotate: viewport.rotation, bold: meta.bold });
+      editing.annotations.push({ type: 'text', x, y, size: meta.size, color: meta.color, text, rotate: viewport.rotation, bold: meta.bold, italic: meta.italic, font: meta.font });
     }
     drawOverlay();
     refreshToolbarState();

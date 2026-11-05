@@ -1,6 +1,7 @@
 /** PDF assembly: images → PDF, and page composition for the PDF editor (merge, reorder, rotate, annotate). */
 import { concatTransformationMatrix, degrees, drawObject, LineCapStyle, PDFDocument, popGraphicsState, pushGraphicsState, rgb, type PDFImage, type PDFPage } from 'pdf-lib';
-import { FontManager, type FontKey, type FontLoader } from './pdf-fonts';
+import { FontManager, styleOf, type FontKey, type FontLoader } from './pdf-fonts';
+import type { FontFamily } from './model';
 import type { Subsetter } from './hb-subset';
 import { ConvertError } from './util';
 
@@ -115,7 +116,7 @@ export async function overlayTextLayers(base: Uint8Array, layers: TextLayer[]): 
 
 /** Annotation coordinates are in PDF user space of the target page (already converted by the editor). */
 export type Annotation =
-  | { type: 'text'; x: number; y: number; size: number; color: [number, number, number]; text: string; rotate: number; bold?: boolean }
+  | { type: 'text'; x: number; y: number; size: number; color: [number, number, number]; text: string; rotate: number; bold?: boolean; italic?: boolean; font?: FontFamily }
   | { type: 'rect'; x: number; y: number; w: number; h: number; color: [number, number, number]; opacity: number; rotate: number }
   | { type: 'image'; x: number; y: number; w: number; h: number; data: Uint8Array; mime: 'image/png' | 'image/jpeg'; rotate: number }
   | { type: 'path'; points: [number, number][]; color: [number, number, number]; width: number; opacity: number };
@@ -131,6 +132,9 @@ export interface PageSpec {
   annotations?: Annotation[];
 }
 
+/** Font of a text annotation: family (sans by default) and style. */
+const textKey = (a: { font?: FontFamily; bold?: boolean; italic?: boolean }): FontKey => `${a.font ?? 'sans'}-${styleOf(!!a.bold, !!a.italic)}`;
+
 export async function composePdf(sources: Uint8Array[], pages: PageSpec[], fonts?: FontLoader, subsetter?: Subsetter): Promise<Uint8Array> {
   if (!pages.length) throw new ConvertError('В документе не осталось страниц.');
   const out = await PDFDocument.create();
@@ -143,7 +147,7 @@ export async function composePdf(sources: Uint8Array[], pages: PageSpec[], fonts
     out.registerFontkit((await import('@pdf-lib/fontkit')).default);
     fm = new FontManager(fonts, subsetter);
     for (const a of texts) {
-      const primary: FontKey = a.bold ? 'sans-bold' : 'sans-regular';
+      const primary = textKey(a);
       await fm.load([primary]);
       const need = new Set<FontKey>();
       for (const ch of a.text) for (const k of fm.fallbacksFor(primary, ch.codePointAt(0)!)) need.add(k);
@@ -158,7 +162,7 @@ export async function composePdf(sources: Uint8Array[], pages: PageSpec[], fonts
           if (segs.length && segs[segs.length - 1].key === k) segs[segs.length - 1].text += c;
           else segs.push({ key: k, text: c });
         }
-        segmentsOf.set(`${a.bold ? 1 : 0}|${line}`, segs);
+        segmentsOf.set(`${primary}|${line}`, segs);
       }
     }
     await fm.embedAll(out);
@@ -173,7 +177,16 @@ export async function composePdf(sources: Uint8Array[], pages: PageSpec[], fonts
     } catch {
       throw new ConvertError('Один из PDF-файлов повреждён и не может быть обработан.');
     }
-    if (doc.isEncrypted) throw new ConvertError('PDF зашифрован (защищён паролем или ограничениями). Редактирование такого файла невозможно.', 'encrypted');
+    if (doc.isEncrypted) {
+      // Permission-only protection (empty user password) is removed transparently
+      const { decryptPdf } = await import('./pdf-decrypt');
+      try {
+        doc = await PDFDocument.load(await decryptPdf(s, ''), { updateMetadata: false });
+      } catch (e) {
+        if (e instanceof ConvertError && e.code === 'password_required') throw new ConvertError('PDF защищён паролем: откройте его заново и введите пароль.', 'password_required');
+        throw e;
+      }
+    }
     loaded.push(doc);
   }
   if (loaded.length === 1 && !out.getTitle()) {
@@ -207,7 +220,7 @@ export async function composePdf(sources: Uint8Array[], pages: PageSpec[], fonts
             // Successive lines move "down" in the rotated text frame; segments advance along it
             const dy = i * a.size * 1.25;
             let adv = 0;
-            for (const seg of segmentsOf.get(`${a.bold ? 1 : 0}|${line}`) ?? []) {
+            for (const seg of segmentsOf.get(`${textKey(a)}|${line}`) ?? []) {
               page.drawText(seg.text, {
                 x: a.x + Math.sin(rad) * dy + Math.cos(rad) * adv,
                 y: a.y - Math.cos(rad) * dy + Math.sin(rad) * adv,

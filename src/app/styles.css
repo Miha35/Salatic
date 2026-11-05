@@ -909,6 +909,19 @@ input[type='range'] {
   height: 100%;
 }
 
+.page-stage svg.overlay rect.text-seg {
+  fill: rgba(79, 70, 229, 0.05);
+  stroke: rgba(79, 70, 229, 0.35);
+  stroke-width: 1;
+  stroke-dasharray: 3 3;
+  cursor: text;
+  pointer-events: all;
+}
+.page-stage svg.overlay rect.text-seg:hover {
+  fill: rgba(79, 70, 229, 0.14);
+  stroke: #4f46e5;
+  stroke-dasharray: none;
+}
 .page-stage textarea.text-edit {
   position: absolute;
   min-width: 120px;

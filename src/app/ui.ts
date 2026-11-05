@@ -46,6 +46,7 @@ const ICONS: Record<string, string> = {
   move: '<path d="M12 3v18M3 12h18M12 3l-3 3m3-3 3 3m-3 15-3-3m3 3 3-3M3 12l3-3m-3 3 3 3m15-3-3-3m3 3-3 3"/>',
   pointer: '<path d="M5 3l14 7-6 2-2 6z"/>',
   type: '<path d="M5 6V4h14v2M12 4v16M9 20h6"/>',
+  'edit-text': '<path d="M4 7V5h11v2M9.5 5v12M7 17h5"/><path d="m14 20 1-3 5-5a1.4 1.4 0 0 1 2 2l-5 5z"/>',
   square: '<rect x="4" y="4" width="16" height="16" rx="1"/>',
   eraser: '<path d="M8 20h12M5.5 13.5l7-7a2 2 0 0 1 2.8 0l2.2 2.2a2 2 0 0 1 0 2.8L11 18H8.5z"/>',
   highlighter: '<path d="m9 11 6 6M4 20h6l9.5-9.5a2.1 2.1 0 0 0-3-3L7 17z"/>',
@@ -151,9 +152,9 @@ export function openDialog(build: (close: (value?: unknown) => void) => Node): P
   });
 }
 
-export async function promptText(title: string, label: string, value = '', placeholder = ''): Promise<string | null> {
+export async function promptText(title: string, label: string, value = '', placeholder = '', type: 'text' | 'password' = 'text'): Promise<string | null> {
   const res = await openDialog((close) => {
-    const input = h('input', { class: 'input', value, placeholder, 'aria-label': label });
+    const input = h('input', { class: 'input', type, value, placeholder, 'aria-label': label, autocomplete: type === 'password' ? 'current-password' : 'off' });
     const form = h(
       'form',
       {

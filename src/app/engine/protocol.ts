@@ -16,7 +16,8 @@ export type EngineRequest =
   | { op: 'writeDoc'; doc: Doc; to: FormatId; opts: ConvertOptions; title?: string }
   | { op: 'overlayText'; base: Uint8Array; layers: TextLayer[] }
   | { op: 'composePdf'; sources: Uint8Array[]; pages: PageSpec[] }
-  | { op: 'decodeImage'; bytes: Uint8Array; format: 'tiff' | 'heic' };
+  | { op: 'decodeImage'; bytes: Uint8Array; format: 'tiff' | 'heic' }
+  | { op: 'decryptPdf'; bytes: Uint8Array; password: string };
 
 export interface ConvertResult {
   data: Uint8Array;

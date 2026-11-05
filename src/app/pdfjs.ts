@@ -18,6 +18,8 @@ export async function openPdf(data: Uint8Array, password?: string): Promise<PdfD
   const pdfjs = await loadPdfjs();
   const origin = location.origin;
   return pdfjs.getDocument({
+    // Font names and style flags let the PDF editor match the font of existing text
+    fontExtraProperties: true,
     data: data.slice(),
     password,
     cMapUrl: `${origin}/pdfjs/cmaps/`,

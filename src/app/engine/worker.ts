@@ -182,6 +182,11 @@ async function handle(id: number, req: EngineRequest): Promise<{ result: unknown
       const pages = await decodePages(req.bytes, req.format);
       return { result: pages, transfer: pages.map((p) => p.data.buffer) };
     }
+    case 'decryptPdf': {
+      const { decryptPdf } = await import('../../core/pdf-decrypt');
+      const data = await decryptPdf(req.bytes, req.password);
+      return { result: data, transfer: [data.buffer] };
+    }
     case 'composePdf': {
       const { composePdf } = await import('../../core/pdf-tools');
       const needsFonts = req.pages.some((p) => p.annotations?.some((a) => a.type === 'text'));
