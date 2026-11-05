@@ -110,7 +110,7 @@ export interface Workbook {
   sheets: Sheet[];
 }
 
-export type Content = { kind: 'doc'; doc: Doc } | { kind: 'book'; book: Workbook };
+export type Content = { kind: 'doc'; doc: Doc } | { kind: 'book'; book: Workbook } | { kind: 'slides'; deck: import('./slides').Deck };
 
 // ---------------------------------------------------------------------------
 // Helpers

@@ -19,6 +19,7 @@ export type FormatId =
   | 'odt'
   | 'rtf'
   | 'epub'
+  | 'pptx'
   | 'ods'
   | 'png'
   | 'jpg'
@@ -76,6 +77,14 @@ export const FORMATS: Record<FormatId, FormatInfo> = {
   odt: { id: 'odt', label: 'OpenDocument', ext: 'odt', mime: 'application/vnd.oasis.opendocument.text', kind: 'document', description: 'Текст OpenDocument (LibreOffice)' },
   rtf: { id: 'rtf', label: 'RTF', ext: 'rtf', mime: 'application/rtf', kind: 'document', description: 'Документ RTF (WordPad, Word)' },
   epub: { id: 'epub', label: 'EPUB', ext: 'epub', mime: 'application/epub+zip', kind: 'document', description: 'Электронная книга EPUB' },
+  pptx: {
+    id: 'pptx',
+    label: 'PowerPoint',
+    ext: 'pptx',
+    mime: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    kind: 'document',
+    description: 'Презентация PowerPoint',
+  },
   ods: { id: 'ods', label: 'OpenDocument Calc', ext: 'ods', mime: 'application/vnd.oasis.opendocument.spreadsheet', kind: 'data', description: 'Таблица OpenDocument (LibreOffice)' },
   png: { id: 'png', label: 'PNG', ext: 'png', mime: 'image/png', kind: 'image', description: 'Изображение PNG' },
   jpg: { id: 'jpg', label: 'JPG', ext: 'jpg', mime: 'image/jpeg', kind: 'image', description: 'Изображение JPEG' },
@@ -88,7 +97,7 @@ export const FORMATS: Record<FormatId, FormatInfo> = {
 };
 
 /** Formats handled by the document/data engine (no canvas required). */
-export const DOC_READABLE: FormatId[] = ['pdf', 'docx', 'doc', 'odt', 'rtf', 'epub', 'txt', 'md', 'html', 'csv', 'tsv', 'json', 'xlsx', 'xls', 'ods'];
+export const DOC_READABLE: FormatId[] = ['pdf', 'docx', 'doc', 'odt', 'rtf', 'epub', 'pptx', 'txt', 'md', 'html', 'csv', 'tsv', 'json', 'xlsx', 'xls', 'ods'];
 export const DOC_WRITABLE: FormatId[] = ['pdf', 'docx', 'odt', 'rtf', 'epub', 'txt', 'md', 'html', 'csv', 'tsv', 'json', 'xlsx', 'ods'];
 export const IMAGE_INPUTS: FormatId[] = ['png', 'jpg', 'webp', 'gif', 'bmp', 'svg', 'ico', 'avif'];
 /** Image outputs the browser can always encode (avif is feature-detected at runtime). */
@@ -101,6 +110,7 @@ const TARGETS: Partial<Record<FormatId, FormatId[]>> = {
   odt: ['docx', 'pdf', 'rtf', 'epub', 'txt', 'md', 'html', 'xlsx', 'ods', 'csv'],
   rtf: ['docx', 'pdf', 'odt', 'epub', 'txt', 'md', 'html'],
   epub: ['pdf', 'docx', 'odt', 'rtf', 'txt', 'md', 'html'],
+  pptx: ['pdf', 'docx', 'odt', 'rtf', 'txt', 'md', 'html'],
   txt: ['pdf', 'docx', 'odt', 'rtf', 'epub', 'md', 'html'],
   md: ['pdf', 'docx', 'odt', 'rtf', 'epub', 'html', 'txt'],
   html: ['pdf', 'docx', 'odt', 'rtf', 'epub', 'md', 'txt', 'xlsx', 'csv'],
@@ -171,6 +181,10 @@ const EXT_MAP: Record<string, FormatId> = {
   ots: 'ods',
   rtf: 'rtf',
   epub: 'epub',
+  pptx: 'pptx',
+  pptm: 'pptx',
+  ppsx: 'pptx',
+  potx: 'pptx',
   png: 'png',
   jpg: 'jpg',
   jpeg: 'jpg',
@@ -184,8 +198,7 @@ const EXT_MAP: Record<string, FormatId> = {
 };
 
 const UNSUPPORTED_HINTS: Record<string, string> = {
-  ppt: 'Презентации пока не поддерживаются.',
-  pptx: 'Презентации пока не поддерживаются.',
+  ppt: 'Старый формат презентаций .ppt не поддерживается. Откройте файл в PowerPoint или LibreOffice и сохраните как .pptx.',
   heic: 'Формат HEIC не поддерживается браузером. Сохраните фото как JPG.',
   tif: 'Формат TIFF не поддерживается браузером. Сохраните изображение как PNG.',
   tiff: 'Формат TIFF не поддерживается браузером. Сохраните изображение как PNG.',
@@ -222,6 +235,7 @@ function zipKind(bytes: Uint8Array): FormatId | null {
       filter: (f) => {
         if (f.name === 'word/document.xml') kind = 'docx';
         else if (f.name === 'xl/workbook.xml') kind = 'xlsx';
+        else if (f.name === 'ppt/presentation.xml') kind = 'pptx';
         return f.name === 'mimetype' && f.originalSize < 200;
       },
     });
@@ -257,7 +271,7 @@ export function detectFormat(name: string, bytes: Uint8Array): Detection {
   if (startsWith(bytes, [0x50, 0x4b, 0x03, 0x04])) {
     const kind = zipKind(bytes);
     if (kind) return { format: kind };
-    return { format: null, error: UNSUPPORTED_HINTS[ext] ?? 'Этот ZIP-архив не является документом Word, Excel, OpenDocument или книгой EPUB.' };
+    return { format: null, error: UNSUPPORTED_HINTS[ext] ?? 'Этот ZIP-архив не является документом Word, Excel, PowerPoint, OpenDocument или книгой EPUB.' };
   }
   if (UNSUPPORTED_HINTS[ext]) return { format: null, error: UNSUPPORTED_HINTS[ext] };
   const byExt = EXT_MAP[ext];

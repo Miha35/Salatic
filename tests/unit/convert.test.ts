@@ -15,6 +15,7 @@ import { docToRtf } from '../../src/core/writers/rtf';
 import { rtfToDoc } from '../../src/core/readers/rtf';
 import { docToEpub } from '../../src/core/writers/epub';
 import { epubToDoc } from '../../src/core/readers/epub';
+import { makePptx } from './pptx-fixture';
 import type { Workbook } from '../../src/core/model';
 import { bytes, env, hasCmd, loadFonts, pdfToText, soffice, text } from './helpers';
 import { sample } from './sample';
@@ -61,6 +62,8 @@ async function fixture(f: FormatId): Promise<Uint8Array> {
       return bookToOds(book);
     case 'epub':
       return docToEpub(sample).data;
+    case 'pptx':
+      return makePptx();
     // legacy binary formats are produced by LibreOffice (tests are skipped without it)
     case 'doc':
       return soffice(docToDocx(sample).data, 'docx', 'doc:MS Word 97');
@@ -113,7 +116,7 @@ describe('conversion matrix', () => {
         const input = await fixture(from);
         const isData = FORMATS[from].kind === 'data';
         // docx/html → table formats export the table; data → anything keeps the cells
-        const expectText = isData ? 'Яблоки' : FORMATS[to].kind === 'data' ? 'Москва' : 'Отчёт о работе';
+        const expectText = isData ? 'Яблоки' : from === 'pptx' ? 'Список и объекты' : FORMATS[to].kind === 'data' ? 'Москва' : 'Отчёт о работе';
         const out = await convert(input, from, to, env, {}, 'файл');
         expect(out.ext === FORMATS[to].ext || out.ext === 'zip').toBe(true);
         validate(to, out.data, expectText);

@@ -44,6 +44,11 @@ export async function readContent(bytes: Uint8Array, from: FormatId, env: Conver
 export async function writeContent(content: Content, to: FormatId, env: ConvertEnv, opts: ConvertOptions = {}, title?: string): Promise<ConvertOutput> {
   if (to === 'pdf') {
     if (!env.fonts) throw new ConvertError('Создание PDF недоступно в этой среде.', 'unsupported');
+    if (content.kind === 'slides') {
+      const { deckToPdf } = await import('./writers/slides-pdf');
+      const r = await deckToPdf({ ...content.deck, title: content.deck.title ?? title }, { fonts: env.fonts, subsetter: env.subsetter, transcodeImage: env.transcodeImage, onProgress: env.onProgress });
+      return { data: r.data, mime: FORMATS.pdf.mime, ext: 'pdf', warnings: r.warnings };
+    }
     const { docToPdf } = await import('./writers/pdf');
     const doc: Doc = asDoc(content, title);
     const r = await docToPdf({ ...doc, title: doc.title ?? title }, { fonts: env.fonts, subsetter: env.subsetter, transcodeImage: env.transcodeImage }, { pageSize: opts.pageSize });

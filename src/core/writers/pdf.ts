@@ -35,16 +35,16 @@ export interface PdfOptions {
   subsetFonts?: boolean;
 }
 
-type Color = [number, number, number];
+export type Color = [number, number, number];
 
-type Op =
+export type Op =
   | { k: 'text'; x: number; y: number; top: number; bottom: number; text: string; font: FontKey; size: number; color: Color; field?: 'page' | 'pages'; fieldW?: number; anchor?: Align; noteRef?: number }
   | { k: 'line'; x1: number; y1: number; x2: number; y2: number; w: number; color: Color; top: number; bottom: number }
   | { k: 'rect'; x: number; y: number; w: number; h: number; fill?: Color; stroke?: Color; clip: true; top: number; bottom: number }
   | { k: 'image'; x: number; y: number; w: number; h: number; img: PDFImage; top: number; bottom: number }
   | { k: 'link'; x: number; y: number; w: number; h: number; url: string; top: number; bottom: number };
 
-interface Box {
+export interface Box {
   height: number;
   ops: Op[];
   spaceBefore: number;
@@ -67,7 +67,7 @@ interface Token {
 }
 
 /** Inherited layout context. */
-interface Ctx {
+export interface Ctx {
   family: FontFamily;
   size: number;
   bold?: boolean;
@@ -89,15 +89,15 @@ const HEADING_SCALE = [0, 2, 1.64, 1.36, 1.18, 1.09, 1];
 const MM = 72 / 25.4;
 const FALLBACK_CHARS: Record<string, string> = { '\u2028': ' ', '\u2029': ' ' };
 
-const hexColor = (hex: string): Color => [parseInt(hex.slice(0, 2), 16) / 255, parseInt(hex.slice(2, 4), 16) / 255, parseInt(hex.slice(4, 6), 16) / 255];
+export const hexColor = (hex: string): Color => [parseInt(hex.slice(0, 2), 16) / 255, parseInt(hex.slice(2, 4), 16) / 255, parseInt(hex.slice(4, 6), 16) / 255];
 
-class PdfWriter {
-  private pdf!: PDFDocument;
-  private fm: FontManager;
-  private images = new Map<Uint8Array, PDFImage | null>();
+export class PdfWriter {
+  protected pdf!: PDFDocument;
+  protected fm: FontManager;
+  protected images = new Map<Uint8Array, PDFImage | null>();
   warnings = new Set<string>();
-  private pageW = 595.28;
-  private pageH = 841.89;
+  protected pageW = 595.28;
+  protected pageH = 841.89;
   private margins = { top: 20 * MM, right: 20 * MM, bottom: 20 * MM, left: 20 * MM };
   private headerDist = 12.5 * MM;
   private footerDist = 12.5 * MM;
@@ -106,7 +106,7 @@ class PdfWriter {
   private pages: PDFPage[] = [];
   private page!: PDFPage;
   private cursor = 0;
-  private base: Ctx = { family: 'sans', size: 11 };
+  protected base: Ctx = { family: 'sans', size: 11 };
   private defaults: ParaFormat = {};
   private notes: Note[] = [];
   private placedNotes = new Set<number>();
@@ -117,8 +117,8 @@ class PdfWriter {
   private footerBlocks: Block[] = [];
 
   constructor(
-    private env: PdfWriteEnv,
-    private opts: PdfOptions,
+    protected env: PdfWriteEnv,
+    protected opts: PdfOptions,
   ) {
     this.fm = new FontManager(env.fonts, env.subsetter);
   }
@@ -152,18 +152,18 @@ class PdfWriter {
 
   // ------------------------------------------------------------------ text
 
-  private keyFor(r: TextRun, ctx: Ctx): FontKey {
+  protected keyFor(r: TextRun, ctx: Ctx): FontKey {
     const family: FontFamily = r.code ? 'mono' : (r.font ?? ctx.family);
     return `${family}-${styleOf(!!(r.bold || ctx.bold), !!(r.italic || ctx.italic))}`;
   }
 
-  private sizeFor(r: TextRun, ctx: Ctx): number {
+  protected sizeFor(r: TextRun, ctx: Ctx): number {
     const s = r.size ?? (r.code && !r.font ? ctx.size * 0.92 : ctx.size);
     return r.sup || r.sub || r.note ? s * 0.68 : s;
   }
 
   /** Split runs into tokens; each token is drawn with a single font. */
-  private async tokens(runs: TextRun[], ctx: Ctx): Promise<Token[]> {
+  protected async tokens(runs: TextRun[], ctx: Ctx): Promise<Token[]> {
     const out: Token[] = [];
     for (const r of runs) {
       const primary = this.keyFor(r, ctx);
@@ -243,7 +243,7 @@ class PdfWriter {
   }
 
   /** Group tokens into unbreakable units (a word possibly made of several fonts). */
-  private breakLines(tokens: Token[], firstWidth: number, width: number, keepIndent = false): Token[][] {
+  protected breakLines(tokens: Token[], firstWidth: number, width: number, keepIndent = false): Token[][] {
     const lines: Token[][] = [];
     let line: Token[] = [];
     let w = 0;
@@ -328,7 +328,7 @@ class PdfWriter {
   }
 
   /** Lay out runs as a paragraph box. */
-  private async textBox(runs: TextRun[], x: number, width: number, ctx: Ctx, p: ReturnType<PdfWriter['para']>, keepIndent = false): Promise<Box> {
+  protected async textBox(runs: TextRun[], x: number, width: number, ctx: Ctx, p: ReturnType<PdfWriter['para']>, keepIndent = false): Promise<Box> {
     const tokens = await this.tokens(runs, ctx);
     const left = x + p.indent;
     const firstX = left + p.firstLine;
@@ -405,7 +405,7 @@ class PdfWriter {
 
   // ------------------------------------------------------------------ blocks
 
-  private async image(b: Extract<Block, { type: 'image' }>): Promise<PDFImage | null> {
+  protected async image(b: Extract<Block, { type: 'image' }>): Promise<PDFImage | null> {
     if (this.images.has(b.data)) return this.images.get(b.data)!;
     let data = b.data;
     let mime = b.mime;
@@ -714,7 +714,7 @@ class PdfWriter {
     }
   }
 
-  private draw(ops: Op[], offset: number, from: number, to: number, page = this.page, pageNo = 0, total = 0): void {
+  protected draw(ops: Op[], offset: number, from: number, to: number, page = this.page, pageNo = 0, total = 0): void {
     const H = this.pageH;
     for (const o of ops) {
       if (o.k === 'rect') {

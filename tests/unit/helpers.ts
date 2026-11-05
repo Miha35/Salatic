@@ -61,6 +61,32 @@ export function pdfToText(pdf: Uint8Array): string {
   });
 }
 
+export interface WordBox {
+  page: number;
+  text: string;
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
+
+/** Word bounding boxes (points, y from the top) via `pdftotext -bbox`. */
+export function pdfWords(pdf: Uint8Array): WordBox[] {
+  const html = withTemp((dir) => {
+    const f = join(dir, 'in.pdf');
+    writeFileSync(f, pdf);
+    return execFileSync('pdftotext', ['-bbox', f, '-'], { encoding: 'utf8' });
+  });
+  const out: WordBox[] = [];
+  let page = 0;
+  for (const line of html.split('\n')) {
+    if (line.includes('<page ')) page++;
+    const m = /<word xMin="([\d.]+)" yMin="([\d.]+)" xMax="([\d.]+)" yMax="([\d.]+)">(.*?)<\/word>/.exec(line);
+    if (m) out.push({ page, text: m[5].replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>'), x0: +m[1], y0: +m[2], x1: +m[3], y1: +m[4] });
+  }
+  return out;
+}
+
 /** Convert with LibreOffice (headless) and return the produced file bytes. */
 export function soffice(input: Uint8Array, ext: string, target: string): Uint8Array {
   return withTemp((dir) => {

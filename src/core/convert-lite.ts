@@ -17,6 +17,7 @@ import { rtfToDoc } from './readers/rtf';
 import { docToRtf } from './writers/rtf';
 import { epubToDoc } from './readers/epub';
 import { docToEpub } from './writers/epub';
+import { deckToDoc, pptxToDeck } from './readers/pptx';
 import { htmlToDoc } from './readers/html';
 import { markdownToDoc } from './readers/markdown';
 import { textToDoc } from './readers/text';
@@ -38,7 +39,7 @@ export interface ConvertOutput {
   warnings: string[];
 }
 
-export const LITE_FORMATS: FormatId[] = ['docx', 'doc', 'odt', 'rtf', 'epub', 'txt', 'md', 'html', 'csv', 'tsv', 'json', 'xlsx', 'xls', 'ods'];
+export const LITE_FORMATS: FormatId[] = ['docx', 'doc', 'odt', 'rtf', 'epub', 'pptx', 'txt', 'md', 'html', 'csv', 'tsv', 'json', 'xlsx', 'xls', 'ods'];
 
 export function readLite(bytes: Uint8Array, from: FormatId, title?: string): { content: Content; warnings: string[] } {
   switch (from) {
@@ -71,6 +72,11 @@ export function readLite(bytes: Uint8Array, from: FormatId, title?: string): { c
       doc.title ??= title;
       return { content: { kind: 'doc', doc }, warnings };
     }
+    case 'pptx': {
+      const { deck, warnings } = pptxToDeck(bytes);
+      deck.title ??= title;
+      return { content: { kind: 'slides', deck }, warnings };
+    }
     case 'epub': {
       const { doc, warnings } = epubToDoc(bytes);
       doc.title ??= title;
@@ -96,12 +102,14 @@ export function readLite(bytes: Uint8Array, from: FormatId, title?: string): { c
 }
 
 export function asDoc(content: Content, title?: string): Doc {
-  return content.kind === 'doc' ? content.doc : bookToDoc(content.book, title);
+  if (content.kind === 'doc') return content.doc;
+  if (content.kind === 'slides') return deckToDoc(content.deck);
+  return bookToDoc(content.book, title);
 }
 
 export function asBook(content: Content): Workbook {
   if (content.kind === 'book') return content.book;
-  const book = docToBook(content.doc);
+  const book = docToBook(asDoc(content));
   if (!book.sheets.length) throw new ConvertError('В документе нет таблиц, которые можно сохранить как таблицу данных.', 'no_tables');
   return book;
 }
