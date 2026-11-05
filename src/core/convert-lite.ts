@@ -9,6 +9,8 @@ import type { Content, Doc, Workbook } from './model';
 import { bookToDoc, docToBook } from './model';
 import { csvToBook, jsonToBook, xlsxToBook } from './readers/data';
 import { docxToDoc } from './readers/docx';
+import { docBinaryToDoc } from './readers/doc';
+import { xlsToBook } from './readers/xls';
 import { htmlToDoc } from './readers/html';
 import { markdownToDoc } from './readers/markdown';
 import { textToDoc } from './readers/text';
@@ -30,7 +32,7 @@ export interface ConvertOutput {
   warnings: string[];
 }
 
-export const LITE_FORMATS: FormatId[] = ['docx', 'txt', 'md', 'html', 'csv', 'tsv', 'json', 'xlsx'];
+export const LITE_FORMATS: FormatId[] = ['docx', 'doc', 'txt', 'md', 'html', 'csv', 'tsv', 'json', 'xlsx', 'xls'];
 
 export function readLite(bytes: Uint8Array, from: FormatId, title?: string): { content: Content; warnings: string[] } {
   switch (from) {
@@ -42,6 +44,11 @@ export function readLite(bytes: Uint8Array, from: FormatId, title?: string): { c
       const doc = htmlToDoc(decodeText(bytes));
       doc.title ??= title;
       return { content: { kind: 'doc', doc }, warnings: [] };
+    }
+    case 'doc': {
+      const { doc, warnings } = docBinaryToDoc(bytes);
+      doc.title ??= title;
+      return { content: { kind: 'doc', doc }, warnings };
     }
     case 'docx': {
       const { doc, warnings } = docxToDoc(bytes);
@@ -56,6 +63,8 @@ export function readLite(bytes: Uint8Array, from: FormatId, title?: string): { c
       return { content: { kind: 'book', book: jsonToBook(decodeText(bytes)) }, warnings: [] };
     case 'xlsx':
       return { content: { kind: 'book', book: xlsxToBook(bytes) }, warnings: [] };
+    case 'xls':
+      return { content: { kind: 'book', book: xlsToBook(bytes) }, warnings: [] };
     default:
       throw new ConvertError(`Чтение формата ${FORMATS[from]?.label ?? from} здесь не поддерживается.`, 'unsupported');
   }

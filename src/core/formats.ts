@@ -2,10 +2,12 @@
 
 import { unzipSync } from 'fflate';
 import { extensionOf } from './util';
+import { Cfb } from './cfb';
 
 export type FormatId =
   | 'pdf'
   | 'docx'
+  | 'doc'
   | 'txt'
   | 'md'
   | 'html'
@@ -13,6 +15,7 @@ export type FormatId =
   | 'tsv'
   | 'json'
   | 'xlsx'
+  | 'xls'
   | 'png'
   | 'jpg'
   | 'webp'
@@ -43,6 +46,7 @@ export const FORMATS: Record<FormatId, FormatInfo> = {
     kind: 'document',
     description: 'Документ Microsoft Word',
   },
+  doc: { id: 'doc', label: 'Word 97–2003', ext: 'doc', mime: 'application/msword', kind: 'document', description: 'Документ Word 97–2003' },
   txt: { id: 'txt', label: 'TXT', ext: 'txt', mime: 'text/plain;charset=utf-8', kind: 'document', description: 'Обычный текст' },
   md: { id: 'md', label: 'Markdown', ext: 'md', mime: 'text/markdown;charset=utf-8', kind: 'document', description: 'Разметка Markdown' },
   html: { id: 'html', label: 'HTML', ext: 'html', mime: 'text/html;charset=utf-8', kind: 'document', description: 'Веб-страница' },
@@ -64,6 +68,7 @@ export const FORMATS: Record<FormatId, FormatInfo> = {
     kind: 'data',
     description: 'Таблица Microsoft Excel',
   },
+  xls: { id: 'xls', label: 'Excel 97–2003', ext: 'xls', mime: 'application/vnd.ms-excel', kind: 'data', description: 'Таблица Excel 97–2003' },
   png: { id: 'png', label: 'PNG', ext: 'png', mime: 'image/png', kind: 'image', description: 'Изображение PNG' },
   jpg: { id: 'jpg', label: 'JPG', ext: 'jpg', mime: 'image/jpeg', kind: 'image', description: 'Изображение JPEG' },
   webp: { id: 'webp', label: 'WebP', ext: 'webp', mime: 'image/webp', kind: 'image', description: 'Изображение WebP' },
@@ -75,7 +80,7 @@ export const FORMATS: Record<FormatId, FormatInfo> = {
 };
 
 /** Formats handled by the document/data engine (no canvas required). */
-export const DOC_READABLE: FormatId[] = ['pdf', 'docx', 'txt', 'md', 'html', 'csv', 'tsv', 'json', 'xlsx'];
+export const DOC_READABLE: FormatId[] = ['pdf', 'docx', 'doc', 'txt', 'md', 'html', 'csv', 'tsv', 'json', 'xlsx', 'xls'];
 export const DOC_WRITABLE: FormatId[] = ['pdf', 'docx', 'txt', 'md', 'html', 'csv', 'tsv', 'json', 'xlsx'];
 export const IMAGE_INPUTS: FormatId[] = ['png', 'jpg', 'webp', 'gif', 'bmp', 'svg', 'ico', 'avif'];
 /** Image outputs the browser can always encode (avif is feature-detected at runtime). */
@@ -84,6 +89,7 @@ export const IMAGE_OUTPUTS: FormatId[] = ['png', 'jpg', 'webp', 'bmp', 'ico'];
 const TARGETS: Partial<Record<FormatId, FormatId[]>> = {
   pdf: ['docx', 'txt', 'md', 'html', 'pdf', 'png', 'jpg'],
   docx: ['pdf', 'txt', 'md', 'html', 'xlsx', 'csv'],
+  doc: ['docx', 'pdf', 'txt', 'md', 'html', 'xlsx', 'csv'],
   txt: ['pdf', 'docx', 'md', 'html'],
   md: ['pdf', 'docx', 'html', 'txt'],
   html: ['pdf', 'docx', 'md', 'txt', 'xlsx', 'csv'],
@@ -91,6 +97,7 @@ const TARGETS: Partial<Record<FormatId, FormatId[]>> = {
   tsv: ['xlsx', 'json', 'csv', 'html', 'pdf', 'docx', 'md'],
   json: ['xlsx', 'csv', 'tsv', 'html', 'pdf', 'docx', 'md'],
   xlsx: ['csv', 'tsv', 'json', 'html', 'pdf', 'docx', 'md'],
+  xls: ['xlsx', 'csv', 'tsv', 'json', 'html', 'pdf', 'docx', 'md'],
 };
 
 /** Available output formats for a given input format. */
@@ -124,6 +131,8 @@ export function targetLabel(from: FormatId, to: FormatId): string {
 const EXT_MAP: Record<string, FormatId> = {
   pdf: 'pdf',
   docx: 'docx',
+  doc: 'doc',
+  dot: 'doc',
   docm: 'docx',
   dotx: 'docx',
   txt: 'txt',
@@ -141,6 +150,8 @@ const EXT_MAP: Record<string, FormatId> = {
   json: 'json',
   xlsx: 'xlsx',
   xlsm: 'xlsx',
+  xls: 'xls',
+  xlt: 'xls',
   png: 'png',
   jpg: 'jpg',
   jpeg: 'jpg',
@@ -154,8 +165,6 @@ const EXT_MAP: Record<string, FormatId> = {
 };
 
 const UNSUPPORTED_HINTS: Record<string, string> = {
-  doc: 'Старый формат .doc не поддерживается. Откройте файл в Word и сохраните как .docx.',
-  xls: 'Старый формат .xls не поддерживается. Сохраните файл как .xlsx.',
   ppt: 'Презентации пока не поддерживаются.',
   pptx: 'Презентации пока не поддерживаются.',
   odt: 'Формат ODT пока не поддерживается. Сохраните документ как .docx.',
@@ -176,6 +185,17 @@ function startsWith(bytes: Uint8Array, sig: number[], offset = 0): boolean {
   if (bytes.length < offset + sig.length) return false;
   for (let i = 0; i < sig.length; i++) if (bytes[offset + i] !== sig[i]) return false;
   return true;
+}
+
+function cfbKind(bytes: Uint8Array): FormatId | null {
+  try {
+    const cfb = new Cfb(bytes);
+    if (cfb.has('WordDocument')) return 'doc';
+    if (cfb.has('Workbook') || cfb.has('Book')) return 'xls';
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 function zipKind(bytes: Uint8Array): FormatId | null {
@@ -207,7 +227,9 @@ export function detectFormat(name: string, bytes: Uint8Array): Detection {
   if (startsWith(bytes, [0x66, 0x74, 0x79, 0x70], 4) && (startsWith(bytes, [0x61, 0x76, 0x69], 8) || ext === 'avif')) return { format: 'avif' };
   if (startsWith(bytes, [0x42, 0x4d]) && (ext === 'bmp' || ext === 'dib' || !ext)) return { format: 'bmp' };
   if (startsWith(bytes, [0xd0, 0xcf, 0x11, 0xe0])) {
-    return { format: null, error: UNSUPPORTED_HINTS[ext] ?? 'Старые форматы Office (.doc, .xls) не поддерживаются. Сохраните файл в формате .docx или .xlsx.' };
+    const kind = cfbKind(bytes);
+    if (kind) return { format: kind };
+    return { format: null, error: UNSUPPORTED_HINTS[ext] ?? 'Этот файл Office старого формата не распознан (поддерживаются .doc и .xls).' };
   }
   if (startsWith(bytes, [0x50, 0x4b, 0x03, 0x04])) {
     const kind = zipKind(bytes);

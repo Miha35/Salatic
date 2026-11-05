@@ -148,7 +148,7 @@ export function jsonToBook(text: string): Workbook {
 // XLSX
 
 const decoder = new TextDecoder('utf-8');
-const BUILTIN_DATE_FORMATS = new Set([14, 15, 16, 17, 18, 19, 20, 21, 22, 27, 30, 36, 45, 46, 47, 50, 57]);
+export const BUILTIN_DATE_FORMATS = new Set([14, 15, 16, 17, 18, 19, 20, 21, 22, 27, 30, 36, 45, 46, 47, 50, 57]);
 
 function colIndex(ref: string): number {
   let n = 0;
@@ -160,12 +160,12 @@ function colIndex(ref: string): number {
   return n - 1;
 }
 
-function isDateFormat(code: string): boolean {
+export function isDateFormat(code: string): boolean {
   const stripped = code.replace(/"[^"]*"|\[[^\]]*\]|\\./g, '');
   return /[dmyhs]/i.test(stripped) && !/^[#0.,%\s]*$/.test(stripped);
 }
 
-function excelDate(serial: number, date1904: boolean): string {
+export function excelDate(serial: number, date1904: boolean): string {
   const ms = Math.round((serial - (date1904 ? -1462 : 25569)) * 86400000);
   const d = new Date(ms);
   if (Number.isNaN(d.getTime())) return String(serial);
