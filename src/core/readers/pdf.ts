@@ -6,8 +6,8 @@
  * bold/italic (from font names) and embedded images, and drops repeating
  * headers/footers and page numbers.
  */
-import type { Align, Block, Doc, TableRow, TextRun } from '../model';
-import { normalizeRuns } from '../model';
+import type { Align, Block, Doc, TableCell, TableRow, TextRun } from '../model';
+import { normalizeRuns, trimRuns } from '../model';
 import { encodePng } from '../png';
 import { ConvertError, cleanText, maxOf, minOf, tick } from '../util';
 
@@ -66,7 +66,35 @@ interface PageImage {
   block: Block;
 }
 
-type PageItem = { type: 'para'; p: Para } | { type: 'table'; lines: Line[]; top: number; cols: number[] } | { type: 'image'; img: PageImage };
+interface Rect {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
+interface HSeg {
+  y: number;
+  x0: number;
+  x1: number;
+}
+interface VSeg {
+  x: number;
+  y0: number;
+  y1: number;
+}
+interface Graphics {
+  images: PageImage[];
+  h: HSeg[];
+  v: VSeg[];
+  /** Small filled shapes – candidates for vector-drawn list bullets. */
+  marks: Rect[];
+}
+interface GridTable {
+  top: number;
+  rows: TableRow[];
+}
+
+type PageItem = { type: 'para'; p: Para } | { type: 'table'; lines: Line[]; top: number; cols: number[] } | { type: 'grid'; table: GridTable } | { type: 'image'; img: PageImage };
 
 const BULLET_RE = /^\s*([•●○◦▪▫■□‣⁃∙·➢►▸▹✓✔❖]|[-–—*](?=\s))\s*/;
 const NUMBER_RE = /^\s*(\d{1,3})[.)]\s+(?=\S)/;
@@ -453,10 +481,12 @@ class PdfLayout {
     for (const [k, g] of gaps) if (g.length >= 2) this.lineGap.set(k, median(g));
   }
 
-  async pageImages(page: PdfPageLike, viewport: Matrix, pageArea: number, hasText: boolean, seen: Map<string, number>): Promise<PageImage[]> {
+  /** Walk the operator list: embedded images, ruling lines (table borders) and small filled marks. */
+  async pageGraphics(page: PdfPageLike, viewport: Matrix, pageArea: number, hasText: boolean, seen: Map<string, number>): Promise<Graphics> {
     const { OPS } = this.env.pdfjs;
     const ops = await page.getOperatorList();
-    const out: PageImage[] = [];
+    const out: Graphics = { images: [], h: [], v: [], marks: [] };
+    const STROKE = new Set([OPS.stroke, OPS.closeStroke, OPS.fillStroke, OPS.eoFillStroke, OPS.closeFillStroke, OPS.closeEOFillStroke]);
     let ctm: Matrix = [1, 0, 0, 1, 0, 0];
     const stack: Matrix[] = [];
     for (let i = 0; i < ops.fnArray.length; i++) {
@@ -470,7 +500,20 @@ class PdfLayout {
         const m = args?.[0] as Matrix | null;
         if (m && m.length === 6) ctm = mul(ctm, m);
       } else if (fn === OPS.paintFormXObjectEnd) ctm = stack.pop() ?? ctm;
-      else if (fn === OPS.paintImageXObject || fn === OPS.paintInlineImageXObject) {
+      else if (fn === OPS.constructPath) {
+        const paintOp = args?.[0] as number;
+        const mm = args?.[2] as ArrayLike<number> | null | undefined;
+        if (paintOp === OPS.endPath || !mm || mm.length < 4 || !Number.isFinite(mm[0])) continue;
+        const box = bboxOf(mul(mul(viewport, ctm), [mm[2] - mm[0], 0, 0, mm[3] - mm[1], mm[0], mm[1]]));
+        const w = box.x1 - box.x0;
+        const h = box.y1 - box.y0;
+        if (h <= 3 && w >= 6) out.h.push({ y: (box.y0 + box.y1) / 2, x0: box.x0, x1: box.x1 });
+        else if (w <= 3 && h >= 6) out.v.push({ x: (box.x0 + box.x1) / 2, y0: box.y0, y1: box.y1 });
+        else if (STROKE.has(paintOp) && w >= 6 && h >= 6 && isRectPath((args?.[1] as ArrayLike<number>[] | undefined)?.[0])) {
+          out.h.push({ y: box.y0, x0: box.x0, x1: box.x1 }, { y: box.y1, x0: box.x0, x1: box.x1 });
+          out.v.push({ x: box.x0, y0: box.y0, y1: box.y1 }, { x: box.x1, y0: box.y0, y1: box.y1 });
+        } else if (!STROKE.has(paintOp) && w >= 1.5 && w <= 9 && h >= 1.5 && h <= 9 && Math.abs(w - h) < 2.5) out.marks.push(box);
+      } else if (fn === OPS.paintImageXObject || fn === OPS.paintInlineImageXObject) {
         const box = bboxOf(mul(viewport, ctm));
         const w = box.x1 - box.x0;
         const h = box.y1 - box.y0;
@@ -486,10 +529,90 @@ class PdfLayout {
           seen.set(key, (seen.get(key) ?? 0) + 1);
         }
         const block = raw ? await this.imageBlock(raw, w, h) : null;
-        if (block) out.push({ top: box.y0, block });
+        if (block) out.images.push({ top: box.y0, block });
       }
     }
     return out;
+  }
+
+  /** Lay text fragments that fall inside a ruled grid into table cells. */
+  gridTables(frags: Frag[], g: Graphics): { tables: GridTable[]; rest: Frag[] } {
+    const grids = detectGrids(g.h, g.v);
+    if (!grids.length) return { tables: [], rest: frags };
+    const buckets = grids.map((gr) => gr.ys.slice(1).map(() => gr.xs.slice(1).map(() => [] as Frag[])));
+    const rest: Frag[] = [];
+    for (const f of frags) {
+      const cx = f.x + f.w / 2;
+      const cy = f.y - f.fs * 0.35;
+      const gi = grids.findIndex((gr) => cx > gr.box.x0 - 1 && cx < gr.box.x1 + 1 && cy > gr.box.y0 - 1 && cy < gr.box.y1 + 1);
+      if (gi < 0) {
+        rest.push(f);
+        continue;
+      }
+      const gr = grids[gi];
+      let r = 0;
+      while (r < gr.ys.length - 2 && cy > gr.ys[r + 1]) r++;
+      let c = 0;
+      while (c < gr.xs.length - 2 && f.x + 0.5 >= gr.xs[c + 1]) c++;
+      while (c > 0 && gr.merged[r][c]) c--;
+      buckets[gi][r][c].push(f);
+    }
+    const tables = grids.map((gr, gi): GridTable => {
+      const rows: TableRow[] = [];
+      for (let r = 0; r < gr.ys.length - 1; r++) {
+        const cells: TableCell[] = [];
+        for (let c = 0; c < gr.xs.length - 1; c++) {
+          if (gr.merged[r][c]) continue;
+          let span = 1;
+          while (c + span < gr.xs.length - 1 && gr.merged[r][c + span]) span++;
+          const blocks = this.cellBlocks(buckets[gi][r][c]);
+          const cell: TableCell = { blocks: blocks.length ? blocks : [{ type: 'paragraph', runs: [] }] };
+          if (span > 1) cell.colspan = span;
+          cells.push(cell);
+        }
+        rows.push({ cells });
+      }
+      while (rows.length && rows[rows.length - 1].cells.every((c) => c.blocks.every((b) => b.type === 'paragraph' && !b.runs.length))) rows.pop();
+      const first = rows[0];
+      if (first && rows.length > 1 && first.cells.every((c) => c.blocks.every((b) => b.type !== 'paragraph' || b.runs.every((x) => x.bold || !x.text.trim())))) {
+        first.cells.forEach((c) => (c.header = true));
+      }
+      return { top: gr.box.y0, rows };
+    });
+    return { tables: tables.filter((t) => t.rows.length), rest };
+  }
+
+  private cellBlocks(frags: Frag[]): Block[] {
+    const lines = this.buildLines(frags).sort((a, b) => a.y - b.y);
+    const paras: TextRun[][] = [];
+    let prev: Line | null = null;
+    for (const l of lines) {
+      const runs = l.segs.flatMap((sg, k) => (k ? [{ text: ' ' } as TextRun, ...sg.runs] : sg.runs));
+      if (!prev || l.y - prev.y > Math.max(l.fs, prev.fs) * 1.7) paras.push(runs.map((r) => ({ ...r })));
+      else {
+        const cur = paras[paras.length - 1];
+        const last = cur[cur.length - 1];
+        if (last && /[\p{L}]-$/u.test(last.text) && /^\p{Ll}/u.test(runs[0]?.text ?? '')) last.text = last.text.slice(0, -1);
+        else cur.push({ text: ' ' });
+        cur.push(...runs.map((r) => ({ ...r })));
+      }
+      prev = l;
+    }
+    return paras.map((r) => ({ type: 'paragraph', runs: trimRuns(r) }) as Block).filter((b) => b.type === 'paragraph' && b.runs.length);
+  }
+
+  /** Lines that start right after a small filled shape get a text bullet (Chrome & co. draw bullets as vectors). */
+  static markBullets(lines: Line[], marks: Rect[]): void {
+    const used = new Set<Rect>();
+    for (const l of lines) {
+      const m = marks.find((mk) => !used.has(mk) && mk.x1 <= l.x0 + 1 && l.x0 - mk.x1 < l.fs * 2.5 && mk.x1 - mk.x0 < l.fs * 0.9 && (mk.y0 + mk.y1) / 2 > l.y - l.fs * 0.9 && (mk.y0 + mk.y1) / 2 < l.y + l.fs * 0.1);
+      if (!m) continue;
+      used.add(m);
+      const first = l.segs[0];
+      first.runs.unshift({ text: '• ' });
+      first.x0 = m.x0;
+      l.x0 = m.x0;
+    }
   }
 
   private async imageBlock(raw: RawImage, w: number, h: number): Promise<Block | null> {
@@ -529,6 +652,96 @@ function resolveObj(objs: PdfObjs, id: string, timeoutMs = 10_000): Promise<unkn
     }
   });
 }
+
+/** pdf.js path data: 0 moveTo(x,y), 1 lineTo(x,y), 2 curveTo(6), 3 quadraticCurveTo(4), 4 closePath. */
+function isRectPath(data: ArrayLike<number> | undefined): boolean {
+  if (!data) return false;
+  let segs = 0;
+  for (let i = 0; i < data.length; ) {
+    const op = data[i];
+    if (op === 0 || op === 1) {
+      segs++;
+      i += 3;
+    } else if (op === 4) i += 1;
+    else return false;
+  }
+  return segs >= 4 && segs <= 5;
+}
+
+function cluster(values: number[], tol: number): number[] {
+  const sorted = [...values].sort((a, b) => a - b);
+  const out: number[] = [];
+  for (const v of sorted) if (!out.length || v - out[out.length - 1] > tol) out.push(v);
+  return out;
+}
+
+interface Grid {
+  xs: number[];
+  ys: number[];
+  box: Rect;
+  /** merged[r][c] – no ruling between column c-1 and c in row r. */
+  merged: boolean[][];
+}
+
+/** Find ruled tables: connected sets of horizontal and vertical lines forming at least two cells. */
+export function detectGrids(hRaw: HSeg[], vRaw: VSeg[]): Grid[] {
+  if (hRaw.length < 2 || vRaw.length < 2 || hRaw.length + vRaw.length > 4000) return [];
+  // Merge collinear touching segments
+  const hs: HSeg[] = [];
+  for (const s of [...hRaw].sort((a, b) => a.y - b.y || a.x0 - b.x0)) {
+    const last = hs[hs.length - 1];
+    if (last && Math.abs(last.y - s.y) < 1.5 && s.x0 <= last.x1 + 2) last.x1 = Math.max(last.x1, s.x1);
+    else hs.push({ ...s });
+  }
+  const vs: VSeg[] = [];
+  for (const s of [...vRaw].sort((a, b) => a.x - b.x || a.y0 - b.y0)) {
+    const last = vs[vs.length - 1];
+    if (last && Math.abs(last.x - s.x) < 1.5 && s.y0 <= last.y1 + 2) last.y1 = Math.max(last.y1, s.y1);
+    else vs.push({ ...s });
+  }
+  // Union-find over intersecting segments
+  const parent = Array.from({ length: hs.length + vs.length }, (_, i) => i);
+  const findRoot = (i: number): number => (parent[i] === i ? i : (parent[i] = findRoot(parent[i])));
+  const hits = new Map<number, number>();
+  hs.forEach((h, i) =>
+    vs.forEach((v, j) => {
+      if (v.x >= h.x0 - 2 && v.x <= h.x1 + 2 && h.y >= v.y0 - 2 && h.y <= v.y1 + 2) {
+        parent[findRoot(i)] = findRoot(hs.length + j);
+        hits.set(i, (hits.get(i) ?? 0) + 1);
+        hits.set(hs.length + j, (hits.get(hs.length + j) ?? 0) + 1);
+      }
+    }),
+  );
+  const groups = new Map<number, { h: HSeg[]; v: VSeg[] }>();
+  hs.forEach((h, i) => {
+    if (!hits.get(i)) return;
+    const g = groups.get(findRoot(i)) ?? { h: [], v: [] };
+    g.h.push(h);
+    groups.set(findRoot(i), g);
+  });
+  vs.forEach((v, j) => {
+    if (!hits.get(hs.length + j)) return;
+    const g = groups.get(findRoot(hs.length + j)) ?? { h: [], v: [] };
+    g.v.push(v);
+    groups.set(findRoot(hs.length + j), g);
+  });
+  const grids: Grid[] = [];
+  for (const g of groups.values()) {
+    const ys = cluster(g.h.map((h) => h.y), 2);
+    const xs = cluster(g.v.map((v) => v.x), 2);
+    if (ys.length < 2 || xs.length < 2 || (ys.length - 1) * (xs.length - 1) < 2) continue;
+    const box = { x0: xs[0], y0: ys[0], x1: xs[xs.length - 1], y1: ys[ys.length - 1] };
+    if (box.x1 - box.x0 < 30 || box.y1 - box.y0 < 8) continue;
+    const merged = ys.slice(1).map((y1, r) => {
+      const ym = (ys[r] + y1) / 2;
+      return xs.slice(0, -1).map((x, c) => c > 0 && !g.v.some((v) => Math.abs(v.x - x) < 2 && v.y0 <= ym + 1 && v.y1 >= ym - 1));
+    });
+    grids.push({ xs, ys, box, merged });
+  }
+  return grids;
+}
+
+const itemTop = (it: PageItem): number => (it.type === 'para' ? it.p.top : it.type === 'table' ? it.top : it.type === 'grid' ? it.table.top : it.img.top);
 
 function headerFooterFilter(pages: { lines: Line[]; height: number }[]): (line: Line, pageIdx: number) => boolean {
   const zone = (l: Line, h: number): boolean => l.y < h * 0.08 || l.y > h * 0.92;
@@ -574,7 +787,7 @@ export async function pdfToDoc(bytes: Uint8Array, env: PdfReadEnv): Promise<{ do
     throw e;
   }
   const layout = new PdfLayout(env);
-  const pages: { lines: Line[]; height: number; width: number; images: PageImage[] }[] = [];
+  const pages: { lines: Line[]; height: number; width: number; images: PageImage[]; grids: GridTable[] }[] = [];
   const seenImages = new Map<string, number>();
   let title: string | undefined;
   try {
@@ -588,7 +801,7 @@ export async function pdfToDoc(bytes: Uint8Array, env: PdfReadEnv): Promise<{ do
       const vpm = vp.transform as Matrix;
       const tc = await page.getTextContent();
       // Operator list loads fonts (for bold/italic detection) and images.
-      const images = await layout.pageImages(page as unknown as PdfPageLike, vpm, vp.width * vp.height, tc.items.some((it) => 'str' in it && it.str.trim()), seenImages);
+      const graphics = await layout.pageGraphics(page as unknown as PdfPageLike, vpm, vp.width * vp.height, tc.items.some((it) => 'str' in it && it.str.trim()), seenImages);
       const fontCache = new Map<string, { bold: boolean; italic: boolean; mono: boolean }>();
       const frags: Frag[] = [];
       for (const it of tc.items) {
@@ -612,7 +825,10 @@ export async function pdfToDoc(bytes: Uint8Array, env: PdfReadEnv): Promise<{ do
         if (!str) continue;
         frags.push({ str, x: m[4], y: m[5], w: it.width * vp.scale, fs, ...style });
       }
-      pages.push({ lines: layout.buildLines(frags), height: vp.height, width: vp.width, images });
+      const { tables: grids, rest } = layout.gridTables(frags, graphics);
+      const lines = layout.buildLines(rest);
+      PdfLayout.markBullets(lines, graphics.marks);
+      pages.push({ lines, height: vp.height, width: vp.width, images: graphics.images, grids });
       page.cleanup();
       env.onProgress?.(n / pdf.numPages);
       if (n % 4 === 0) await tick();
@@ -627,7 +843,11 @@ export async function pdfToDoc(bytes: Uint8Array, env: PdfReadEnv): Promise<{ do
   // Build page items
   const pageItems: PageItem[][] = pages.map((p, pi) => {
     const lines = p.lines.filter((l) => keep(l, pi));
-    if (!lines.length) return p.images.map((img) => ({ type: 'image' as const, img }));
+    const extras: { top: number; item: PageItem }[] = [
+      ...p.images.map((img) => ({ top: img.top, item: { type: 'image', img } as PageItem })),
+      ...p.grids.map((t) => ({ top: t.top, item: { type: 'grid', table: t } as PageItem })),
+    ].sort((a, b) => a.top - b.top);
+    if (!lines.length) return extras.map((e) => e.item);
     const left = minOf(lines.map((l) => l.x0));
     const right = maxOf(lines.map((l) => l.x1));
     const items: PageItem[] = [];
@@ -641,11 +861,11 @@ export async function pdfToDoc(bytes: Uint8Array, env: PdfReadEnv): Promise<{ do
       }
       cursor = t.end;
     }
-    // Insert images by vertical position
-    for (const img of p.images) {
-      const idx = items.findIndex((it) => (it.type === 'para' ? it.p.top : it.type === 'table' ? it.top : img.top + 1) > img.top);
-      if (idx < 0) items.push({ type: 'image', img });
-      else items.splice(idx, 0, { type: 'image', img });
+    // Insert images and ruled tables by vertical position
+    for (const e of extras) {
+      const idx = items.findIndex((it) => itemTop(it) > e.top);
+      if (idx < 0) items.push(e.item);
+      else items.splice(idx, 0, e.item);
     }
     return items;
   });
@@ -693,6 +913,11 @@ export async function pdfToDoc(bytes: Uint8Array, env: PdfReadEnv): Promise<{ do
     if (it.type === 'image') {
       stack = [];
       blocks.push(it.img.block);
+      continue;
+    }
+    if (it.type === 'grid') {
+      stack = [];
+      blocks.push({ type: 'table', rows: it.table.rows });
       continue;
     }
     if (it.type === 'table') {

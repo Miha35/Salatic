@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { unzipSync } from 'fflate';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { docToDocx } from '../../src/core/writers/docx';
 import { docxToDoc } from '../../src/core/readers/docx';
 import { docToPdf } from '../../src/core/writers/pdf';
@@ -200,6 +202,38 @@ describe('PDF reader', () => {
     const list = doc.blocks.find((b) => b.type === 'list') as Extract<Block, { type: 'list' }>;
     expect(list?.items.map((i) => blockText(i.blocks[0]))).toEqual(['пункт А', 'пункт Б']);
     expect(flatText(doc)).toContain('Итог.');
+  });
+
+  it('rebuilds a Chrome-printed PDF: vector bullets and a ruled table', async () => {
+    // tests/fixtures/chrome-report.pdf: HTML page printed to PDF by Chromium (bullets are drawn as shapes)
+    const pdf = new Uint8Array(readFileSync(join(__dirname, '../fixtures/chrome-report.pdf')));
+    const { doc } = await pdfToDoc(pdf, { pdfjs: await loadPdfjs() });
+    expect(doc.blocks.map((b) => b.type)).toEqual(['heading', 'paragraph', 'heading', 'list', 'heading', 'table', 'paragraph']);
+    const list = doc.blocks[3] as Extract<Block, { type: 'list' }>;
+    expect(list.items.map((i) => blockText(i.blocks[0]))).toEqual(['Выручка: 1,2 млрд руб.', 'Чистая прибыль: 150 млн руб.', 'Сотрудники: 420 человек']);
+    const table = doc.blocks[5] as Extract<Block, { type: 'table' }>;
+    expect(table.rows.map((r) => r.cells.map((c) => blockText(c.blocks[0] ?? { type: 'hr' })))).toEqual([
+      ['Регион', 'Продажи', 'Рост'],
+      ['Москва', '500', '+20%'],
+      ['Казань', '200', '+35%'],
+    ]);
+    expect(table.rows[0].cells.every((c) => c.header)).toBe(true);
+    expect(blockText(doc.blocks[6])).toBe('Примечание: данные предварительные.');
+  });
+
+  it.skipIf(!hasCmd('soffice'))('detects ruled tables with merged cells in a LibreOffice PDF', async () => {
+    const html = '<table border="1"><tr><td colspan="2">Объединённая шапка</td><td>Ц</td></tr><tr><td>a1</td><td>b1</td><td>c1</td></tr><tr><td>a2</td><td>b2 длинный текст в ячейке, который переносится на несколько строк внутри узкого столбца</td><td>c2</td></tr></table><p>После таблицы.</p>';
+    const pdf = soffice(new TextEncoder().encode(`<html><body>${html}</body></html>`), 'html', 'pdf');
+    const { doc } = await pdfToDoc(pdf, { pdfjs: await loadPdfjs() });
+    const table = doc.blocks.find((b) => b.type === 'table') as Extract<Block, { type: 'table' }>;
+    expect(table).toBeDefined();
+    expect(table.rows[0].cells[0]).toMatchObject({ colspan: 2 });
+    expect(table.rows.map((r) => r.cells.map((c) => blockText(c.blocks[0] ?? { type: 'hr' })))).toEqual([
+      ['Объединённая шапка', 'Ц'],
+      ['a1', 'b1', 'c1'],
+      ['a2', 'b2 длинный текст в ячейке, который переносится на несколько строк внутри узкого столбца', 'c2'],
+    ]);
+    expect(flatText(doc)).toContain('После таблицы.');
   });
 
   it('rejects garbage with a readable error', async () => {
