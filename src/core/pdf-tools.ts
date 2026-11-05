@@ -1,6 +1,5 @@
 /** PDF assembly: images → PDF, and page composition for the PDF editor (merge, reorder, rotate, annotate). */
 import { degrees, LineCapStyle, PDFDocument, rgb, type PDFFont, type PDFImage, type PDFPage } from 'pdf-lib';
-import fontkit from '@pdf-lib/fontkit';
 import type { FontLoader } from './writers/pdf';
 import { ConvertError } from './util';
 
@@ -78,7 +77,8 @@ export interface PageSpec {
 export async function composePdf(sources: Uint8Array[], pages: PageSpec[], fonts?: FontLoader): Promise<Uint8Array> {
   if (!pages.length) throw new ConvertError('В документе не осталось страниц.');
   const out = await PDFDocument.create();
-  out.registerFontkit(fontkit);
+  // fontkit is large: load it only when text annotations need an embedded font
+  if (pages.some((p) => p.annotations?.some((a) => a.type === 'text'))) out.registerFontkit((await import('@pdf-lib/fontkit')).default);
   out.setCreator('Salatic');
   out.setProducer('Salatic');
   const loaded: PDFDocument[] = [];

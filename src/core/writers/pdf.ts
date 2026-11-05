@@ -7,7 +7,6 @@
  * and table rows flow naturally across pages.
  */
 import { PDFDocument, PDFName, PDFString, rgb, type PDFFont, type PDFImage, type PDFPage } from 'pdf-lib';
-import fontkit from '@pdf-lib/fontkit';
 import type { Align, Block, Doc, TextRun } from '../model';
 import { cleanText, maxOf } from '../util';
 
@@ -106,7 +105,7 @@ class PdfWriter {
 
   async init(doc: Doc): Promise<void> {
     this.pdf = await PDFDocument.create();
-    this.pdf.registerFontkit(fontkit);
+    this.pdf.registerFontkit((await import('@pdf-lib/fontkit')).default);
     const needed = new Set<FontKey>(['regular', 'bold']);
     const scan = (blocks: Block[]): void => {
       for (const b of blocks) {
