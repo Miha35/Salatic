@@ -5,7 +5,7 @@
 import type { FormatId } from './formats';
 import { FORMATS, targetsFor } from './formats';
 import type { Content, Doc } from './model';
-import type { FontSet } from './writers/pdf';
+import type { FontLoader } from './writers/pdf';
 import { asDoc, readLite, writeLite, type ConvertOptions, type ConvertOutput } from './convert-lite';
 import { ConvertError } from './util';
 
@@ -16,7 +16,7 @@ type PdfJs = typeof import('pdfjs-dist');
 export interface ConvertEnv {
   pdfjs?: () => Promise<PdfJs>;
   pdfDocParams?: Record<string, unknown>;
-  fonts?: () => Promise<FontSet>;
+  fonts?: FontLoader;
   encodeImage?: (pixels: Uint8Array | Uint8ClampedArray, width: number, height: number, channels: 1 | 3 | 4) => Promise<{ data: Uint8Array; mime: string }>;
   transcodeImage?: (data: Uint8Array, mime: string) => Promise<{ data: Uint8Array; mime: string } | null>;
   onProgress?: (fraction: number) => void;

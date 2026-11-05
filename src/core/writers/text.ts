@@ -1,7 +1,7 @@
 /** Doc → plain text, Markdown, HTML. */
 import type { Align, Block, Doc, TextRun } from '../model';
 import { blockText, runsText } from '../model';
-import { bytesToBase64, escapeHtml } from '../util';
+import { bytesToBase64, escapeHtml, maxOf } from '../util';
 
 // ---------------------------------------------------------------------------
 // Plain text
@@ -126,7 +126,7 @@ export function docToMarkdown(doc: Doc): string {
           );
           break;
         case 'table': {
-          const width = Math.max(...b.rows.map((r) => r.cells.reduce((s, c) => s + (c.colspan ?? 1), 0)));
+          const width = maxOf(b.rows.map((r) => r.cells.reduce((s, c) => s + (c.colspan ?? 1), 0)), 0);
           if (!width) break;
           const cellText = (blocks: Block[]): string =>
             blocks
@@ -225,7 +225,8 @@ export function blocksToHtml(blocks: Block[]): string {
             const tag = c.header ? 'th' : 'td';
             const span = c.colspan && c.colspan > 1 ? ` colspan="${c.colspan}"` : '';
             const only = c.blocks.length === 1 && c.blocks[0].type === 'paragraph' ? c.blocks[0] : null;
-            s += `<${tag}${span}>${only ? htmlRuns(only.runs) : blocksToHtml(c.blocks)}</${tag}>`;
+            const align = only ? alignAttr(only.align) : '';
+            s += `<${tag}${span}${align}>${only ? htmlRuns(only.runs) : blocksToHtml(c.blocks)}</${tag}>`;
           }
           s += '</tr>\n';
         }
@@ -253,7 +254,7 @@ export function blocksToHtml(blocks: Block[]): string {
 
 const HTML_CSS = `
 :root{color-scheme:light}
-body{font-family:"PT Sans",Arial,"Helvetica Neue",sans-serif;font-size:16px;line-height:1.55;color:#1d1d1f;max-width:820px;margin:40px auto;padding:0 20px}
+body{font-family:Arial,"Liberation Sans","Helvetica Neue",sans-serif;font-size:16px;line-height:1.55;color:#1d1d1f;max-width:820px;margin:40px auto;padding:0 20px}
 h1,h2,h3,h4,h5,h6{line-height:1.25;margin:1.4em 0 .5em}
 p{margin:.6em 0}
 img{max-width:100%;height:auto}
@@ -261,7 +262,7 @@ table{border-collapse:collapse;margin:1em 0;width:100%}
 td,th{border:1px solid #c8c8cc;padding:6px 10px;vertical-align:top;text-align:left}
 th{background:#f2f2f5}
 pre{background:#f5f5f7;padding:12px 14px;border-radius:6px;overflow:auto}
-code{font-family:"PT Mono",Consolas,monospace;font-size:.92em}
+code{font-family:Consolas,"DejaVu Sans Mono",monospace;font-size:.92em}
 blockquote{margin:1em 0;padding:.2em 1em;border-left:4px solid #d0d0d6;color:#444}
 hr.page-break{border:0;page-break-after:always;break-after:page;margin:2em 0;border-top:1px dashed #bbb}
 @media print{hr.page-break{border:0;margin:0}}

@@ -296,7 +296,7 @@ export function mount(root: HTMLElement, params: URLSearchParams): () => void {
     if (f && item.target) {
       const targets = targetsFor(f, { avif });
       actions.append(
-        h('span', { style: 'color:var(--muted);display:inline-flex' }, icon('arrow')),
+        h('span', { class: 'file__arrow', style: 'color:var(--muted);display:inline-flex' }, icon('arrow')),
         h(
           'select',
           {

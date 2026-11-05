@@ -2,18 +2,14 @@
  * Conversion engine running off the main thread. Heavy libraries (pdf.js, pdf-lib,
  * fonts) are loaded on first use only.
  */
-import regularUrl from '@expo-google-fonts/pt-sans/400Regular/PTSans_400Regular.ttf?url';
-import boldUrl from '@expo-google-fonts/pt-sans/700Bold/PTSans_700Bold.ttf?url';
-import italicUrl from '@expo-google-fonts/pt-sans/400Regular_Italic/PTSans_400Regular_Italic.ttf?url';
-import boldItalicUrl from '@expo-google-fonts/pt-sans/700Bold_Italic/PTSans_700Bold_Italic.ttf?url';
-import monoUrl from '@expo-google-fonts/pt-mono/400Regular/PTMono_400Regular.ttf?url';
+import monoUrl from 'dejavu-fonts-ttf/ttf/DejaVuSansMono.ttf?url';
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { convert, readContent, writeContent, type ConvertEnv } from '../../core/convert';
 import { asDoc } from '../../core/convert-lite';
 import { htmlToDoc } from '../../core/readers/html';
 import { blocksToHtml } from '../../core/writers/text';
 import { encodePng } from '../../core/png';
-import type { FontSet } from '../../core/writers/pdf';
+import type { FontKey } from '../../core/writers/pdf';
 import type { EngineRequest, WorkerMessage } from './protocol';
 
 interface WorkerScope {
@@ -25,20 +21,28 @@ declare const self: WorkerScope;
 
 const abs = (u: string): string => new URL(u, self.location.href).href;
 
-let fontsPromise: Promise<FontSet> | null = null;
-function loadFonts(): Promise<FontSet> {
-  const get = async (u: string): Promise<Uint8Array> => {
-    const r = await fetch(abs(u));
-    if (!r.ok) throw new Error(`Не удалось загрузить шрифт (${r.status})`);
-    return new Uint8Array(await r.arrayBuffer());
-  };
-  fontsPromise ??= Promise.all([get(regularUrl), get(boldUrl), get(italicUrl), get(boldItalicUrl), get(monoUrl)])
-    .then(([regular, bold, italic, boldItalic, mono]) => ({ regular, bold, italic, boldItalic, mono }))
-    .catch((e) => {
-      fontsPromise = null;
-      throw e;
+// Liberation Sans ships with pdf.js (standard_fonts) and is already deployed under /pdfjs/.
+const FONT_URLS: Record<FontKey, string> = {
+  regular: '/pdfjs/standard_fonts/LiberationSans-Regular.ttf',
+  bold: '/pdfjs/standard_fonts/LiberationSans-Bold.ttf',
+  italic: '/pdfjs/standard_fonts/LiberationSans-Italic.ttf',
+  boldItalic: '/pdfjs/standard_fonts/LiberationSans-BoldItalic.ttf',
+  mono: monoUrl,
+};
+const fontCache = new Map<FontKey, Promise<Uint8Array>>();
+
+/** Fetch a font style on first use only (most documents never need italic or mono). */
+function loadFont(key: FontKey): Promise<Uint8Array> {
+  let p = fontCache.get(key);
+  if (!p) {
+    p = fetch(abs(FONT_URLS[key])).then(async (r) => {
+      if (!r.ok) throw new Error(`Не удалось загрузить шрифт (${r.status})`);
+      return new Uint8Array(await r.arrayBuffer());
     });
-  return fontsPromise;
+    p.catch(() => fontCache.delete(key));
+    fontCache.set(key, p);
+  }
+  return p;
 }
 
 let pdfjsPromise: Promise<typeof import('pdfjs-dist')> | null = null;
@@ -96,7 +100,7 @@ function env(id: number): ConvertEnv {
       // Inside our worker pdf.js parses in-thread ("fake worker"); silence the notice about it
       verbosity: 0,
     },
-    fonts: loadFonts,
+    fonts: loadFont,
     encodeImage,
     transcodeImage,
     onProgress: (value) => post({ id, type: 'progress', value }),
@@ -131,7 +135,7 @@ async function handle(id: number, req: EngineRequest): Promise<{ result: unknown
     }
     case 'composePdf': {
       const { composePdf } = await import('../../core/pdf-tools');
-      const data = await composePdf(req.sources, req.pages, loadFonts);
+      const data = await composePdf(req.sources, req.pages, loadFont);
       return { result: data, transfer: [data.buffer] };
     }
   }

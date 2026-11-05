@@ -1,7 +1,7 @@
 /** PDF assembly: images → PDF, and page composition for the PDF editor (merge, reorder, rotate, annotate). */
 import { degrees, LineCapStyle, PDFDocument, rgb, type PDFFont, type PDFImage, type PDFPage } from 'pdf-lib';
 import fontkit from '@pdf-lib/fontkit';
-import type { FontSet } from './writers/pdf';
+import type { FontLoader } from './writers/pdf';
 import { ConvertError } from './util';
 
 export interface ImageInput {
@@ -75,7 +75,7 @@ export interface PageSpec {
   annotations?: Annotation[];
 }
 
-export async function composePdf(sources: Uint8Array[], pages: PageSpec[], fonts?: () => Promise<FontSet>): Promise<Uint8Array> {
+export async function composePdf(sources: Uint8Array[], pages: PageSpec[], fonts?: FontLoader): Promise<Uint8Array> {
   if (!pages.length) throw new ConvertError('В документе не осталось страниц.');
   const out = await PDFDocument.create();
   out.registerFontkit(fontkit);
@@ -105,7 +105,6 @@ export async function composePdf(sources: Uint8Array[], pages: PageSpec[], fonts
   const cursor = new Map<number, number>();
   let font: PDFFont | null = null;
   let boldFont: PDFFont | null = null;
-  let fontSet: FontSet | null = null;
   const imageCache = new Map<Uint8Array, PDFImage>();
 
   for (const spec of pages) {
@@ -122,8 +121,7 @@ export async function composePdf(sources: Uint8Array[], pages: PageSpec[], fonts
       switch (a.type) {
         case 'text': {
           if (!fonts) throw new ConvertError('Шрифты недоступны для добавления текста.');
-          fontSet ??= await fonts();
-          const f = a.bold ? (boldFont ??= await out.embedFont(fontSet.bold, { subset: true })) : (font ??= await out.embedFont(fontSet.regular, { subset: true }));
+          const f = a.bold ? (boldFont ??= await out.embedFont(await fonts('bold'), { subset: true })) : (font ??= await out.embedFont(await fonts('regular'), { subset: true }));
           const lines = a.text.split('\n');
           lines.forEach((line, i) => {
             // Successive lines move "down" in the rotated text frame

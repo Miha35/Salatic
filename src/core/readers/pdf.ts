@@ -9,7 +9,7 @@
 import type { Align, Block, Doc, TableRow, TextRun } from '../model';
 import { normalizeRuns } from '../model';
 import { encodePng } from '../png';
-import { ConvertError, cleanText, tick } from '../util';
+import { ConvertError, cleanText, maxOf, minOf, tick } from '../util';
 
 type PdfJs = typeof import('pdfjs-dist');
 type Matrix = [number, number, number, number, number, number];
@@ -357,7 +357,7 @@ class PdfLayout {
 
   private finishPara(p: Para, contentLeft: number, contentRight: number): void {
     if (p.kind === 'code') {
-      const minX = Math.min(...p.lines.map((l) => l.x0));
+      const minX = minOf(p.lines.map((l) => l.x0));
       p.runs = [
         {
           text: p.lines
@@ -628,8 +628,8 @@ export async function pdfToDoc(bytes: Uint8Array, env: PdfReadEnv): Promise<{ do
   const pageItems: PageItem[][] = pages.map((p, pi) => {
     const lines = p.lines.filter((l) => keep(l, pi));
     if (!lines.length) return p.images.map((img) => ({ type: 'image' as const, img }));
-    const left = Math.min(...lines.map((l) => l.x0));
-    const right = Math.max(...lines.map((l) => l.x1));
+    const left = minOf(lines.map((l) => l.x0));
+    const right = maxOf(lines.map((l) => l.x1));
     const items: PageItem[] = [];
     const tables = layout.findTables(lines);
     let cursor = 0;

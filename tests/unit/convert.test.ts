@@ -11,7 +11,7 @@ import { xlsxToBook } from '../../src/core/readers/data';
 import { readLite, writeLite } from '../../src/core/convert-lite';
 import type { Workbook } from '../../src/core/model';
 import { bytes, env, hasCmd, loadFonts, pdfToText, text } from './helpers';
-import { sample } from './documents.test';
+import { sample } from './sample';
 
 const book: Workbook = {
   sheets: [

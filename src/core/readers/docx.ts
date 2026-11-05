@@ -3,7 +3,7 @@ import { unzipSync } from 'fflate';
 import type { Align, Block, Doc, ListItem, TableCell, TableRow, TextRun } from '../model';
 import { normalizeRuns } from '../model';
 import { child, childrenNamed, elements, find, parseXml, rootElement, textContent, type XNode } from '../xml';
-import { ConvertError, imageSize, sniffImageMime } from '../util';
+import { ConvertError, imageSize, sniffImageMime, unzipOffice } from '../util';
 
 type RStyle = Omit<TextRun, 'text'>;
 
@@ -49,8 +49,9 @@ class DocxReader {
 
   constructor(bytes: Uint8Array) {
     try {
-      this.files = unzipSync(bytes);
-    } catch {
+      this.files = unzipOffice(bytes, unzipSync);
+    } catch (e) {
+      if (e instanceof ConvertError) throw e;
       throw new ConvertError('Файл DOCX повреждён или не является архивом Office.');
     }
     const rootRels = this.xml('_rels/.rels');

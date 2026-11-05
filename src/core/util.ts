@@ -112,6 +112,39 @@ export function concatBytes(parts: Uint8Array[]): Uint8Array {
   return out;
 }
 
+/** Max of a possibly huge array (spreading into Math.max overflows the call stack). */
+export function maxOf(values: Iterable<number>, initial = -Infinity): number {
+  let m = initial;
+  for (const v of values) if (v > m) m = v;
+  return m;
+}
+
+export function minOf(values: Iterable<number>, initial = Infinity): number {
+  let m = initial;
+  for (const v of values) if (v < m) m = v;
+  return m;
+}
+
+const MAX_UNZIPPED = 400 * 1024 * 1024;
+const MAX_RATIO = 250;
+
+/**
+ * Unzip an Office package defensively: entry sizes are checked from the central
+ * directory before anything is inflated, so zip bombs are rejected cheaply.
+ */
+export function unzipOffice(bytes: Uint8Array, unzip: (b: Uint8Array, o?: { filter?: (f: { name: string; size: number; originalSize: number }) => boolean }) => Record<string, Uint8Array>): Record<string, Uint8Array> {
+  let total = 0;
+  unzip(bytes, {
+    filter: (f) => {
+      total += f.originalSize;
+      if (f.originalSize > 1_000_000 && f.originalSize / Math.max(1, f.size) > MAX_RATIO) throw new ConvertError('Архив документа выглядит подозрительно (аномальное сжатие) и не будет распакован.', 'zip_bomb');
+      return false;
+    },
+  });
+  if (total > MAX_UNZIPPED) throw new ConvertError('Документ слишком большой после распаковки.', 'too_large');
+  return unzip(bytes);
+}
+
 /** Image dimensions from PNG/JPEG/GIF/BMP/WebP headers without decoding. */
 export function imageSize(data: Uint8Array): { width: number; height: number } | null {
   const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);

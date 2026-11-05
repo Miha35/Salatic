@@ -61,6 +61,9 @@ const LIST_BOUNDARY = new Set(['ul', 'ol', 'table', 'td', 'th']);
 const ROW_BOUNDARY = new Set(['table', 'thead', 'tbody', 'tfoot']);
 const CELL_BOUNDARY = new Set(['tr', 'table']);
 
+/** Deeper nesting is flattened so that recursive walkers can never overflow the stack. */
+const MAX_DEPTH = 400;
+
 export function parseHtml(src: string): HNode {
   const root: HNode = { tag: '#document', attrs: {}, children: [] };
   const stack: HNode[] = [root];
@@ -222,7 +225,7 @@ export function parseHtml(src: string): HNode {
       i = gt < 0 ? n : gt + 1;
       continue;
     }
-    stack.push(node);
+    if (stack.length < MAX_DEPTH) stack.push(node);
   }
   return root;
 }

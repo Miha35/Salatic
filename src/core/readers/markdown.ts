@@ -235,55 +235,71 @@ function paragraphWithImages(text: string): Block[] {
 
 const PUNCT = /[!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~]/;
 
-function findClosing(s: string, from: number, delim: string): number {
-  let k = from;
-  while (k < s.length) {
-    const idx = s.indexOf(delim, k);
-    if (idx < 0) return -1;
-    if (s[idx - 1] === '\\') {
-      k = idx + 1;
-      continue;
-    }
+/** Emphasis/link text rarely spans more than this; bounding keeps pathological input cheap. */
+const EMPHASIS_WINDOW = 4000;
+
+/**
+ * Per-string index of valid closing delimiters and matching brackets, computed once so
+ * that inline parsing stays O(n log n) even on hostile input like "****…" or "[[[[…".
+ */
+class InlineIndex {
+  private closers = new Map<string, number[]>();
+  private brackets: Int32Array | null = null;
+  constructor(private s: string) {}
+
+  private validCloser(idx: number, delim: string): boolean {
+    const s = this.s;
     const before = s[idx - 1];
     const after = s[idx + delim.length];
-    // closing delimiter must not be preceded by whitespace; for single '*', avoid matching '**'
-    if (idx > from && before !== undefined && !/\s/.test(before)) {
-      if (delim.length === 1 && (after === delim || before === delim)) {
-        k = idx + 2;
-        continue;
-      }
-      if (delim[0] === '_' && after && /[\p{L}\p{N}]/u.test(after)) {
-        k = idx + 1;
-        continue;
-      }
-      return idx;
-    }
-    k = idx + 1;
+    if (before === undefined || before === '\\' || /\s/.test(before)) return false;
+    if (delim.length === 1 && (after === delim || before === delim)) return false;
+    if (delim[0] === '_' && after && /[\p{L}\p{N}]/u.test(after)) return false;
+    return true;
   }
-  return -1;
-}
 
-function findBracket(s: string, open: number): number {
-  let depth = 0;
-  for (let k = open; k < s.length; k++) {
-    const ch = s[k];
-    if (ch === '\\') {
-      k++;
-      continue;
+  /** First valid closing delimiter strictly after `from` (within the window), or -1. */
+  closing(from: number, delim: string): number {
+    let list = this.closers.get(delim);
+    if (!list) {
+      list = [];
+      for (let k = this.s.indexOf(delim); k >= 0; k = this.s.indexOf(delim, k + 1)) if (this.validCloser(k, delim)) list.push(k);
+      this.closers.set(delim, list);
     }
-    if (ch === '[') depth++;
-    else if (ch === ']') {
-      depth--;
-      if (depth === 0) return k;
+    let lo = 0;
+    let hi = list.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (list[mid] <= from) lo = mid + 1;
+      else hi = mid;
     }
+    const idx = lo < list.length ? list[lo] : -1;
+    return idx >= 0 && idx - from <= EMPHASIS_WINDOW ? idx : -1;
   }
-  return -1;
+
+  /** Index of the "]" matching the "[" at `open`, or -1. */
+  bracket(open: number): number {
+    if (!this.brackets) {
+      const s = this.s;
+      const match = new Int32Array(s.length).fill(-1);
+      const stack: number[] = [];
+      for (let k = 0; k < s.length; k++) {
+        const ch = s[k];
+        if (ch === '\\') k++;
+        else if (ch === '[') stack.push(k);
+        else if (ch === ']' && stack.length) match[stack.pop()!] = k;
+      }
+      this.brackets = match;
+    }
+    const m = this.brackets[open];
+    return m >= 0 && m - open <= EMPHASIS_WINDOW ? m : -1;
+  }
 }
 
 function parseLinkTarget(s: string, start: number): { url: string; end: number } | null {
   if (s[start] !== '(') return null;
   let depth = 0;
-  for (let k = start; k < s.length; k++) {
+  const limit = Math.min(s.length, start + EMPHASIS_WINDOW);
+  for (let k = start; k < limit; k++) {
     if (s[k] === '(') depth++;
     else if (s[k] === ')') {
       depth--;
@@ -300,6 +316,7 @@ function parseLinkTarget(s: string, start: number): { url: string; end: number }
 
 /** Parse inline Markdown into runs. Block images are pushed into `images` when given. */
 export function parseInline(src: string, style: Style = {}, images?: Block[]): TextRun[] {
+  const index = new InlineIndex(src);
   const runs: TextRun[] = [];
   let buf = '';
   const emit = (): void => {
@@ -320,8 +337,10 @@ export function parseInline(src: string, style: Style = {}, images?: Block[]): T
       continue;
     }
     if (ch === '`') {
-      const tick = /^`+/.exec(src.slice(i))![0];
-      const end = src.indexOf(tick, i + tick.length);
+      let tl = 0;
+      while (src[i + tl] === '`') tl++;
+      const tick = '`'.repeat(tl);
+      const end = src.indexOf(tick, i + tl);
       if (end > 0) {
         emit();
         let code = src.slice(i + tick.length, end).replace(/\u2028/g, ' ');
@@ -331,12 +350,12 @@ export function parseInline(src: string, style: Style = {}, images?: Block[]): T
         continue;
       }
       buf += tick;
-      i += tick.length;
+      i += tl;
       continue;
     }
     if ((ch === '!' && src[i + 1] === '[') || ch === '[') {
       const open = ch === '!' ? i + 1 : i;
-      const close = findBracket(src, open);
+      const close = index.bracket(open);
       const target = close > 0 ? parseLinkTarget(src, close + 1) : null;
       if (target) {
         const label = src.slice(open + 1, close);
@@ -383,7 +402,7 @@ export function parseInline(src: string, style: Style = {}, images?: Block[]): T
       const intraword = ch === '_' && i > 0 && /[\p{L}\p{N}]/u.test(src[i - 1]);
       if (leftFlanking && !intraword) {
         if (triple) {
-          const end = findClosing(src, i + 3, ch.repeat(3));
+          const end = index.closing(i + 3, ch.repeat(3));
           if (end > 0) {
             emit();
             runs.push(...parseInline(src.slice(i + 3, end), { ...style, bold: true, italic: true }, images));
@@ -392,7 +411,7 @@ export function parseInline(src: string, style: Style = {}, images?: Block[]): T
           }
         }
         if (double) {
-          const end = findClosing(src, i + 2, ch + ch);
+          const end = index.closing(i + 2, ch + ch);
           if (end > 0) {
             emit();
             const add = ch === '~' ? { strike: true } : { bold: true };
@@ -401,7 +420,7 @@ export function parseInline(src: string, style: Style = {}, images?: Block[]): T
             continue;
           }
         } else if (ch !== '~') {
-          const end = findClosing(src, i + 1, ch);
+          const end = index.closing(i + 1, ch);
           if (end > 0) {
             emit();
             runs.push(...parseInline(src.slice(i + 1, end), { ...style, italic: true }, images));

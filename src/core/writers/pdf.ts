@@ -9,18 +9,18 @@
 import { PDFDocument, PDFName, PDFString, rgb, type PDFFont, type PDFImage, type PDFPage } from 'pdf-lib';
 import fontkit from '@pdf-lib/fontkit';
 import type { Align, Block, Doc, TextRun } from '../model';
-import { cleanText } from '../util';
+import { cleanText, maxOf } from '../util';
 
-export interface FontSet {
-  regular: Uint8Array;
-  bold: Uint8Array;
-  italic: Uint8Array;
-  boldItalic: Uint8Array;
-  mono: Uint8Array;
-}
+export type FontKey = 'regular' | 'bold' | 'italic' | 'boldItalic' | 'mono';
+
+/**
+ * Loads a TrueType font by style. Fonts must subset cleanly with @pdf-lib/fontkit
+ * (Liberation Sans + DejaVu Sans Mono do; PT Sans, for example, does not — see tests).
+ */
+export type FontLoader = (key: FontKey) => Promise<Uint8Array>;
 
 export interface PdfWriteEnv {
-  fonts: () => Promise<FontSet>;
+  fonts: FontLoader;
   /** Convert images pdf-lib cannot embed (GIF, BMP, WebP) to PNG/JPEG. */
   transcodeImage?: (data: Uint8Array, mime: string) => Promise<{ data: Uint8Array; mime: string } | null>;
   onProgress?: (fraction: number) => void;
@@ -28,9 +28,9 @@ export interface PdfWriteEnv {
 
 export interface PdfOptions {
   pageSize?: 'a4' | 'letter';
+  /** Embed only used glyphs (default). Disabled in tests to compare renderings. */
+  subsetFonts?: boolean;
 }
-
-type FontKey = 'regular' | 'bold' | 'italic' | 'boldItalic' | 'mono';
 type Color = [number, number, number];
 
 type Op =
@@ -89,7 +89,7 @@ class PdfWriter {
 
   constructor(
     private env: PdfWriteEnv,
-    opts: PdfOptions,
+    private opts: PdfOptions,
   ) {
     const letter = opts.pageSize === 'letter';
     this.pageW = letter ? 612 : 595.28;
@@ -120,9 +120,10 @@ class PdfWriter {
       }
     };
     scan(doc.blocks);
-    const data = await this.env.fonts();
-    for (const key of needed) {
-      const font = await this.pdf.embedFont(data[key], { subset: true });
+    const keys = [...needed];
+    const data = await Promise.all(keys.map((k) => this.env.fonts(k)));
+    for (const [i, key] of keys.entries()) {
+      const font = await this.pdf.embedFont(data[i], { subset: this.opts.subsetFonts !== false });
       this.fonts.set(key, font);
       this.charsets.set(key, new Set(font.getCharacterSet()));
       this.widthCache.set(key, new Map());
@@ -435,7 +436,7 @@ class PdfWriter {
   }
 
   private async table(b: Extract<Block, { type: 'table' }>, x: number, width: number, depth: number): Promise<Box[]> {
-    const cols = Math.max(1, ...b.rows.map((r) => r.cells.reduce((s, c) => s + (c.colspan ?? 1), 0)));
+    const cols = maxOf(b.rows.map((r) => r.cells.reduce((s, c) => s + (c.colspan ?? 1), 0)), 1);
     const pad = 4;
     // Natural (max) and minimum widths per column from single-span cells
     const maxW = new Array(cols).fill(20);
@@ -586,11 +587,17 @@ class PdfWriter {
   place(boxes: Box[]): void {
     this.newPage();
     const contentH = this.bottom - this.margin;
+    // A page break only takes effect when more content follows (no empty trailing pages)
+    let pendingBreak = false;
     for (let i = 0; i < boxes.length; i++) {
       const box = boxes[i];
       if (box.pageBreak) {
-        if (this.cursor > this.margin) this.newPage();
+        pendingBreak = true;
         continue;
+      }
+      if (pendingBreak) {
+        pendingBreak = false;
+        if (this.cursor > this.margin) this.newPage();
       }
       const atTop = this.cursor <= this.margin + 0.01;
       if (!atTop) this.cursor += box.spaceBefore;

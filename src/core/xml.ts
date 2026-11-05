@@ -25,6 +25,9 @@ export function decodeXmlEntities(s: string): string {
 const isNameEnd = (c: number): boolean => c === 32 || c === 9 || c === 10 || c === 13 || c === 47 || c === 62;
 const isWs = (c: number): boolean => c === 32 || c === 9 || c === 10 || c === 13;
 
+/** Deeper nesting is flattened (no real OOXML part comes close) to protect recursive helpers. */
+const MAX_DEPTH = 1000;
+
 export function parseXml(src: string): XNode {
   const root: XNode = { name: '#root', attrs: {}, children: [] };
   const stack: XNode[] = [root];
@@ -121,7 +124,7 @@ export function parseXml(src: string): XNode {
       else j++; // defensive: skip a stray character
     }
     stack[stack.length - 1].children.push(node);
-    if (!selfClosing) stack.push(node);
+    if (!selfClosing && stack.length < MAX_DEPTH) stack.push(node);
     i = j;
   }
   return root;

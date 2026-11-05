@@ -2,7 +2,7 @@
 import { unzipSync } from 'fflate';
 import type { CellValue, Sheet, Workbook } from '../model';
 import { child, childrenNamed, find, findAll, parseXml, rootElement, textContent, type XNode } from '../xml';
-import { ConvertError } from '../util';
+import { ConvertError, unzipOffice } from '../util';
 
 // ---------------------------------------------------------------------------
 // CSV
@@ -179,8 +179,9 @@ function excelDate(serial: number, date1904: boolean): string {
 export function xlsxToBook(bytes: Uint8Array): Workbook {
   let files: Record<string, Uint8Array>;
   try {
-    files = unzipSync(bytes);
-  } catch {
+    files = unzipOffice(bytes, unzipSync);
+  } catch (e) {
+    if (e instanceof ConvertError) throw e;
     throw new ConvertError('Файл XLSX повреждён.');
   }
   const xml = (p: string): XNode | undefined => (files[p] ? parseXml(decoder.decode(files[p])) : undefined);

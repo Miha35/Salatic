@@ -7,69 +7,12 @@ import { pdfToDoc } from '../../src/core/readers/pdf';
 import { docToHtml, docToMarkdown, docToText } from '../../src/core/writers/text';
 import { markdownToDoc } from '../../src/core/readers/markdown';
 import { htmlToDoc } from '../../src/core/readers/html';
-import { encodePng } from '../../src/core/png';
 import { blockText, runsText, type Block, type Doc } from '../../src/core/model';
-import { hasCmd, loadFonts, loadPdfjs, pdfToText, soffice, text } from './helpers';
-
-const png = encodePng(
-  new Uint8Array(120 * 80 * 3).map((_, i) => (i % 3 === 0 ? 220 : i % 3 === 1 ? 80 : (i >> 4) & 255)),
-  120,
-  80,
-  3,
-);
-
-const longPara = 'Съешь же ещё этих мягких французских булок, да выпей чаю. '.repeat(12).trim();
-
-export const sample: Doc = {
-  title: 'Тестовый документ',
-  blocks: [
-    { type: 'heading', level: 1, runs: [{ text: 'Отчёт о работе' }] },
-    {
-      type: 'paragraph',
-      runs: [
-        { text: 'Обычный текст, ' },
-        { text: 'жирный', bold: true },
-        { text: ', ' },
-        { text: 'курсив', italic: true },
-        { text: ', ' },
-        { text: 'подчёркнутый', underline: true },
-        { text: ' и ' },
-        { text: 'ссылка', link: 'https://example.com/' },
-        { text: '. E=mc' },
-        { text: '2', sup: true },
-      ],
-    },
-    { type: 'heading', level: 2, runs: [{ text: 'Список задач' }] },
-    {
-      type: 'list',
-      ordered: false,
-      items: [
-        { blocks: [{ type: 'paragraph', runs: [{ text: 'Первый пункт' }] }] },
-        {
-          blocks: [
-            { type: 'paragraph', runs: [{ text: 'Второй пункт' }] },
-            { type: 'list', ordered: true, items: [{ blocks: [{ type: 'paragraph', runs: [{ text: 'Вложенный один' }] }] }, { blocks: [{ type: 'paragraph', runs: [{ text: 'Вложенный два' }] }] }] },
-          ],
-        },
-      ],
-    },
-    { type: 'paragraph', runs: [{ text: longPara }], align: 'justify' },
-    {
-      type: 'table',
-      rows: [
-        { cells: [{ header: true, blocks: [{ type: 'paragraph', runs: [{ text: 'Город' }] }] }, { header: true, blocks: [{ type: 'paragraph', runs: [{ text: 'Население' }] }] }] },
-        { cells: [{ blocks: [{ type: 'paragraph', runs: [{ text: 'Москва' }] }] }, { blocks: [{ type: 'paragraph', runs: [{ text: '13 100 000' }] }] }] },
-        { cells: [{ blocks: [{ type: 'paragraph', runs: [{ text: 'Казань' }] }] }, { blocks: [{ type: 'paragraph', runs: [{ text: '1 300 000' }] }] }] },
-      ],
-    },
-    { type: 'image', data: png, mime: 'image/png', width: 120, height: 80, alt: 'Диаграмма' },
-    { type: 'code', text: 'function hello() {\n  return "Привет";\n}' },
-    { type: 'quote', blocks: [{ type: 'paragraph', runs: [{ text: 'Цитата великого человека.' }] }] },
-    { type: 'pagebreak' },
-    { type: 'heading', level: 2, runs: [{ text: 'Вторая страница' }], align: 'center' },
-    { type: 'paragraph', runs: [{ text: 'Конец документа.' }] },
-  ],
-};
+import { longPara, sample } from './sample';
+import { PDFDocument } from 'pdf-lib';
+import fontkit from '@pdf-lib/fontkit';
+import { FONT_FILES, hasCmd, loadFonts, loadPdfjs, pdfToText, renderPages, soffice, text } from './helpers';
+import type { FontKey } from '../../src/core/writers/pdf';
 
 const flatText = (d: Doc): string => d.blocks.map(blockText).join('\n');
 
@@ -133,6 +76,30 @@ describe('DOCX writer/reader', () => {
 });
 
 describe('PDF writer', () => {
+  // Regression: some fonts (e.g. PT Sans) lose most glyph outlines when subset by
+  // @pdf-lib/fontkit, while the text layer stays intact – only a renderer notices.
+  it.skipIf(!hasCmd('pdftoppm'))('every shipped font renders identically when subset', async () => {
+    const pangram = 'Съешь же ещё этих мягких французских булок ЁЙЩЪ №1 «»— The quick brown fox 0123 {}[]';
+    for (const key of Object.keys(FONT_FILES) as FontKey[]) {
+      const renders: Buffer[] = [];
+      for (const subset of [true, false]) {
+        const doc = await PDFDocument.create();
+        doc.registerFontkit(fontkit);
+        const font = await doc.embedFont(await loadFonts(key), { subset });
+        doc.addPage([700, 40]).drawText(pangram, { x: 8, y: 14, size: 14, font });
+        renders.push(renderPages(await doc.save(), 72)[0]);
+      }
+      expect(renders[0].equals(renders[1]), `${key} subset differs from the full font`).toBe(true);
+    }
+  });
+
+  it.skipIf(!hasCmd('pdftoppm'))('generated documents look the same as with fully embedded fonts', async () => {
+    const sub = renderPages((await docToPdf(sample, { fonts: loadFonts })).data);
+    const full = renderPages((await docToPdf(sample, { fonts: loadFonts }, { subsetFonts: false })).data);
+    expect(sub.length).toBe(full.length);
+    sub.forEach((page, i) => expect(page.equals(full[i]), `page ${i + 1}`).toBe(true));
+  });
+
   it('lays out Cyrillic text across pages with fonts, tables and images', async () => {
     const { data, warnings } = await docToPdf(sample, { fonts: loadFonts });
     expect(text(data.subarray(0, 5))).toBe('%PDF-');
@@ -150,15 +117,24 @@ describe('PDF writer', () => {
   it('flows long documents over many pages and replaces unsupported characters', async () => {
     const blocks: Block[] = [];
     for (let i = 0; i < 120; i++) blocks.push({ type: 'paragraph', runs: [{ text: `Абзац ${i + 1}. ${longPara}` }] });
-    blocks.push({ type: 'paragraph', runs: [{ text: 'Иероглифы 漢字 и стрелка →' }] });
+    blocks.push({ type: 'paragraph', runs: [{ text: 'Иероглифы 漢字, стрелка → и галочка ✓' }] });
     const { data, warnings } = await docToPdf({ blocks }, { fonts: loadFonts });
     expect(warnings.some((w) => w.includes('символы'))).toBe(true);
     if (hasCmd('pdftotext')) {
       const t = pdfToText(data);
       expect(t).toContain('Абзац 120.');
-      expect(t).toContain('стрелка ->');
+      expect(t).toMatch(/стрелка (→|->) и галочка (✓|v)/);
+      expect(t).toContain('Иероглифы ??');
       expect(t.split('\f').length).toBeGreaterThan(10);
     }
+  });
+
+  it('ignores trailing page breaks (no empty last page) in PDF and DOCX', async () => {
+    const doc: Doc = { blocks: [{ type: 'paragraph', runs: [{ text: 'Один' }] }, { type: 'pagebreak' }, { type: 'paragraph', runs: [{ text: 'Два' }] }, { type: 'pagebreak' }] };
+    const pdf = await docToPdf(doc, { fonts: loadFonts });
+    expect((await PDFDocument.load(pdf.data)).getPageCount()).toBe(2);
+    const xml = text(unzipSync(docToDocx(doc).data)['word/document.xml']);
+    expect(xml.match(/w:type="page"/g)?.length).toBe(1);
   });
 
   it('splits a table that is taller than one page', async () => {
@@ -248,6 +224,14 @@ describe('text writers', () => {
     const back = htmlToDoc(html);
     expect(back.title).toBe('Тестовый документ');
     expect(back.blocks.map((b) => b.type)).toEqual(sample.blocks.map((b) => b.type));
+  });
+
+  it('keeps table cell alignment through HTML', () => {
+    const doc = markdownToDoc('| A | B |\n|---|--:|\n| 1 | 2 |');
+    const html = docToHtml(doc);
+    expect(html).toContain('<td style="text-align:right">2</td>');
+    const back = htmlToDoc(html).blocks[0] as Extract<Block, { type: 'table' }>;
+    expect((back.rows[1].cells[1].blocks[0] as Extract<Block, { type: 'paragraph' }>).align).toBe('right');
   });
 
   it('plain text keeps reading order and list markers', () => {

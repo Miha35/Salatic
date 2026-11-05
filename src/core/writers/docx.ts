@@ -1,7 +1,7 @@
 /** Doc → DOCX (Office Open XML). Element order follows the ECMA-376 schema so Word opens files without repair. */
 import { zipSync, type Zippable } from 'fflate';
 import type { Align, Block, Doc, TableCell, TextRun } from '../model';
-import { escapeXml, utf8 } from '../util';
+import { escapeXml, maxOf, utf8 } from '../util';
 
 export interface DocxOptions {
   pageSize?: 'a4' | 'letter';
@@ -149,7 +149,7 @@ class DocxWriter {
   }
 
   private table(b: Extract<Block, { type: 'table' }>, widthTw: number): string {
-    const cols = Math.max(1, ...b.rows.map((r) => r.cells.reduce((s, c) => s + (c.colspan ?? 1), 0)));
+    const cols = maxOf(b.rows.map((r) => r.cells.reduce((s, c) => s + (c.colspan ?? 1), 0)), 1);
     // Column widths proportional to content length (bounded), summing to the available width
     const weights = new Array(cols).fill(1);
     for (const r of b.rows) {
@@ -243,7 +243,10 @@ class DocxWriter {
   }
 
   build(doc: Doc): Uint8Array {
-    let body = this.blocks(doc.blocks, 0, this.contentW);
+    // Trailing page breaks would only add empty pages
+    const blocks = [...doc.blocks];
+    while (blocks.length && blocks[blocks.length - 1].type === 'pagebreak') blocks.pop();
+    let body = this.blocks(blocks, 0, this.contentW);
     if (!body || body.endsWith('</w:tbl>')) body += '<w:p/>';
     const document =
       XML_HEAD +

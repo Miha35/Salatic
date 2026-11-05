@@ -1,20 +1,22 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ConvertEnv } from '../../src/core/convert';
-import type { FontSet } from '../../src/core/writers/pdf';
+import type { FontKey, FontLoader } from '../../src/core/writers/pdf';
 
 const root = join(__dirname, '../..');
 const nm = (p: string): Uint8Array => new Uint8Array(readFileSync(join(root, 'node_modules', p)));
 
-export const loadFonts = async (): Promise<FontSet> => ({
-  regular: nm('@expo-google-fonts/pt-sans/400Regular/PTSans_400Regular.ttf'),
-  bold: nm('@expo-google-fonts/pt-sans/700Bold/PTSans_700Bold.ttf'),
-  italic: nm('@expo-google-fonts/pt-sans/400Regular_Italic/PTSans_400Regular_Italic.ttf'),
-  boldItalic: nm('@expo-google-fonts/pt-sans/700Bold_Italic/PTSans_700Bold_Italic.ttf'),
-  mono: nm('@expo-google-fonts/pt-mono/400Regular/PTMono_400Regular.ttf'),
-});
+export const FONT_FILES: Record<FontKey, string> = {
+  regular: 'pdfjs-dist/standard_fonts/LiberationSans-Regular.ttf',
+  bold: 'pdfjs-dist/standard_fonts/LiberationSans-Bold.ttf',
+  italic: 'pdfjs-dist/standard_fonts/LiberationSans-Italic.ttf',
+  boldItalic: 'pdfjs-dist/standard_fonts/LiberationSans-BoldItalic.ttf',
+  mono: 'dejavu-fonts-ttf/ttf/DejaVuSansMono.ttf',
+};
+
+export const loadFonts: FontLoader = async (key) => nm(FONT_FILES[key]);
 
 export const loadPdfjs = async () => (await import('pdfjs-dist/legacy/build/pdf.mjs')) as unknown as typeof import('pdfjs-dist');
 
@@ -62,3 +64,16 @@ export function soffice(input: Uint8Array, ext: string, target: string): Uint8Ar
 
 export const text = (b: Uint8Array): string => new TextDecoder().decode(b);
 export const bytes = (s: string): Uint8Array => new TextEncoder().encode(s);
+
+/** Rasterise every page with poppler (grayscale PGM) – an independent renderer for visual checks. */
+export function renderPages(pdf: Uint8Array, dpi = 50): Buffer[] {
+  return withTemp((dir) => {
+    const f = join(dir, 'in.pdf');
+    writeFileSync(f, pdf);
+    execFileSync('pdftoppm', ['-r', String(dpi), '-gray', f, join(dir, 'p')]);
+    return readdirSync(dir)
+      .filter((n) => n.endsWith('.pgm'))
+      .sort()
+      .map((n) => readFileSync(join(dir, n)));
+  });
+}

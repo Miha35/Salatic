@@ -2,7 +2,7 @@
 import { zipSync, type Zippable } from 'fflate';
 import type { CellValue, Sheet, Workbook } from '../model';
 import { cellToString } from '../model';
-import { escapeXml, utf8 } from '../util';
+import { escapeXml, maxOf, utf8 } from '../util';
 
 const XML_HEAD = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n';
 
@@ -97,7 +97,7 @@ function sheetXml(sheet: Sheet): string {
       if (v === null || v === '') continue;
       const ref = `${colName(ci)}${ri + 1}`;
       const style = ri === 0 && sheet.header ? ' s="1"' : '';
-      const len = typeof v === 'string' ? Math.max(...v.split('\n').map((l) => l.length)) : String(v).length;
+      const len = typeof v === 'string' ? maxOf(v.split('\n').map((l) => l.length), 0) : String(v).length;
       widths[ci] = Math.min(60, Math.max(widths[ci], len + 2));
       if (typeof v === 'number') cells += `<c r="${ref}"${style}><v>${v}</v></c>`;
       else if (typeof v === 'boolean') cells += `<c r="${ref}"${style} t="b"><v>${v ? 1 : 0}</v></c>`;
