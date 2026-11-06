@@ -1,9 +1,11 @@
 /**
  * Office charts (DrawingML chartSpace, as in word/charts/*.xml and ppt/charts/*.xml)
  * → SVG drawn from the cached values stored in the file. Covers column/bar
- * (clustered, stacked, 100 %), line, area, pie, doughnut and scatter charts,
- * combinations with a secondary value axis, titles, legends, gridlines, axis
- * number formats, per-point colours and value/percentage data labels.
+ * (clustered, stacked, 100 %), line, area, pie, doughnut, pie/bar of pie, scatter,
+ * bubble, radar, stock (high-low lines, up/down bars) and surface (contour) charts,
+ * their 3-D variants (oblique projection with depth, shaded faces), combinations
+ * with a secondary value axis, titles, legends, gridlines, axis number formats,
+ * per-point colours, marker symbols and value/percentage data labels.
  */
 import { colorOf, type Theme } from './drawingml';
 import { elements, parseXml, textContent, type XNode } from './xml';
@@ -35,6 +37,10 @@ interface Series {
   cats: string[];
   vals: (number | null)[];
   xs?: (number | null)[];
+  /** bubble sizes */
+  sizes?: (number | null)[];
+  /** marker symbol: circle, square, diamond, triangle, x, star, plus, dash, dot */
+  symbol?: string;
   color?: string;
   lineColor?: string;
   lineWidth?: number;
@@ -46,7 +52,19 @@ interface Series {
 }
 
 interface Group {
-  type: 'bar' | 'line' | 'area' | 'pie' | 'doughnut' | 'scatter';
+  type: 'bar' | 'line' | 'area' | 'pie' | 'doughnut' | 'scatter' | 'bubble' | 'radar' | 'stock' | 'surface' | 'ofPie';
+  /** a 3-D variant (bar3DChart, pie3DChart …) */
+  threeD: boolean;
+  /** 3-D bar shape: box, cylinder, cone, pyramid (and *ToMax) */
+  shape: string;
+  radarStyle: string;
+  hiLow: boolean;
+  upDown?: { gap: number; up?: string; down?: string };
+  bubbleScale: number;
+  sizeArea: boolean;
+  wireframe: boolean;
+  /** pie of pie / bar of pie: the last `splitPos` points go to the second plot */
+  ofPie?: { bar: boolean; splitPos: number; secondSize: number };
   horizontal: boolean;
   grouping: 'clustered' | 'stacked' | 'percentStacked' | 'standard';
   series: Series[];
@@ -169,7 +187,14 @@ function niceScale(min: number, max: number, fixedMin?: number, fixedMax?: numbe
   return { min: fixedMin ?? Math.floor(min / step) * step, max: fixedMax ?? Math.ceil(max / step) * step, step };
 }
 
-function parseChart(xml: XNode, theme: Theme): { title?: string; titleSize: number; groups: Group[]; catAxis: Axis; valAxis: Axis; val2Axis?: Axis; xAxis?: Axis; legend?: string; bg?: string; plotBg?: string } {
+interface View3D {
+  rotX: number;
+  rotY: number;
+  depthPercent: number;
+  rAngAx: boolean;
+}
+
+function parseChart(xml: XNode, theme: Theme): { title?: string; titleSize: number; groups: Group[]; catAxis: Axis; valAxis: Axis; val2Axis?: Axis; xAxis?: Axis; legend?: string; bg?: string; plotBg?: string; view3D?: View3D } {
   const chart = deep(xml, 'chart');
   const plot = kid(chart, 'plotArea');
   const map = { tx1: 'dk1', bg1: 'lt1', tx2: 'dk2', bg2: 'lt2' };
@@ -187,11 +212,43 @@ function parseChart(xml: XNode, theme: Theme): { title?: string; titleSize: numb
   for (const ax of elements(plot)) if (/Ax$/.test(local(ax.name))) axIds.set(val(kid(ax, 'axId')) ?? '', ax);
   for (const g of elements(plot)) {
     const name = local(g.name);
-    const type: Group['type'] | undefined = /^bar/.test(name) ? 'bar' : /^line/.test(name) || name === 'radarChart' || name === 'stockChart' ? 'line' : /^area/.test(name) ? 'area' : /^pie/.test(name) || name === 'ofPieChart' ? 'pie' : name === 'doughnutChart' ? 'doughnut' : name === 'scatterChart' || name === 'bubbleChart' ? 'scatter' : undefined;
+    const type: Group['type'] | undefined = /^bar/.test(name)
+      ? 'bar'
+      : /^line/.test(name)
+        ? 'line'
+        : name === 'radarChart'
+          ? 'radar'
+          : name === 'stockChart'
+            ? 'stock'
+            : /^area/.test(name)
+              ? 'area'
+              : name === 'ofPieChart'
+                ? 'ofPie'
+                : /^pie/.test(name)
+                  ? 'pie'
+                  : name === 'doughnutChart'
+                    ? 'doughnut'
+                    : name === 'scatterChart'
+                      ? 'scatter'
+                      : name === 'bubbleChart'
+                        ? 'bubble'
+                        : /^surface/.test(name)
+                          ? 'surface'
+                          : undefined;
     if (!type) continue;
     const dl = kid(g, 'dLbls');
+    const ud = kid(g, 'upDownBars');
     const grp: Group = {
       type,
+      threeD: /3DChart$/.test(name),
+      shape: val(kid(g, 'shape')) ?? val(deep(g, 'shape')) ?? 'box',
+      radarStyle: val(kid(g, 'radarStyle')) ?? 'marker',
+      hiLow: !!kid(g, 'hiLowLines'),
+      upDown: ud ? { gap: +(val(kid(ud, 'gapWidth')) ?? 150), up: color(kid(kid(ud, 'upBars'), 'spPr'), 'fill'), down: color(kid(kid(ud, 'downBars'), 'spPr'), 'fill') } : undefined,
+      bubbleScale: +(val(kid(g, 'bubbleScale')) ?? 100),
+      sizeArea: val(kid(g, 'sizeRepresents')) !== 'w',
+      wireframe: on(kid(g, 'wireframe')),
+      ofPie: name === 'ofPieChart' ? { bar: val(kid(g, 'ofPieType')) === 'bar', splitPos: Math.max(1, +(val(kid(g, 'splitPos')) ?? 3)), secondSize: +(val(kid(g, 'secondPieSize')) ?? 75) } : undefined,
       horizontal: val(kid(g, 'barDir')) === 'bar',
       grouping: (val(kid(g, 'grouping')) as Group['grouping']) ?? (type === 'bar' ? 'clustered' : 'standard'),
       series: [],
@@ -229,10 +286,19 @@ function parseChart(xml: XNode, theme: Theme): { title?: string; titleSize: numb
         marker: (() => {
           const m = kid(s, 'marker');
           if (m) return val(kid(m, 'symbol')) !== 'none';
+          if (type === 'radar') return grp.radarStyle === 'marker';
           return type === 'line' ? val(kid(g, 'marker')) !== '0' : type === 'scatter';
         })(),
+        symbol: val(kid(kid(s, 'marker'), 'symbol')),
         smooth: on(kid(s, 'smooth')),
       };
+      if (type === 'bubble') {
+        const xs = numbers(kid(s, 'xVal')).vals;
+        if (xs.some((x) => x !== null)) ser.xs = xs;
+        ser.sizes = numbers(kid(s, 'bubbleSize')).vals;
+        ser.marker = false;
+        ser.noLine = true;
+      }
       if (type === 'scatter') {
         const xs = numbers(kid(s, 'xVal')).vals;
         if (xs.some((x) => x !== null)) ser.xs = xs;
@@ -270,14 +336,18 @@ function parseChart(xml: XNode, theme: Theme): { title?: string; titleSize: numb
   // For scatter charts the vertical value axis is the one on the left or right
   const vertical = elements(plot).filter((a) => local(a.name) === 'valAx').find((a) => ['l', 'r'].includes(val(kid(a, 'axPos')) ?? ''));
   const valAxis = (vertical ? axisOf(vertical) : axis('valAx')) ?? { deleted: false, grid: true, reversed: false };
-  const scatterX = groups.some((g) => g.type === 'scatter') ? elements(plot).filter((a) => local(a.name) === 'valAx').find((a) => ['b', 't'].includes(val(kid(a, 'axPos')) ?? '')) : undefined;
+  const scatterX = groups.some((g) => g.type === 'scatter' || g.type === 'bubble') ? elements(plot).filter((a) => local(a.name) === 'valAx').find((a) => ['b', 't'].includes(val(kid(a, 'axPos')) ?? '')) : undefined;
   let title: string | undefined;
   const t = kid(chart, 'title');
   if (t) title = richText(kid(t, 'tx')) || (groups.length === 1 && groups[0].series.length === 1 ? groups[0].series[0].name : undefined);
   else if (!on(kid(chart, 'autoTitleDeleted')) && groups.length === 1 && groups[0].series.length === 1 && groups[0].type !== 'scatter') title = groups[0].series[0].name || undefined;
   const sz = deep(t, 'defRPr')?.attrs.sz ?? deep(t, 'rPr')?.attrs.sz;
   const legend = kid(chart, 'legend');
+  const v3 = kid(chart, 'view3D');
   return {
+    view3D: v3 || groups.some((g) => g.threeD)
+      ? { rotX: +(val(kid(v3, 'rotX')) ?? (groups.some((g) => g.type === 'pie') ? 30 : 15)), rotY: +(val(kid(v3, 'rotY')) ?? 20), depthPercent: +(val(kid(v3, 'depthPercent')) ?? 100), rAngAx: on(kid(v3, 'rAngAx'), true) }
+      : undefined,
     title,
     titleSize: sz ? +sz / 100 : 14,
     groups,
@@ -337,18 +407,29 @@ export function chartToSvg(xmlText: string, opts: ChartOptions): string | null {
     lines.forEach((l, i) => text(W / 2, top + ts * (i + 1), l, ts, 'middle', '404040'));
     top += ts * lines.length + ts * 0.6;
   }
-  const pieLike = c.groups.every((g) => g.type === 'pie' || g.type === 'doughnut');
+  const pieLike = c.groups.every((g) => g.type === 'pie' || g.type === 'doughnut' || g.type === 'ofPie');
+  const surface = c.groups[0].type === 'surface';
+  const radar = c.groups[0].type === 'radar';
   // Legend entries
   const entries: { name: string; color: string; line: boolean }[] = [];
   if (c.legend) {
-    if (pieLike) {
+    if (surface) {
+      // value bands, not series
+      const b = surfaceBands(c);
+      const fmt = (v: number): string => formatNumber(v, c.valAxis.format ?? c.groups[0].series[0]?.format);
+      for (let k = 0; k + 1 < b.length; k++) entries.push({ name: `${fmt(b[k])}–${fmt(b[k + 1])}`, color: auto(k), line: false });
+    } else if (pieLike) {
       const s = c.groups[0].series[0];
       s.vals.forEach((_, i) => entries.push({ name: s.cats[i] ?? String(i + 1), color: s.pointColors.get(i) ?? auto(i), line: false }));
     } else {
       let k = 0;
       for (const g of c.groups)
         for (const s of g.series) {
-          const lineLike = g.type === 'line' || g.type === 'scatter';
+          const lineLike = g.type === 'line' || g.type === 'scatter' || g.type === 'stock' || (g.type === 'radar' && g.radarStyle !== 'filled');
+          if (g.type === 'stock' && s.noLine && !s.marker) {
+            k++;
+            continue;
+          }
           entries.push({ name: s.name || `Ряд ${k + 1}`, color: (lineLike ? s.lineColor ?? s.color : s.color) ?? auto(k), line: lineLike });
           k++;
         }
@@ -398,16 +479,20 @@ export function chartToSvg(xmlText: string, opts: ChartOptions): string | null {
       else bottom -= blockH + 4;
     }
   }
-  if (pieLike) {
-    drawPies(c.groups, left, top, right, bottom, fs, auto, (s) => (out += s));
+  if (radar) drawRadar(c, left, top, right, bottom, fs, auto, (s) => (out += s));
+  else if (surface) drawSurface(c, left, top, right, bottom, fs, auto, (s) => (out += s));
+  else if (pieLike) {
+    drawPies(c.groups, left, top, right, bottom, fs, auto, (s) => (out += s), c.view3D);
   } else {
     drawAxes(c, left, top, right, bottom, fs, auto, (s) => (out += s));
   }
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${f(W)} ${f(H)}" width="${f(W)}pt" height="${f(H)}pt">${out}</svg>`;
 }
 
-function drawPies(groups: Group[], left: number, top: number, right: number, bottom: number, fs: number, auto: (i: number) => string, emit: (s: string) => void): void {
+function drawPies(groups: Group[], left: number, top: number, right: number, bottom: number, fs: number, auto: (i: number) => string, emit: (s: string) => void, view?: View3D): void {
   const g = groups[0];
+  if (g.type === 'ofPie' && g.ofPie) return drawOfPie(g, left, top, right, bottom, fs, auto, emit);
+  if (g.threeD && g.type === 'pie') return drawPie3D(g, left, top, right, bottom, fs, auto, emit, view);
   const s = g.series[0];
   const vals = s.vals.map((v) => Math.max(0, v ?? 0));
   const total = vals.reduce((a, b) => a + b, 0);
@@ -449,8 +534,9 @@ function drawPies(groups: Group[], left: number, top: number, right: number, bot
 }
 
 function drawAxes(c: ReturnType<typeof parseChart>, left: number, top: number, right: number, bottom: number, fs: number, auto: (i: number) => string, emit: (s: string) => void): void {
-  const groups = c.groups.filter((g) => g.type !== 'pie' && g.type !== 'doughnut');
-  const scatter = groups.some((g) => g.type === 'scatter');
+  const groups = c.groups.filter((g) => g.type !== 'pie' && g.type !== 'doughnut' && g.type !== 'ofPie' && g.type !== 'radar' && g.type !== 'surface');
+  const scatter = groups.some((g) => g.type === 'scatter' || g.type === 'bubble');
+  const bubbles = groups.some((g) => g.type === 'bubble');
   const horizontal = groups.some((g) => g.type === 'bar' && g.horizontal);
   const cats = groups.flatMap((g) => g.series).reduce<string[]>((best, s) => (s.cats.length > best.length ? s.cats : best), []);
   const nCats = Math.max(1, cats.length, ...groups.flatMap((g) => g.series.map((s) => s.vals.length)));
@@ -495,6 +581,7 @@ function drawAxes(c: ReturnType<typeof parseChart>, left: number, top: number, r
   const intervals = (len: number, along: boolean, sample: number): number => Math.min(10, Math.max(3, Math.round(len / Math.max(fs * 4.5, along ? textWidth(formatNumber(sample), fs) * 1.6 : 0))));
   const r1 = range(false);
   if (scatter) r1.min = autoMin(Math.min(...groups.flatMap((g) => g.series.flatMap((s) => s.vals.filter((v): v is number => v !== null)))), r1.max);
+
   const vs = niceScale(r1.min, r1.max, c.valAxis.min, c.valAxis.max, intervals(vLen, horizontal, Math.max(Math.abs(r1.min), Math.abs(r1.max))));
   const hasSecondary = groups.some((g) => g.secondary);
   const r2 = hasSecondary ? range(true) : null;
@@ -505,7 +592,8 @@ function drawAxes(c: ReturnType<typeof parseChart>, left: number, top: number, r
   let xs: { min: number; max: number; step: number } | null = null;
   if (scatter) {
     const all = groups.flatMap((g) => g.series.flatMap((s) => (s.xs ?? s.vals.map((_, i) => i + 1)).filter((x): x is number => x !== null)));
-    xs = niceScale(autoMin(Math.min(...all), Math.max(...all)), Math.max(...all), c.xAxis?.min, c.xAxis?.max, intervals(xLen, true, Math.max(...all.map(Math.abs))));
+    const xr = { min: autoMin(Math.min(...all), Math.max(...all)), max: Math.max(...all) };
+    xs = niceScale(xr.min, xr.max, c.xAxis?.min, c.xAxis?.max, intervals(xLen, true, Math.max(...all.map(Math.abs))));
   }
   // Space for labels
   const ticks = (sc: { min: number; max: number; step: number }): number[] => {
@@ -538,9 +626,36 @@ function drawAxes(c: ReturnType<typeof parseChart>, left: number, top: number, r
     plotB = bottom - catH;
     plotT = Math.min(plotT, plotB - 10);
   }
+  // 3-D: the back wall is offset by the depth vector
+  const d3 = c.view3D && groups.some((g) => g.threeD && (g.type === 'bar' || g.type === 'line' || g.type === 'area')) ? depthOf(c.view3D, plotR - plotL, plotB - plotT) : null;
+  // a series axis (standard 3-D lines/areas) puts every series in its own row: more depth
+  const rowsInDepth = Math.max(1, ...groups.filter((g) => g.threeD && (g.type === 'line' || g.type === 'area') && g.grouping === 'standard').map((g) => g.series.length));
+  if (d3 && rowsInDepth > 1) {
+    const k = Math.min(3.5, 1.5 + 0.8 * (rowsInDepth - 1));
+    d3.dx *= k;
+    d3.dy *= k;
+  }
+  if (d3) {
+    if (d3.dx > 0) plotR -= d3.dx;
+    else plotL -= d3.dx;
+    if (d3.dy < 0) plotT -= d3.dy;
+    else plotB -= d3.dy;
+  }
   const plotW = plotR - plotL;
   const plotH = plotB - plotT;
   if (plotW < 10 || plotH < 10) return;
+  if (d3) {
+    const { dx, dy } = d3;
+    const back: [number, number][] = [
+      [plotL + dx, plotT + dy],
+      [plotR + dx, plotT + dy],
+      [plotR + dx, plotB + dy],
+      [plotL + dx, plotB + dy],
+    ];
+    emit(`<path d="${poly(back)}" fill="none" stroke="#${GRID}" stroke-width="0.75"/>`);
+    emit(`<path d="${poly([[plotL, plotT], [plotL + dx, plotT + dy], [plotL + dx, plotB + dy], [plotL, plotB]])}" fill="none" stroke="#${GRID}" stroke-width="0.75"/>`);
+    emit(`<path d="${poly([[plotL, plotB], [plotR, plotB], [plotR + dx, plotB + dy], [plotL + dx, plotB + dy]])}" fill="none" stroke="#${AXIS}" stroke-width="0.75"/>`);
+  }
   if (c.plotBg) emit(`<rect x="${f(plotL)}" y="${f(plotT)}" width="${f(plotW)}" height="${f(plotH)}" fill="#${c.plotBg}"/>`);
   // value → coordinate
   const vPos = (v: number, sc = vs): number => (horizontal ? plotL + ((v - sc.min) / (sc.max - sc.min)) * plotW : plotB - ((v - sc.min) / (sc.max - sc.min)) * plotH);
@@ -556,7 +671,15 @@ function drawAxes(c: ReturnType<typeof parseChart>, left: number, top: number, r
   // Gridlines and value labels
   for (const t of vTicks) {
     const p = vPos(t);
-    if (c.valAxis.grid) emit(horizontal ? `<line x1="${f(p)}" y1="${f(plotT)}" x2="${f(p)}" y2="${f(plotB)}" stroke="#${GRID}" stroke-width="0.75"/>` : `<line x1="${f(plotL)}" y1="${f(p)}" x2="${f(plotR)}" y2="${f(p)}" stroke="#${GRID}" stroke-width="0.75"/>`);
+    if (c.valAxis.grid && d3) {
+      // on the back wall and across the side wall (columns) or the floor (bars)
+      const { dx, dy } = d3;
+      emit(
+        horizontal
+          ? `<path d="M${f(p)} ${f(plotB)}L${f(p + dx)} ${f(plotB + dy)}L${f(p + dx)} ${f(plotT + dy)}" fill="none" stroke="#${GRID}" stroke-width="0.75"/>`
+          : `<path d="M${f(plotL)} ${f(p)}L${f(plotL + dx)} ${f(p + dy)}L${f(plotR + dx)} ${f(p + dy)}" fill="none" stroke="#${GRID}" stroke-width="0.75"/>`,
+      );
+    } else if (c.valAxis.grid) emit(horizontal ? `<line x1="${f(p)}" y1="${f(plotT)}" x2="${f(p)}" y2="${f(plotB)}" stroke="#${GRID}" stroke-width="0.75"/>` : `<line x1="${f(plotL)}" y1="${f(p)}" x2="${f(plotR)}" y2="${f(p)}" stroke="#${GRID}" stroke-width="0.75"/>`);
     if (!c.valAxis.deleted) {
       const label = escapeXml(valFmt(t));
       emit(horizontal ? `<text x="${f(p)}" y="${f(plotB + fs * 1.25)}" font-family="${FONT}" font-size="${f(fs)}" fill="#${LABEL}" text-anchor="middle">${label}</text>` : `<text x="${f(plotL - 4)}" y="${f(p + fs * 0.35)}" font-family="${FONT}" font-size="${f(fs)}" fill="#${LABEL}" text-anchor="end">${label}</text>`);
@@ -581,10 +704,44 @@ function drawAxes(c: ReturnType<typeof parseChart>, left: number, top: number, r
   }
   // Axis line at zero / bottom
   const zero = vPos(Math.min(Math.max(0, vs.min), vs.max));
-  emit(horizontal ? `<line x1="${f(zero)}" y1="${f(plotT)}" x2="${f(zero)}" y2="${f(plotB)}" stroke="#${AXIS}" stroke-width="0.75"/>` : `<line x1="${f(plotL)}" y1="${f(zero)}" x2="${f(plotR)}" y2="${f(zero)}" stroke="#${AXIS}" stroke-width="0.75"/>`);
+  if (!d3) emit(horizontal ? `<line x1="${f(zero)}" y1="${f(plotT)}" x2="${f(zero)}" y2="${f(plotB)}" stroke="#${AXIS}" stroke-width="0.75"/>` : `<line x1="${f(plotL)}" y1="${f(zero)}" x2="${f(plotR)}" y2="${f(zero)}" stroke="#${AXIS}" stroke-width="0.75"/>`);
   // Series
   let seriesIndex = 0;
   const labels: string[] = [];
+  const prisms: { x: number; y: number; svg: string }[] = [];
+  /** A 3-D bar: front rectangle with top and side faces (or a cylinder, cone or pyramid). */
+  const prism = (x: number, y: number, w: number, h: number, col: string, shape: string, depth: number): void => {
+    const dx = d3!.dx * depth;
+    const dy = d3!.dy * depth;
+    const top = tone(col, 1.25);
+    const side = tone(col, 0.72);
+    const edge = ` stroke="#${tone(col, 0.6)}" stroke-width="0.4"`;
+    let svg: string;
+    if (/^cylinder/.test(shape)) {
+      const rx = w / 2;
+      const ry = Math.max(1.5, Math.abs(dy) / 2);
+      const cxm = x + w / 2 + dx / 2;
+      svg =
+        `<path d="M${f(cxm - rx)} ${f(y + dy / 2)}L${f(cxm - rx)} ${f(y + h + dy / 2)}A${f(rx)} ${f(ry)} 0 0 0 ${f(cxm + rx)} ${f(y + h + dy / 2)}L${f(cxm + rx)} ${f(y + dy / 2)}Z" fill="#${col}"${edge}/>` +
+        `<ellipse cx="${f(cxm)}" cy="${f(y + dy / 2)}" rx="${f(rx)}" ry="${f(ry)}" fill="#${top}"${edge}/>`;
+    } else if (/^(cone|pyramid)/.test(shape)) {
+      const apex: [number, number] = [x + w / 2 + dx / 2, y + dy / 2];
+      if (/^cone/.test(shape)) {
+        const rx = w / 2;
+        const ry = Math.max(1.5, Math.abs(dy) / 2);
+        const cxm = x + w / 2 + dx / 2;
+        svg = `<path d="M${f(cxm - rx)} ${f(y + h + dy / 2)}A${f(rx)} ${f(ry)} 0 0 0 ${f(cxm + rx)} ${f(y + h + dy / 2)}L${f(apex[0])} ${f(apex[1])}Z" fill="#${col}"${edge}/>`;
+      } else
+        svg =
+          `<path d="${poly([[x, y + h], [x + w, y + h], apex])}" fill="#${col}"${edge}/>` +
+          `<path d="${poly([[x + w, y + h], [x + w + dx, y + h + dy], apex])}" fill="#${side}"${edge}/>`;
+    } else
+      svg =
+        `<path d="${poly([[x, y], [x + dx, y + dy], [x + w + dx, y + dy], [x + w, y]])}" fill="#${top}"${edge}/>` +
+        `<path d="${poly([[x + w, y], [x + w + dx, y + dy], [x + w + dx, y + h + dy], [x + w, y + h]])}" fill="#${side}"${edge}/>` +
+        `<rect x="${f(x)}" y="${f(y)}" width="${f(w)}" height="${f(h)}" fill="#${col}"${edge}/>`;
+    prisms.push({ x, y: y + h, svg });
+  };
   for (const g of groups) {
     const sc = g.secondary && vs2 ? vs2 : vs;
     const n = g.series.length;
@@ -625,7 +782,10 @@ function drawAxes(c: ReturnType<typeof parseChart>, left: number, top: number, r
           const off = catPos(i) - groupW / 2 + si * barW * (1 - ov);
           const p0 = vPos(a0, sc);
           const p1 = vPos(a1, sc);
-          if (horizontal) emit(`<rect x="${f(Math.min(p0, p1))}" y="${f(off)}" width="${f(Math.abs(p1 - p0))}" height="${f(barW)}" fill="#${fill}"/>`);
+          if (g.threeD && d3) {
+            if (horizontal) prism(Math.min(p0, p1), off, Math.abs(p1 - p0), barW, fill, 'box', 0.7);
+            else prism(off, Math.min(p0, p1), barW, Math.abs(p1 - p0), fill, g.shape, 0.7);
+          } else if (horizontal) emit(`<rect x="${f(Math.min(p0, p1))}" y="${f(off)}" width="${f(Math.abs(p1 - p0))}" height="${f(barW)}" fill="#${fill}"/>`);
           else emit(`<rect x="${f(off)}" y="${f(Math.min(p0, p1))}" width="${f(barW)}" height="${f(Math.abs(p1 - p0))}" fill="#${fill}"/>`);
           if (g.showVal) {
             const t = escapeXml(g.grouping === 'percentStacked' ? `${Math.round(v * 100)}%` : formatNumber(s.vals[i]!, s.format));
@@ -634,6 +794,105 @@ function drawAxes(c: ReturnType<typeof parseChart>, left: number, top: number, r
           }
         }
       });
+      if (prisms.length) {
+        // painter's order: bars further back (left for columns, bottom for bars, lower in stacks) first
+        const dir = d3 && d3.dx < 0 ? -1 : 1;
+        prisms.sort((a, b) => (horizontal ? b.y - a.y || a.x - b.x : (a.x - b.x) * dir || b.y - a.y));
+        for (const pr of prisms) emit(pr.svg);
+        prisms.length = 0;
+      }
+      seriesIndex += n;
+      continue;
+    }
+    if (g.type === 'stock') {
+      // high-low lines, open-close (up/down) bars, then the series markers
+      const barW = g.upDown ? slot / (1 + g.upDown.gap / 100) : 0;
+      for (let i = 0; i < nCats; i++) {
+        const vals = g.series.map((s) => s.vals[i]).filter((v): v is number => v !== null && v !== undefined);
+        if (!vals.length) continue;
+        const x = catPos(i);
+        if (g.hiLow && vals.length > 1) emit(`<line x1="${f(x)}" y1="${f(vPos(Math.max(...vals), sc))}" x2="${f(x)}" y2="${f(vPos(Math.min(...vals), sc))}" stroke="#404040" stroke-width="0.75"/>`);
+        const open = g.series[0]?.vals[i];
+        const close = g.series[n - 1]?.vals[i];
+        if (g.upDown && n >= 4 && open != null && close != null) {
+          const up = close >= open;
+          const y0 = vPos(Math.max(open, close), sc);
+          const y1 = vPos(Math.min(open, close), sc);
+          emit(`<rect x="${f(x - barW / 2)}" y="${f(y0)}" width="${f(barW)}" height="${f(Math.max(0.75, y1 - y0))}" fill="#${up ? (g.upDown.up ?? 'FFFFFF') : (g.upDown.down ?? '000000')}" stroke="#404040" stroke-width="0.75"/>`);
+        }
+      }
+      g.series.forEach((s, si) => {
+        const col = (s.lineColor ?? s.color) ?? auto(seriesIndex + si);
+        const pts = s.vals.map((v, i) => (v === null ? null : ([catPos(i), vPos(v, sc)] as [number, number]))).filter((q): q is [number, number] => !!q);
+        if (!s.noLine && pts.length > 1) emit(`<path d="M${pts.map(([x, y]) => `${f(x)} ${f(y)}`).join('L')}" fill="none" stroke="#${col}" stroke-width="${f(s.lineWidth ?? 2.25)}"/>`);
+        if (s.marker) for (const [x, y] of pts) emit(markerSvg(s.symbol, x, y, Math.max(2, fs * 0.3), s.color ?? col, col));
+      });
+      seriesIndex += n;
+      continue;
+    }
+    if (g.type === 'bubble' && xs) {
+      // bubble area (or width) proportional to its size; the largest is a quarter of the plot
+      const sizes = g.series.flatMap((s) => (s.sizes ?? []).filter((v): v is number => v !== null && v > 0));
+      const maxSize = Math.max(...sizes, 1e-9);
+      const maxR = (Math.min(plotW, plotH) * 0.125 * Math.max(0, Math.min(300, g.bubbleScale))) / 100;
+      const items: { r: number; svg: string }[] = [];
+      g.series.forEach((s, si) => {
+        const col = s.color ?? auto(seriesIndex + si);
+        s.vals.forEach((v, i) => {
+          const size = s.sizes?.[i];
+          if (v === null || size === null || size === undefined || size <= 0) return;
+          const r = g.sizeArea ? maxR * Math.sqrt(size / maxSize) : (maxR * size) / maxSize;
+          const x = xPos(s.xs?.[i] ?? i + 1);
+          const y = vPos(v, sc);
+          items.push({ r, svg: `<circle cx="${f(x)}" cy="${f(y)}" r="${f(r)}" fill="#${s.pointColors.get(i) ?? col}" fill-opacity="0.8" stroke="#FFFFFF" stroke-width="0.75"/>` });
+          if (g.showVal) labels.push(`<text x="${f(x)}" y="${f(y + fs * 0.35)}" font-family="${FONT}" font-size="${f(fs)}" fill="#404040" text-anchor="middle">${escapeXml(formatNumber(v, s.format))}</text>`);
+        });
+      });
+      for (const it of items.sort((a, b) => b.r - a.r)) emit(it.svg);
+      seriesIndex += n;
+      continue;
+    }
+    if (g.threeD && d3 && (g.type === 'line' || g.type === 'area')) {
+      // series as slabs (areas) or ribbons (lines) in depth rows, the back row first
+      const stackedRows = g.grouping === 'stacked' || g.grouping === 'percentStacked';
+      const rowsN = stackedRows ? 1 : n;
+      const totals = Array.from({ length: nCats }, (_, i) => g.series.reduce((sum, s) => sum + Math.abs(s.vals[i] ?? 0), 0) || 1);
+      const cum = new Array(nCats).fill(0);
+      const shapes: { row: number; order: number; svg: string }[] = [];
+      g.series.forEach((s, si) => {
+        const row = stackedRows ? 0 : si;
+        const o = { x: (d3.dx * row) / rowsN, y: (d3.dy * row) / rowsN };
+        const t = { x: (d3.dx / rowsN) * 0.8, y: (d3.dy / rowsN) * 0.8 };
+        const col = (g.type === 'area' ? s.color : (s.lineColor ?? s.color)) ?? auto(seriesIndex + si);
+        const pts: [number, number][] = [];
+        const base: [number, number][] = [];
+        for (let i = 0; i < nCats; i++) {
+          let v = s.vals[i];
+          if (v === null || v === undefined) continue;
+          if (g.grouping === 'percentStacked') v /= totals[i];
+          const b = stackedRows ? cum[i] : Math.min(Math.max(0, sc.min), sc.max);
+          if (stackedRows) cum[i] += v;
+          const top = stackedRows ? cum[i] : v;
+          pts.push([catPos(i) + o.x, vPos(top, sc) + o.y]);
+          base.push([catPos(i) + o.x, vPos(b, sc) + o.y]);
+        }
+        if (!pts.length) return;
+        let svg = '';
+        for (let i = 0; i + 1 < pts.length; i++) {
+          const a = pts[i];
+          const b = pts[i + 1];
+          svg += `<path d="${poly([a, b, [b[0] + t.x, b[1] + t.y], [a[0] + t.x, a[1] + t.y]])}" fill="#${g.type === 'area' ? tone(col, 1.2) : col}" stroke="#${tone(col, 0.7)}" stroke-width="0.4"/>`;
+        }
+        if (g.type === 'line' && pts.length > 1) svg += `<path d="M${pts.map(([x, y]) => `${f(x)} ${f(y)}`).join('L')}" fill="none" stroke="#${tone(col, 0.7)}" stroke-width="1.25"/>`;
+        if (g.type === 'area') {
+          const last = pts.length - 1;
+          svg += `<path d="${poly([pts[last], base[last], [base[last][0] + t.x, base[last][1] + t.y], [pts[last][0] + t.x, pts[last][1] + t.y]])}" fill="#${tone(col, 0.72)}" stroke="#${tone(col, 0.6)}" stroke-width="0.4"/>`;
+          svg += `<path d="M${pts.map(([x, y]) => `${f(x)} ${f(y)}`).join('L')}L${[...base].reverse().map(([x, y]) => `${f(x)} ${f(y)}`).join('L')}Z" fill="#${col}" stroke="#${tone(col, 0.6)}" stroke-width="0.4"/>`;
+        }
+        shapes.push({ row, order: si, svg });
+      });
+      shapes.sort((a, b) => b.row - a.row || a.order - b.order);
+      for (const sh of shapes) emit(sh.svg);
       seriesIndex += n;
       continue;
     }
@@ -677,11 +936,373 @@ function drawAxes(c: ReturnType<typeof parseChart>, left: number, top: number, r
         } else d += pts.slice(1).map(([x, y]) => `L${f(x)} ${f(y)}`).join('');
         emit(`<path d="${d}" fill="none" stroke="#${col}" stroke-width="${f(s.lineWidth ?? 2.25)}" stroke-linejoin="round" stroke-linecap="round"/>`);
       }
-      if (s.marker) for (const [x, y] of pts) emit(`<circle cx="${f(x)}" cy="${f(y)}" r="${f(Math.max(2, fs * 0.3))}" fill="#${s.color ?? col}" stroke="#${col}" stroke-width="0.75"/>`);
+      if (s.marker) for (const [x, y] of pts) emit(markerSvg(s.symbol, x, y, Math.max(2, fs * 0.3), s.color ?? col, col));
     });
     // Stacked areas are drawn back to front so lower series stay visible
     for (const p of areaPolys.reverse()) emit(p);
     seriesIndex += n;
   }
   for (const l of labels) emit(l);
+}
+
+// ---------------------------------------------------------------------------- shared drawing helpers
+
+/** A colour scaled towards black (k < 1) or white (k > 1). */
+function tone(hex: string, k: number): string {
+  return [0, 2, 4]
+    .map((o) => {
+      const v = parseInt(hex.slice(o, o + 2), 16) || 0;
+      const t = k <= 1 ? v * k : v + (255 - v) * (k - 1);
+      return Math.round(Math.max(0, Math.min(255, t)))
+        .toString(16)
+        .padStart(2, '0');
+    })
+    .join('')
+    .toUpperCase();
+}
+
+const poly = (pts: [number, number][]): string => `M${pts.map(([x, y]) => `${f(x)} ${f(y)}`).join('L')}Z`;
+
+/** A data marker (Office symbols) centred on x, y. */
+function markerSvg(sym: string | undefined, x: number, y: number, r: number, fill: string, stroke: string): string {
+  const st = ` fill="#${fill}" stroke="#${stroke}" stroke-width="0.75"`;
+  switch (sym) {
+    case 'square':
+      return `<rect x="${f(x - r)}" y="${f(y - r)}" width="${f(2 * r)}" height="${f(2 * r)}"${st}/>`;
+    case 'diamond':
+      return `<path d="${poly([[x, y - r * 1.3], [x + r * 1.3, y], [x, y + r * 1.3], [x - r * 1.3, y]])}"${st}/>`;
+    case 'triangle':
+      return `<path d="${poly([[x, y - r * 1.3], [x + r * 1.2, y + r * 0.9], [x - r * 1.2, y + r * 0.9]])}"${st}/>`;
+    case 'x':
+      return `<path d="M${f(x - r)} ${f(y - r)}L${f(x + r)} ${f(y + r)}M${f(x + r)} ${f(y - r)}L${f(x - r)} ${f(y + r)}" fill="none" stroke="#${stroke}" stroke-width="1.25"/>`;
+    case 'plus':
+      return `<path d="M${f(x - r)} ${f(y)}L${f(x + r)} ${f(y)}M${f(x)} ${f(y - r)}L${f(x)} ${f(y + r)}" fill="none" stroke="#${stroke}" stroke-width="1.25"/>`;
+    case 'star':
+      return `<path d="M${f(x - r)} ${f(y)}L${f(x + r)} ${f(y)}M${f(x)} ${f(y - r)}L${f(x)} ${f(y + r)}M${f(x - r * 0.7)} ${f(y - r * 0.7)}L${f(x + r * 0.7)} ${f(y + r * 0.7)}M${f(x + r * 0.7)} ${f(y - r * 0.7)}L${f(x - r * 0.7)} ${f(y + r * 0.7)}" fill="none" stroke="#${stroke}" stroke-width="1"/>`;
+    case 'dash':
+      return `<path d="M${f(x - r * 1.2)} ${f(y)}L${f(x + r * 1.2)} ${f(y)}" fill="none" stroke="#${stroke}" stroke-width="2"/>`;
+    case 'dot':
+      return `<circle cx="${f(x)}" cy="${f(y)}" r="${f(r * 0.5)}" fill="#${stroke}"/>`;
+    default:
+      return `<circle cx="${f(x)}" cy="${f(y)}" r="${f(r)}"${st}/>`;
+  }
+}
+
+/** Depth offset of 3-D charts: an oblique projection (Office's right-angle axes) from view3D. */
+function depthOf(v: View3D | undefined, w: number, h: number): { dx: number; dy: number } {
+  const d = Math.min(w, h) * 0.13 * Math.max(0.2, Math.min(2, (v?.depthPercent ?? 100) / 100));
+  const rotY = (((v?.rotY ?? 20) % 360) + 360) % 360;
+  const rotX = v?.rotX ?? 15;
+  const sx = Math.cos((rotY * Math.PI) / 180) >= 0 ? 1 : -1;
+  const sy = rotX >= 0 ? -1 : 1;
+  return { dx: d * 0.85 * sx, dy: d * (0.3 + 0.4 * Math.min(1, Math.abs(rotX) / 30)) * sy };
+}
+
+// ---------------------------------------------------------------------------- radar
+
+function drawRadar(c: ReturnType<typeof parseChart>, left: number, top: number, right: number, bottom: number, fs: number, auto: (i: number) => string, emit: (s: string) => void): void {
+  const series = c.groups.flatMap((g) => g.series);
+  const style = c.groups[0].radarStyle;
+  const cats = series.reduce<string[]>((best, s) => (s.cats.length > best.length ? s.cats : best), []);
+  const n = Math.max(cats.length, ...series.map((s) => s.vals.length));
+  if (n < 1) return;
+  const all = series.flatMap((s) => s.vals.filter((v): v is number => v !== null));
+  const sc = niceScale(Math.min(0, ...all), Math.max(...all, 0), c.valAxis.min, c.valAxis.max, 5);
+  const labelW = Math.max(0, ...cats.map((t) => textWidth(t, fs)));
+  const R = Math.max(10, Math.min((right - left) / 2 - labelW - 8, (bottom - top) / 2 - fs * 1.8));
+  const cx = (left + right) / 2;
+  const cy = (top + bottom) / 2;
+  const ang = (i: number): number => -Math.PI / 2 + (i * 2 * Math.PI) / n;
+  const pt = (i: number, v: number): [number, number] => {
+    const r = (R * (v - sc.min)) / (sc.max - sc.min || 1);
+    return [cx + r * Math.cos(ang(i)), cy + r * Math.sin(ang(i))];
+  };
+  const ticks: number[] = [];
+  for (let v = sc.min, k = 0; v <= sc.max + sc.step * 1e-6 && k < 50; v += sc.step, k++) ticks.push(Math.round(v / sc.step) * sc.step);
+  // gridlines: polygons at the ticks, spokes to every category
+  for (const t of ticks.slice(1)) emit(`<path d="${poly(Array.from({ length: n }, (_, i) => pt(i, t)))}" fill="none" stroke="#${GRID}" stroke-width="0.75"/>`);
+  for (let i = 0; i < n; i++) {
+    const [x, y] = pt(i, sc.max);
+    emit(`<line x1="${f(cx)}" y1="${f(cy)}" x2="${f(x)}" y2="${f(y)}" stroke="#${AXIS}" stroke-width="0.75"/>`);
+    const lx = cx + (R + 6) * Math.cos(ang(i));
+    const ly = cy + (R + 6) * Math.sin(ang(i));
+    const cos = Math.cos(ang(i));
+    const anchor = cos > 0.25 ? 'start' : cos < -0.25 ? 'end' : 'middle';
+    const dy = Math.sin(ang(i)) > 0.25 ? fs * 0.9 : Math.sin(ang(i)) < -0.25 ? -fs * 0.1 : fs * 0.35;
+    if (!c.catAxis.deleted && cats[i] !== undefined) emit(`<text x="${f(lx)}" y="${f(ly + dy)}" font-family="${FONT}" font-size="${f(fs)}" fill="#${LABEL}"${anchor !== 'start' ? ` text-anchor="${anchor}"` : ''}>${escapeXml(cats[i])}</text>`);
+  }
+  if (!c.valAxis.deleted)
+    for (const t of ticks) {
+      const [x, y] = pt(0, t);
+      emit(`<text x="${f(x - 4)}" y="${f(y + fs * 0.35)}" font-family="${FONT}" font-size="${f(fs * 0.9)}" fill="#${LABEL}" text-anchor="end">${escapeXml(formatNumber(t, c.valAxis.format ?? series[0]?.format))}</text>`);
+    }
+  series.forEach((s, k) => {
+    const col = (style === 'filled' ? s.color : (s.lineColor ?? s.color)) ?? auto(k);
+    const pts = Array.from({ length: n }, (_, i) => pt(i, s.vals[i] ?? sc.min));
+    if (style === 'filled') emit(`<path d="${poly(pts)}" fill="#${col}" fill-opacity="0.85" stroke="#${col}" stroke-width="0.75"/>`);
+    else {
+      emit(`<path d="${poly(pts)}" fill="none" stroke="#${col}" stroke-width="${f(s.lineWidth ?? 2.25)}" stroke-linejoin="round"/>`);
+      if (s.marker) pts.forEach(([x, y], i) => s.vals[i] !== null && emit(markerSvg(s.symbol, x, y, Math.max(2, fs * 0.3), s.color ?? col, col)));
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------- surface
+
+type VPt = [number, number, number]; // x, y (data grid), value
+
+/** Part of a convex polygon where value ≥ t (keepAbove) or ≤ t, with interpolated edges. */
+function clipByValue(polyIn: VPt[], t: number, keepAbove: boolean): VPt[] {
+  const inside = (p: VPt): boolean => (keepAbove ? p[2] >= t : p[2] <= t);
+  const out: VPt[] = [];
+  for (let i = 0; i < polyIn.length; i++) {
+    const a = polyIn[i];
+    const b = polyIn[(i + 1) % polyIn.length];
+    if (inside(a)) out.push(a);
+    if (inside(a) !== inside(b) && a[2] !== b[2]) {
+      const k = (t - a[2]) / (b[2] - a[2]);
+      out.push([a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k, t]);
+    }
+  }
+  return out;
+}
+
+/** Value bands of a surface chart: [low, high) pairs from the value axis scale. */
+function surfaceBands(c: ReturnType<typeof parseChart>): number[] {
+  const all = c.groups.flatMap((g) => g.series.flatMap((s) => s.vals.filter((v): v is number => v !== null)));
+  const sc = niceScale(Math.min(...all), Math.max(...all), c.valAxis.min, c.valAxis.max, 6);
+  const t: number[] = [];
+  for (let v = sc.min, k = 0; v <= sc.max + sc.step * 1e-6 && k < 40; v += sc.step, k++) t.push(Math.round(v / sc.step) * sc.step);
+  return t;
+}
+
+function drawSurface(c: ReturnType<typeof parseChart>, left: number, top: number, right: number, bottom: number, fs: number, auto: (i: number) => string, emit: (s: string) => void): void {
+  const g = c.groups[0];
+  const rows = g.series;
+  const cats = rows.reduce<string[]>((best, s) => (s.cats.length > best.length ? s.cats : best), []);
+  const nx = Math.max(cats.length, ...rows.map((s) => s.vals.length));
+  const ny = rows.length;
+  if (nx < 2 || ny < 1) return;
+  const bands = surfaceBands(c);
+  const vmin = bands[0];
+  const vmax = bands[bands.length - 1];
+  const contour = !g.threeD || (c.view3D?.rotX ?? 15) >= 89;
+  const labelW = Math.max(0, ...rows.map((s) => textWidth(s.name, fs))) + 6;
+  const vLabelW = Math.max(...bands.map((t) => textWidth(formatNumber(t, c.valAxis.format), fs))) + 6;
+  const plotL = left + (contour ? labelW : vLabelW);
+  let plotR = right - 6;
+  let plotT = top + fs;
+  const plotB = bottom - fs * 1.8;
+  const depth = contour ? { dx: 0, dy: 0 } : depthOf(c.view3D, plotR - plotL, plotB - plotT);
+  if (!contour) {
+    // the depth axis takes the series rows: give it a third of the room
+    depth.dx *= 2.2;
+    depth.dy *= 2.2;
+    plotR -= Math.abs(depth.dx);
+    plotT += Math.abs(depth.dy);
+  }
+  const W = plotR - plotL;
+  const H = plotB - plotT;
+  // grid → screen
+  const scr = (x: number, y: number, v: number): [number, number] => {
+    if (contour) return [plotL + (x * W) / (nx - 1), plotB - (ny > 1 ? (y * H) / (ny - 1) : 0)];
+    const ky = ny > 1 ? y / (ny - 1) : 0;
+    return [plotL + (x * W) / (nx - 1) + ky * depth.dx, plotB - ((v - vmin) / (vmax - vmin || 1)) * H + ky * depth.dy];
+  };
+  if (!contour) {
+    // walls with value gridlines
+    for (const t of bands) {
+      const [x0, y0] = scr(0, 0, t);
+      const [x1, y1] = scr(0, ny - 1, t);
+      const [x2, y2] = scr(nx - 1, ny - 1, t);
+      emit(`<path d="M${f(x0)} ${f(y0)}L${f(x1)} ${f(y1)}L${f(x2)} ${f(y2)}" fill="none" stroke="#${GRID}" stroke-width="0.75"/>`);
+      if (!c.valAxis.deleted) emit(`<text x="${f(x0 - 4)}" y="${f(y0 + fs * 0.35)}" font-family="${FONT}" font-size="${f(fs)}" fill="#${LABEL}" text-anchor="end">${escapeXml(formatNumber(t, c.valAxis.format ?? rows[0]?.format))}</text>`);
+    }
+  }
+  const val = (x: number, y: number): number | null => rows[y]?.vals[x] ?? null;
+  // painter's order: back rows first
+  for (let y = (contour ? 0 : ny - 2); contour ? y < ny - 1 : y >= 0; y += contour ? 1 : -1) {
+    for (let x = 0; x < nx - 1; x++) {
+      const corners: [number, number][] = [
+        [x, y],
+        [x + 1, y],
+        [x + 1, y + 1],
+        [x, y + 1],
+      ];
+      if (corners.some(([cx, cy]) => val(cx, cy) === null)) continue;
+      const tri = (a: number, b: number, d: number): VPt[] => [a, b, d].map((k) => [corners[k][0], corners[k][1], val(corners[k][0], corners[k][1])!] as VPt);
+      for (const t of [tri(0, 1, 2), tri(0, 2, 3)]) {
+        for (let k = 0; k + 1 < bands.length; k++) {
+          let part = clipByValue(t, bands[k], true);
+          if (k + 2 < bands.length) part = clipByValue(part, bands[k + 1], false);
+          if (part.length < 3) continue;
+          const pts = part.map(([px, py, pv]) => scr(px, py, pv));
+          const col = auto(k);
+          emit(g.wireframe ? `<path d="${poly(pts)}" fill="none" stroke="#${col}" stroke-width="0.75"/>` : `<path d="${poly(pts)}" fill="#${col}" stroke="#${col}" stroke-width="0.4"/>`);
+        }
+      }
+    }
+  }
+  if (!contour)
+    for (let y = ny - 1; y >= 0; y--)
+      for (let x = 0; x < nx; x++) {
+        const v = val(x, y);
+        if (v === null) continue;
+        const [x0, y0] = scr(x, y, v);
+        const right = val(x + 1, y);
+        const front = val(x, y - 1);
+        if (right !== null && x + 1 < nx) {
+          const [x1, y1] = scr(x + 1, y, right);
+          emit(`<line x1="${f(x0)}" y1="${f(y0)}" x2="${f(x1)}" y2="${f(y1)}" stroke="#404040" stroke-width="0.35"/>`);
+        }
+        if (front !== null && y > 0) {
+          const [x1, y1] = scr(x, y - 1, front);
+          emit(`<line x1="${f(x0)}" y1="${f(y0)}" x2="${f(x1)}" y2="${f(y1)}" stroke="#404040" stroke-width="0.35"/>`);
+        }
+      }
+  // axes labels: categories along the front, series along the side (contour: left)
+  if (!c.catAxis.deleted)
+    cats.forEach((t, i) => {
+      const [x, y] = scr(i, 0, vmin);
+      emit(`<text x="${f(x)}" y="${f((contour ? plotB : y) + fs * 1.3)}" font-family="${FONT}" font-size="${f(fs)}" fill="#${LABEL}" text-anchor="middle">${escapeXml(t)}</text>`);
+    });
+  rows.forEach((s, j) => {
+    if (!s.name) return;
+    const [x, y] = scr(contour ? 0 : nx - 1, j, vmin);
+    emit(contour ? `<text x="${f(x - 4)}" y="${f(y + fs * 0.35)}" font-family="${FONT}" font-size="${f(fs)}" fill="#${LABEL}" text-anchor="end">${escapeXml(s.name)}</text>` : `<text x="${f(x + 4)}" y="${f(y + fs * 0.35)}" font-family="${FONT}" font-size="${f(fs)}" fill="#${LABEL}">${escapeXml(s.name)}</text>`);
+  });
+}
+
+// ---------------------------------------------------------------------------- 3-D pie and pie of pie
+
+function pieSlices(vals: number[], start: number): { a1: number; a2: number; v: number; i: number }[] {
+  const total = vals.reduce((a, b) => a + b, 0) || 1;
+  let a = start;
+  return vals.map((v, i) => {
+    const sweep = (v / total) * Math.PI * 2;
+    const r = { a1: a, a2: a + sweep, v, i };
+    a += sweep;
+    return r;
+  });
+}
+
+function drawPie3D(g: Group, left: number, top: number, right: number, bottom: number, fs: number, auto: (i: number) => string, emit: (s: string) => void, view: View3D | undefined): void {
+  const s = g.series[0];
+  const vals = s.vals.map((v) => Math.max(0, v ?? 0));
+  const total = vals.reduce((a, b) => a + b, 0);
+  if (!total) return;
+  const tilt = Math.max(0.2, Math.sin((Math.max(10, Math.min(80, view?.rotX ?? 30)) * Math.PI) / 180));
+  const showLabels = g.showPercent || g.showVal || g.showCat;
+  const pad = showLabels ? fs * 0.5 : 4;
+  let r = Math.min((right - left) / 2 - pad, ((bottom - top) / 2 - pad) / tilt);
+  const thick = r * 0.2 * (1 - tilt * 0.5);
+  r = Math.max(10, Math.min(r, ((bottom - top) / 2 - pad - thick / 2) / tilt));
+  const cx = (left + right) / 2;
+  const cy = (top + bottom) / 2 - thick / 2;
+  const ry = r * tilt;
+  const p = (ang: number, dy = 0): string => `${f(cx + r * Math.cos(ang))} ${f(cy + dy + ry * Math.sin(ang))}`;
+  const colorOfPoint = (i: number): string => s.pointColors.get(i) ?? (g.vary ? auto(i) : (s.color ?? auto(0)));
+  const slices = pieSlices(vals, ((g.firstAngle - 90) * Math.PI) / 180).filter((x) => x.v > 0);
+  // outer walls of the front half (sin > 0), from the back towards the front
+  const walls: { mid: number; d: string; col: string }[] = [];
+  for (const sl of slices) {
+    for (let k = -1; k <= 2; k++) {
+      const lo = Math.max(sl.a1, k * 2 * Math.PI);
+      const hi = Math.min(sl.a2, k * 2 * Math.PI + Math.PI);
+      if (hi - lo < 1e-4) continue;
+      const large = hi - lo > Math.PI ? 1 : 0;
+      walls.push({ mid: (lo + hi) / 2, col: tone(colorOfPoint(sl.i), 0.72), d: `M${p(lo)}A${f(r)} ${f(ry)} 0 ${large} 1 ${p(hi)}L${p(hi, thick)}A${f(r)} ${f(ry)} 0 ${large} 0 ${p(lo, thick)}Z` });
+    }
+  }
+  walls.sort((a, b) => Math.abs(Math.sin(a.mid)) - Math.abs(Math.sin(b.mid)) || Math.cos(a.mid) - Math.cos(b.mid));
+  for (const w of walls) emit(`<path d="${w.d}" fill="#${w.col}" stroke="#${tone(w.col, 0.9)}" stroke-width="0.5"/>`);
+  for (const sl of slices) {
+    const large = sl.a2 - sl.a1 > Math.PI ? 1 : 0;
+    const d = sl.a2 - sl.a1 >= Math.PI * 2 - 1e-6 ? `M${p(0)}A${f(r)} ${f(ry)} 0 1 1 ${p(Math.PI)}A${f(r)} ${f(ry)} 0 1 1 ${p(0)}Z` : `M${f(cx)} ${f(cy)}L${p(sl.a1)}A${f(r)} ${f(ry)} 0 ${large} 1 ${p(sl.a2)}Z`;
+    emit(`<path d="${d}" fill="#${colorOfPoint(sl.i)}" stroke="#FFFFFF" stroke-width="0.75"/>`);
+  }
+  if (showLabels)
+    for (const sl of slices) {
+      const mid = (sl.a1 + sl.a2) / 2;
+      const parts: string[] = [];
+      if (g.showCat && s.cats[sl.i]) parts.push(s.cats[sl.i]);
+      if (g.showVal) parts.push(formatNumber(sl.v, s.format));
+      if (g.showPercent) parts.push(`${Math.round((sl.v / total) * 100)}%`);
+      emit(`<text x="${f(cx + r * 0.65 * Math.cos(mid))}" y="${f(cy + ry * 0.65 * Math.sin(mid) + fs * 0.35)}" font-family="${FONT}" font-size="${f(fs)}" font-weight="bold" fill="#FFFFFF" text-anchor="middle">${escapeXml(parts.join(' '))}</text>`);
+    }
+}
+
+function drawOfPie(g: Group, left: number, top: number, right: number, bottom: number, fs: number, auto: (i: number) => string, emit: (s: string) => void): void {
+  const s = g.series[0];
+  const op = g.ofPie!;
+  const vals = s.vals.map((v) => Math.max(0, v ?? 0));
+  const total = vals.reduce((a, b) => a + b, 0);
+  if (!total) return;
+  const k = Math.min(op.splitPos, vals.length - 1);
+  const main = vals.slice(0, vals.length - k);
+  const second = vals.slice(vals.length - k);
+  const other = second.reduce((a, b) => a + b, 0);
+  const colorOfPoint = (i: number): string => s.pointColors.get(i) ?? (g.vary ? auto(i) : (s.color ?? auto(0)));
+  const showLabels = g.showPercent || g.showVal || g.showCat;
+  const pct = (v: number): string => {
+    const parts: string[] = [];
+    if (g.showVal) parts.push(formatNumber(v, s.format));
+    if (g.showPercent || !parts.length) parts.push(`${Math.round((v / total) * 100)}%`);
+    return parts.join(' ');
+  };
+  const W = right - left;
+  const H = bottom - top;
+  const r = Math.max(10, Math.min(W * 0.27, H / 2 - 6));
+  const cx = left + W * 0.3;
+  const cy = top + H / 2;
+  const r2 = (r * Math.max(5, Math.min(200, op.secondSize))) / 100;
+  const cx2 = left + W * 0.78;
+  // main pie: the "other" slice faces the second plot
+  const otherSweep = (other / total) * Math.PI * 2;
+  const slices = pieSlices([...main, other], otherSweep / 2);
+  const p = (x: number, y: number, rad: number, ang: number): [number, number] => [x + rad * Math.cos(ang), y + rad * Math.sin(ang)];
+  slices.forEach((sl, n) => {
+    if (sl.v <= 0) return;
+    const isOther = n === slices.length - 1;
+    const col = isOther ? auto(vals.length) : colorOfPoint(sl.i);
+    const [x1, y1] = p(cx, cy, r, sl.a1);
+    const [x2, y2] = p(cx, cy, r, sl.a2);
+    const large = sl.a2 - sl.a1 > Math.PI ? 1 : 0;
+    emit(`<path d="M${f(cx)} ${f(cy)}L${f(x1)} ${f(y1)}A${f(r)} ${f(r)} 0 ${large} 1 ${f(x2)} ${f(y2)}Z" fill="#${col}" stroke="#FFFFFF" stroke-width="1"/>`);
+    if (showLabels) {
+      const [tx, ty] = p(cx, cy, r * 0.65, (sl.a1 + sl.a2) / 2);
+      emit(`<text x="${f(tx)}" y="${f(ty + fs * 0.35)}" font-family="${FONT}" font-size="${f(fs)}" font-weight="bold" fill="#FFFFFF" text-anchor="middle">${escapeXml(pct(sl.v))}</text>`);
+    }
+  });
+  const [ox1, oy1] = p(cx, cy, r, -otherSweep / 2);
+  const [ox2, oy2] = p(cx, cy, r, otherSweep / 2);
+  if (op.bar) {
+    // the split points stacked in a column, the first at the top
+    const bh = Math.min(H - 8, r2 * 2);
+    const bw = Math.max(14, r * 0.45);
+    const bx = cx2 - bw / 2;
+    let by = cy - bh / 2;
+    emit(`<line x1="${f(ox1)}" y1="${f(oy1)}" x2="${f(bx)}" y2="${f(by)}" stroke="#${AXIS}" stroke-width="0.75"/><line x1="${f(ox2)}" y1="${f(oy2)}" x2="${f(bx)}" y2="${f(by + bh)}" stroke="#${AXIS}" stroke-width="0.75"/>`);
+    second.forEach((v, j) => {
+      const h = other ? (v / other) * bh : 0;
+      emit(`<rect x="${f(bx)}" y="${f(by)}" width="${f(bw)}" height="${f(h)}" fill="#${colorOfPoint(vals.length - k + j)}" stroke="#FFFFFF" stroke-width="1"/>`);
+      if (showLabels && h > fs) emit(`<text x="${f(cx2)}" y="${f(by + h / 2 + fs * 0.35)}" font-family="${FONT}" font-size="${f(fs)}" font-weight="bold" fill="#FFFFFF" text-anchor="middle">${escapeXml(pct(v))}</text>`);
+      by += h;
+    });
+  } else {
+    const sub = pieSlices(second, Math.PI - (second[0] / (other || 1)) * Math.PI);
+    emit(`<line x1="${f(ox1)}" y1="${f(oy1)}" x2="${f(cx2)}" y2="${f(cy - r2)}" stroke="#${AXIS}" stroke-width="0.75"/><line x1="${f(ox2)}" y1="${f(oy2)}" x2="${f(cx2)}" y2="${f(cy + r2)}" stroke="#${AXIS}" stroke-width="0.75"/>`);
+    sub.forEach((sl, j) => {
+      if (sl.v <= 0) return;
+      const [x1, y1] = p(cx2, cy, r2, sl.a1);
+      const [x2, y2] = p(cx2, cy, r2, sl.a2);
+      const large = sl.a2 - sl.a1 > Math.PI ? 1 : 0;
+      const d = sl.a2 - sl.a1 >= Math.PI * 2 - 1e-6 ? `M${f(cx2 + r2)} ${f(cy)}A${f(r2)} ${f(r2)} 0 1 1 ${f(cx2 - r2)} ${f(cy)}A${f(r2)} ${f(r2)} 0 1 1 ${f(cx2 + r2)} ${f(cy)}Z` : `M${f(cx2)} ${f(cy)}L${f(x1)} ${f(y1)}A${f(r2)} ${f(r2)} 0 ${large} 1 ${f(x2)} ${f(y2)}Z`;
+      emit(`<path d="${d}" fill="#${colorOfPoint(vals.length - k + j)}" stroke="#FFFFFF" stroke-width="1"/>`);
+      if (showLabels) {
+        const [tx, ty] = p(cx2, cy, r2 * 0.62, (sl.a1 + sl.a2) / 2);
+        emit(`<text x="${f(tx)}" y="${f(ty + fs * 0.35)}" font-family="${FONT}" font-size="${f(fs)}" font-weight="bold" fill="#FFFFFF" text-anchor="middle">${escapeXml(pct(sl.v))}</text>`);
+      }
+    });
+  }
 }

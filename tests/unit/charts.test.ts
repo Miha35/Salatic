@@ -9,7 +9,7 @@ import { docToDocx } from '../../src/core/writers/docx';
 import { convert } from '../../src/core/convert';
 import type { Block } from '../../src/core/model';
 import type { MetaCmd } from '../../src/core/metafile';
-import { barChart, pieChart, sampleCharts, SAMPLE_CATS } from './chart-fixture';
+import { barChart, moreCharts, pieChart, sampleCharts, SAMPLE_CATS } from './chart-fixture';
 import { makePptx } from './pptx-fixture';
 import { sample } from './sample';
 import { docToHtmlFragment } from '../../src/core/writers/text';
@@ -432,5 +432,75 @@ describe('charts and SVG in written documents', () => {
     const rtf = (await convert(docxWithChart(chartXml), 'docx', 'rtf', env)).data;
     t = norm(pdfToText(soffice(rtf, 'rtf', 'pdf')));
     for (const s of ['Продажи', 'Прогноз', 'Апр', '190']) expect(t, 'rtf chart').toContain(s);
+  });
+});
+
+describe('more chart kinds', () => {
+  const charts = moreCharts();
+  const svgOf = (k: string): string => chartToSvg(charts[k], { width: 432, height: 252 })!;
+
+  it('every kind renders to parseable SVG', () => {
+    for (const k of Object.keys(charts)) {
+      const s = svgOf(k);
+      expect(s, k).toMatch(/^<svg /);
+      expect(parseSvg(s)!.cmds.length, k).toBeGreaterThan(10);
+    }
+  });
+
+  it('radar: one spoke per category, one polygon per series, category labels around', () => {
+    const s = svgOf('radar');
+    expect(s.match(/<line [^>]*stroke="#BFBFBF"/g)?.length).toBe(6);
+    expect(s.match(/<path d="M[^"]+Z" fill="none" stroke="#(4472C4|ED7D31)"/g)?.length).toBe(2);
+    expect(texts(s)).toEqual(expect.arrayContaining(['Скорость', 'Гарантия', 'Модель А']));
+    expect(svgOf('radarFilled')).toMatch(/fill="#4472C4" fill-opacity/);
+  });
+
+  it('stock: high-low lines, white up bars and black down bars, only visible series in the legend', () => {
+    const s = svgOf('stock');
+    expect(s.match(/<line [^>]*stroke="#404040"/g)?.length).toBe(5);
+    // closes below opens on days 1 and 4
+    expect(s.match(/<rect [^>]*fill="#000000"/g)?.length).toBe(2);
+    expect(s.match(/<rect [^>]*fill="#FFFFFF"/g)?.length).toBe(3);
+    expect(texts(s)).toContain('Закрытие');
+    expect(texts(s)).not.toContain('Открытие');
+  });
+
+  it('bubble: bubble area proportional to size', () => {
+    const r = [...svgOf('bubble').matchAll(/<circle [^>]*r="([\d.]+)" fill="#4472C4"/g)].map((m) => +m[1]);
+    expect(r.length).toBe(4);
+    // sizes 40 and 10 of the same series: area ×4, radius ×2
+    expect(Math.max(...r) / Math.min(...r.filter((x) => x > Math.min(...r)))).toBeCloseTo(2, 1);
+  });
+
+  it('3-D columns and bars: front, top and side faces; pie with walls', () => {
+    const col = svgOf('column3d');
+    expect(col.match(/<rect /g)!.length).toBeGreaterThanOrEqual(8 + 2); // 8 bars, 2 legend keys
+    expect(col).toMatch(/fill="#5B85CF"|fill="#[0-9A-F]{6}" stroke="#[0-9A-F]{6}" stroke-width="0.4"/);
+    expect(svgOf('cylinder3d')).toMatch(/<ellipse /);
+    const pie = svgOf('pie3d');
+    expect(pie.match(/<path [^>]*stroke="#FFFFFF"/g)?.length).toBe(4);
+    expect(pie.match(/stroke-width="0.5"/g)!.length).toBeGreaterThanOrEqual(2); // walls of the front slices
+  });
+
+  it('surface: value bands in the legend, contour and 3-D views', () => {
+    expect(texts(svgOf('contour'))).toEqual(expect.arrayContaining(['0–2', '8–10']));
+    expect(svgOf('surface3d').match(/<line [^>]*stroke="#404040" stroke-width="0.35"/g)!.length).toBeGreaterThan(20);
+  });
+
+  it('pie of pie and bar of pie: the last points move to the second plot', () => {
+    const pie = svgOf('pieOfPie');
+    expect(pie.match(/<line [^>]*stroke="#BFBFBF"/g)?.length).toBe(2); // connectors
+    expect(texts(pie)).toEqual(expect.arrayContaining(['40%', '8%', '7%', '5%']));
+    const bar = svgOf('barOfPie');
+    expect(bar.match(/<rect [^>]*stroke="#FFFFFF"/g)?.length).toBe(3);
+  });
+
+  it.skipIf(!hasCmd('pdftotext'))('PPTX → PDF keeps the labels of the new kinds', async () => {
+    for (const k of ['radar', 'stock', 'bubble', 'column3d', 'pie3d', 'pieOfPie']) {
+      const r = await convert(makePptx(charts[k]), 'pptx', 'pdf', env);
+      const page = norm(pdfToText(r.data).split('\f')[3]);
+      const title = /<a:t>([^<]+)<\/a:t>/.exec(charts[k])![1];
+      expect(page, k).toContain(title);
+    }
   });
 });
