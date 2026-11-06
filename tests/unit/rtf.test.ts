@@ -180,7 +180,8 @@ describe('RTF reader edge cases', () => {
 
   it('treats \\page, \\pagebb and section breaks as page breaks', () => {
     const d = read('{\\rtf1 A\\par\\page B\\par\\pard\\pagebb C\\par\\sect\\sectd D\\par\\sect\\sectd\\sbknone E\\par}');
-    expect(d.blocks.map((b) => (b.type === 'pagebreak' ? '|' : blockText(b))).join('')).toBe('A|B|C|DE');
+    // a section break is a section marker that starts a page (\sbknone: continuous)
+    expect(d.blocks.map((b) => (b.type === 'pagebreak' || (b.type === 'section' && b.start === 'page') ? '|' : b.type === 'section' ? '' : blockText(b))).join('')).toBe('A|B|C|DE');
   });
 
   it('survives malformed input and rejects non-RTF', () => {

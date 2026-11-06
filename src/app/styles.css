@@ -1086,6 +1086,15 @@ input[type='range'] {
   overflow-wrap: anywhere;
 }
 
+/* Sections with columns (from Word/ODT/RTF): shown as CSS columns, outlined while editing */
+.doc-page .doc-section {
+  outline: 1px dashed var(--border);
+  outline-offset: 4px;
+  margin: 12px 0;
+}
+.doc-page .doc-section > :first-child {
+  margin-top: 0;
+}
 .doc-page:empty::before {
   content: attr(data-placeholder);
   color: #9a9aa5;

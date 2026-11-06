@@ -54,7 +54,11 @@ export interface Box {
   spaceAfter: number;
   keepWithNext?: boolean;
   pageBreak?: boolean;
+  /** A zero-height marker starting a section (columns) */
+  section?: Section;
 }
+
+type Section = Omit<Extract<Block, { type: 'section' }>, 'type'>;
 
 interface Token {
   text: string;
@@ -833,8 +837,27 @@ export class PdfWriter {
     const stack = (boxes: Box[]): number => boxes.reduce((s, b, i) => s + b.height + (i ? b.spaceBefore : 0) + (i < boxes.length - 1 ? b.spaceAfter : 0), 0);
     this.contentTop = Math.max(this.margins.top, this.headerBoxes.length ? this.headerDist + stack(this.headerBoxes) + 6 : 0);
     this.contentBottom = Math.min(this.pageH - this.margins.bottom, this.footerBoxes.length ? this.pageH - this.footerDist - stack(this.footerBoxes) - 6 : Infinity);
-    // Main flow (footnotes are numbered while laying it out)
-    const main = await this.layout(doc.blocks.length ? doc.blocks : [{ type: 'paragraph', runs: [] }], x, w, ctx);
+    // Main flow (footnotes are numbered while laying it out); sections are laid out at their column width
+    const main: Box[] = [];
+    let cols = 1;
+    let gap = 36;
+    let pending: Block[] = [];
+    const flush = async (): Promise<void> => {
+      if (pending.length) main.push(...(await this.layout(pending, x, (w - (cols - 1) * gap) / cols, ctx)));
+      pending = [];
+    };
+    for (const b of doc.blocks.length ? doc.blocks : [{ type: 'paragraph', runs: [] } as Block]) {
+      if (b.type !== 'section') {
+        pending.push(b);
+        continue;
+      }
+      await flush();
+      gap = Math.max(0, Math.min(b.gap, w / 4));
+      // columns narrower than an inch are not useful
+      cols = Math.max(1, Math.min(Math.round(b.columns) || 1, Math.floor((w + gap) / (72 + gap))));
+      main.push({ height: 0, ops: [], spaceBefore: 0, spaceAfter: 0, section: { columns: cols, gap, separator: b.separator, start: b.start } });
+    }
+    await flush();
     // Footnote bodies
     const noteCtx = { ...ctx, size: Math.max(7, ctx.size * 0.8) };
     for (let i = 0; i < this.notes.length; i++) {
@@ -960,18 +983,136 @@ export class PdfWriter {
     return [...set].sort((a, b) => b - a).filter((y) => !box.ops.some((o) => o.k !== 'rect' && o.top < y - 0.01 && o.bottom > y + 0.01));
   }
 
+  private pendingBreak = false;
+
   place(boxes: Box[]): void {
     this.newPage();
+    for (let i = 0; i < boxes.length; ) {
+      const sec = boxes[i].section;
+      let j = sec ? i + 1 : i;
+      while (j < boxes.length && !boxes[j].section) j++;
+      const run = boxes.slice(sec ? i + 1 : i, j);
+      if (sec) {
+        if ((sec.start === 'page' || this.pendingBreak) && this.cursor > this.contentTop + 0.01) this.newPage();
+        this.pendingBreak = false;
+      }
+      // Word balances the columns of a section only when a continuous section follows it
+      if (sec && sec.columns > 1) this.placeColumns(run, sec, boxes[j]?.section?.start === 'continuous');
+      else this.placeFlow(run);
+      i = j;
+    }
+  }
+
+  /** Lay `boxes` out in the section's columns from the cursor on, page after page. */
+  private placeColumns(boxes: Box[], sec: Section, balance: boolean): void {
+    const n = sec.columns;
+    const colW = (this.contentW - (n - 1) * sec.gap) / n;
+    let state = { i: 0, from: 0 };
+    let guard = 0;
+    while (state.i < boxes.length && guard++ < 10_000) {
+      const top = this.cursor;
+      const avail = this.limit - top;
+      if (avail < 24 && top > this.contentTop + 0.01) {
+        this.newPage();
+        continue;
+      }
+      let h = avail;
+      if (balance && this.fillColumns(boxes, state, n, colW, sec.gap, top, avail, true).done) {
+        // the rest fits on this page: the smallest column height that still holds it
+        let lo = 0;
+        let hi = avail;
+        for (let k = 0; k < 20 && hi - lo > 0.5; k++) {
+          const mid = (lo + hi) / 2;
+          if (this.fillColumns(boxes, state, n, colW, sec.gap, top, mid, true).done) hi = mid;
+          else lo = mid;
+        }
+        h = hi + 0.01;
+      }
+      const r = this.fillColumns(boxes, state, n, colW, sec.gap, top, h, false);
+      const used = Math.max(0, ...r.heights);
+      if (sec.separator && r.heights.length > 1)
+        for (let k = 1; k < r.heights.length; k++) {
+          const lx = this.margins.left + k * (colW + sec.gap) - sec.gap / 2;
+          this.page.drawLine({ start: { x: lx, y: this.pageH - top }, end: { x: lx, y: this.pageH - (top + used) }, thickness: 0.5, color: rgb(0, 0, 0) });
+        }
+      state = r.state;
+      if (r.done) {
+        this.cursor = top + used;
+        return;
+      }
+      this.newPage();
+    }
+  }
+
+  /**
+   * Fill up to n columns of height h starting at y = top. In a dry run nothing is drawn and content
+   * that cannot be split to fit counts as not fitting.
+   */
+  private fillColumns(boxes: Box[], start: { i: number; from: number }, n: number, colW: number, gap: number, top: number, h: number, dry: boolean): { state: { i: number; from: number }; done: boolean; heights: number[] } {
+    let { i, from } = start;
+    const heights: number[] = [];
+    for (let col = 0; col < n; col++) {
+      const dx = col * (colW + gap);
+      let y = 0;
+      while (i < boxes.length) {
+        const box = boxes[i];
+        if (box.pageBreak) {
+          // a page break inside columns continues on the next page
+          i++;
+          from = 0;
+          heights.push(y);
+          return { state: { i, from }, done: i >= boxes.length, heights };
+        }
+        const sb = from === 0 && y > 0.01 ? box.spaceBefore : 0;
+        const rest = box.height - from;
+        const put = (to: number): void => {
+          if (!dry) {
+            this.draw(dx ? this.shift(box, dx, 0) : box.ops, top + y + sb, from, to);
+            this.addNotes(this.notesIn(box, from, to));
+          }
+          y += sb + (to - from);
+        };
+        if (y + sb + rest <= h + 0.01) {
+          put(box.height);
+          y += box.spaceAfter;
+          i++;
+          from = 0;
+          continue;
+        }
+        const cut = this.candidates(box, from, from + (h - y - sb)).find((c) => c > from + 0.01);
+        if (cut !== undefined) {
+          put(cut);
+          from = cut;
+        } else if (y <= 0.01) {
+          // nothing fits even at the top of a column: an atomic piece taller than the column
+          if (dry) return { state: { i, from }, done: false, heights };
+          const to = Math.min(box.height, from + Math.max(h - y, 1));
+          put(to > from + 0.01 ? to : box.height);
+          from = to > from + 0.01 ? to : box.height;
+          if (from >= box.height - 0.01) {
+            i++;
+            from = 0;
+          }
+        }
+        break;
+      }
+      heights.push(Math.min(y, Math.max(h, y)));
+      if (i >= boxes.length) return { state: { i, from }, done: true, heights };
+    }
+    return { state: { i, from }, done: false, heights };
+  }
+
+  /** Single-column flow from the cursor on. */
+  private placeFlow(boxes: Box[]): void {
     const contentH = this.contentBottom - this.contentTop;
-    let pendingBreak = false;
     for (let i = 0; i < boxes.length; i++) {
       const box = boxes[i];
       if (box.pageBreak) {
-        pendingBreak = true;
+        this.pendingBreak = true;
         continue;
       }
-      if (pendingBreak) {
-        pendingBreak = false;
+      if (this.pendingBreak) {
+        this.pendingBreak = false;
         if (this.cursor > this.contentTop) this.newPage();
       }
       const atTop = this.cursor <= this.contentTop + 0.01;

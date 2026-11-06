@@ -4,7 +4,7 @@
  * (default style → named styles → automatic styles) the way office suites do.
  */
 import { unzipSync } from 'fflate';
-import { familyOf, normalizeRuns, trimRuns, type Align, type Block, type CellValue, type Doc, type FontFamily, type ListItem, type PageSetup, type ParaFormat, type Sheet, type TableRow, type TextRun, type Workbook } from '../model';
+import { familyOf, normalizeRuns, normalizeSections, trimRuns, type Align, type Block, type CellValue, type Doc, type FontFamily, type ListItem, type PageSetup, type ParaFormat, type Sheet, type TableRow, type TextRun, type Workbook } from '../model';
 import { childrenNamed, elements, find, parseXml, textContent, type XNode } from '../xml';
 import { base64ToBytes, ConvertError, imageSize, sniffImageMime, unzipOffice } from '../util';
 
@@ -65,6 +65,8 @@ interface OdfStyle {
   listStyle?: string;
   pageLayout?: string;
   masterPage?: string;
+  /** Section columns (style:section-properties) */
+  columns?: { count: number; gap: number; sep: boolean };
 }
 
 interface ListLevel {
@@ -149,6 +151,14 @@ class OdfStyles {
           listStyle: el.attrs['style:list-style-name'],
           masterPage: el.attrs['style:master-page-name'] || undefined,
         };
+        const cols = find(find(el, 'style:section-properties'), 'style:columns');
+        const count = +(cols?.attrs['fo:column-count'] ?? 1);
+        if (count > 1) {
+          // fo:column-gap, or the spacing of the individual style:column elements
+          const listed = elements(cols).filter((c) => c.name === 'style:column');
+          const gap = odfLength(cols?.attrs['fo:column-gap']) ?? (listed.length > 1 ? (odfLength(listed[0].attrs['fo:end-indent']) ?? 0) + (odfLength(listed[1].attrs['fo:start-indent']) ?? 0) : 0);
+          st.columns = { count: Math.min(12, count), gap: gap || 18, sep: !!find(cols, 'style:column-sep') };
+        }
         this.paraProps(find(el, 'style:paragraph-properties'), st);
         if (el.name === 'style:default-style') this.defaults.set(st.family, st);
         else this.styles.set(st.name, st);
@@ -257,7 +267,7 @@ class OdtReader {
       if (find(content, 'office:spreadsheet')) throw new ConvertError('Это таблица OpenDocument (.ods), а не текстовый документ.');
       throw new ConvertError('В документе OpenDocument нет текста (office:text).');
     }
-    const blocks = this.blocks(body.children);
+    const blocks = normalizeSections(this.blocks(body.children));
     const doc: Doc = { blocks };
     if (this.docFont) doc.font = this.docFont;
     if (this.docSize) doc.size = this.docSize;
@@ -336,7 +346,18 @@ class OdtReader {
         case 'table:table':
           out.push(this.table(n));
           break;
-        case 'text:section':
+        case 'text:section': {
+          const cols = this.styles.styles.get(n.attrs['text:style-name'] ?? '')?.columns;
+          if (cols) {
+            // a page break before the section is written on its first paragraph
+            const firstP = elements(n).find((c) => c.name === 'text:p' || c.name === 'text:h');
+            const pageStart = !!firstP && !!this.styles.para(firstP.attrs['text:style-name'] ?? '').breakBefore;
+            out.push({ type: 'section', columns: cols.count, gap: cols.gap, ...(cols.sep ? { separator: true } : {}), start: pageStart && out.length ? 'page' : 'continuous' });
+            out.push(...this.blocks(n.children, listDepth, listStyle));
+            out.push({ type: 'section', columns: 1, gap: 36, start: 'continuous' });
+          } else out.push(...this.blocks(n.children, listDepth, listStyle));
+          break;
+        }
         case 'text:index-body':
         case 'text:table-of-content':
         case 'text:alphabetical-index':

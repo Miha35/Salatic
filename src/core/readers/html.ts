@@ -1,5 +1,5 @@
 import type { Align, Block, ChartSource, Doc, ListItem, ParaFormat, TableRow, TextRun } from '../model';
-import { familyOf, trimRuns } from '../model';
+import { familyOf, normalizeSections, trimRuns } from '../model';
 import { findTag, htmlText, parseHtml, parseStyle, type HNode } from '../html';
 import { imageSize, parseDataUri, sniffImageMime } from '../util';
 
@@ -475,6 +475,17 @@ function blockFrom(node: HNode, style: InlineStyle, ctx: Ctx, out: Block[], inhe
         break;
       }
       if (/\bfootnotes\b/.test(cls) || node.attrs.role === 'doc-endnotes') break; // bodies were attached to their references
+      // Multi-column content: our own sections (data-*) or CSS columns
+      const css = parseStyle(node.attrs.style);
+      const columns = Math.min(12, Math.max(0, Math.round(+(node.attrs['data-columns'] ?? '') || parseInt(css['column-count'] ?? '', 10) || 0)));
+      if (/\bdoc-section\b/.test(cls) || columns > 1) {
+        const gap = +(node.attrs['data-gap'] ?? '') || lengthPt(css['column-gap']) || 36;
+        const separator = 'data-separator' in node.attrs || /solid|dashed|dotted|double/.test(css['column-rule'] ?? '');
+        out.push({ type: 'section', columns: Math.max(1, columns), gap, ...(separator ? { separator: true } : {}), start: node.attrs['data-start'] === 'page' ? 'page' : 'continuous' });
+        out.push(...collectBlocks(node.children, st, ctx, align));
+        out.push({ type: 'section', columns: 1, gap: 36, start: 'continuous' });
+        break;
+      }
       out.push(...collectBlocks(node.children, st, ctx, align));
       break;
     }
@@ -513,7 +524,7 @@ export function htmlToDoc(html: string, opts: { resolveImage?: Ctx['resolveImage
   } finally {
     currentCtx = saved;
   }
-  const doc: Doc = { title: ctx.title, blocks };
+  const doc: Doc = { title: ctx.title, blocks: normalizeSections(blocks) };
   const family = base['font-family'] ? familyOf(base['font-family']) : undefined;
   if (family) doc.font = family;
   const size = lengthPt(base['font-size']);

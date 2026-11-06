@@ -6,7 +6,7 @@
  * lists, tables, fields (hyperlinks, page numbers), footnotes, headers/footers,
  * PNG/JPEG pictures and page breaks.
  */
-import { familyOf, normalizeRuns, trimRuns, type Align, type Block, type Doc, type FontFamily, type ParaFormat, type TableCell, type TableRow, type TextRun } from '../model';
+import { familyOf, normalizeRuns, normalizeSections, trimRuns, type Align, type Block, type Doc, type FontFamily, type ParaFormat, type TableCell, type TableRow, type TextRun } from '../model';
 import { ConvertError, imageSize } from '../util';
 import { ListNester } from './lists';
 
@@ -185,6 +185,9 @@ export class RtfReader {
   private skipChars = 0;
   private highSurrogate = 0;
   private pendingSect = false;
+  /** Properties of the section being defined (\sectd, \cols, \colsx, \linebetcol, \sbk…) */
+  private sect = { cols: 1, gap: 720, sep: false, page: true };
+  private bodyStarted = false;
   private imageCount = 0;
 
   constructor(bytes: Uint8Array) {
@@ -395,8 +398,11 @@ export class RtfReader {
     if (this.pendingSect) {
       this.pendingSect = false;
       this.endParagraph(g.sink, false);
-      this.pushBlock(g.sink, { type: 'pagebreak' });
+      this.pushBlock(g.sink, { type: 'section', columns: this.sect.cols, gap: this.sect.gap / 20, ...(this.sect.sep ? { separator: true } : {}), start: this.sect.page ? 'page' : 'continuous' });
+    } else if (!this.bodyStarted && g.sink.kind === 'body' && this.sect.cols > 1) {
+      this.pushBlock(g.sink, { type: 'section', columns: this.sect.cols, gap: this.sect.gap / 20, ...(this.sect.sep ? { separator: true } : {}), start: 'continuous' });
     }
+    if (g.sink.kind === 'body') this.bodyStarted = true;
     const style = this.runStyle(g.ch);
     const runs = g.sink.runs;
     const last = runs[runs.length - 1];
@@ -634,7 +640,24 @@ export class RtfReader {
         if (sink.kind === 'body') this.pendingSect = true;
         return;
       case 'sbknone':
-        this.pendingSect = false;
+        this.sect.page = false;
+        return;
+      case 'sbkpage':
+      case 'sbkodd':
+      case 'sbkeven':
+        this.sect.page = true;
+        return;
+      case 'sectd':
+        this.sect = { cols: 1, gap: 720, sep: false, page: true };
+        return;
+      case 'cols':
+        this.sect.cols = Math.max(1, Math.min(12, param ?? 1));
+        return;
+      case 'colsx':
+        this.sect.gap = Math.max(0, param ?? 720);
+        return;
+      case 'linebetcol':
+        this.sect.sep = true;
         return;
       case 'emdash':
         return this.emit('—');
@@ -1211,7 +1234,7 @@ export class RtfReader {
   // -- result ----------------------------------------------------------------------
 
   private buildDoc(): Doc {
-    const doc: Doc = { blocks: this.body.blocks };
+    const doc: Doc = { blocks: normalizeSections(this.body.blocks) };
     if (this.title) doc.title = this.title;
     if (this.header) doc.header = this.header;
     if (this.footer) doc.footer = this.footer;

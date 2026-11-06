@@ -10,6 +10,8 @@ import { parseSvg } from '../svg-render';
 import { metafileToEmf } from './emf';
 
 const FONTS: FontFamily[] = ['sans', 'serif', 'mono', 'calibri'];
+/** Sections only exist at the top level of the body. */
+const depthZero = (indent: number): boolean => indent === 0;
 const FONT_DEF: Record<FontFamily, string> = {
   sans: '{\\f0\\fswiss\\fcharset0\\fprq2 Arial;}',
   serif: '{\\f1\\froman\\fcharset0\\fprq2 Times New Roman;}',
@@ -299,16 +301,27 @@ class RtfWriter {
         case 'pagebreak':
           if (!ctx.cell && !ctx.note) s += '\\pard\\plain\\page\n';
           break;
+        case 'section':
+          // a new section with its own columns (only in the body)
+          if (!ctx.cell && !ctx.note && depthZero(indent)) s += `\\sect\\sectd${this.sectionProps(b)}\n`;
+          break;
       }
     }
     return s;
   }
 
+  private sectionProps(b: Extract<Block, { type: 'section' }>): string {
+    const n = Math.max(1, Math.round(b.columns));
+    return `${b.start === 'page' ? '\\sbkpage' : '\\sbknone'}\\pgwsxn${this.pageW}\\pghsxn${this.pageH}${n > 1 ? `\\cols${n}\\colsx${Math.round(b.gap * 20)}${b.separator ? '\\linebetcol' : ''}` : ''}`;
+  }
+
   build(): Uint8Array {
     const doc = this.doc;
     const blocks = [...doc.blocks];
-    while (blocks.length && blocks[blocks.length - 1].type === 'pagebreak') blocks.pop();
+    while (blocks.length && (blocks[blocks.length - 1].type === 'pagebreak' || blocks[blocks.length - 1].type === 'section')) blocks.pop();
     while (blocks.length && blocks[0].type === 'pagebreak') blocks.shift();
+    // a leading section sets the first section's columns
+    const lead = blocks[0]?.type === 'section' ? (blocks.shift() as Extract<Block, { type: 'section' }>) : undefined;
     const body = this.blocks(blocks, 0, this.contentW);
     const header = doc.header?.length ? `{\\header ${this.blocks(doc.header, 0, this.contentW)}}` : '';
     const footer = doc.footer?.length ? `{\\footer ${this.blocks(doc.footer, 0, this.contentW)}}` : '';
@@ -326,7 +339,7 @@ class RtfWriter {
       `{\\rtf1\\ansi\\ansicpg1252\\deff${f}\\uc1\\deflang1049\n` +
       `{\\fonttbl${FONTS.map((x) => FONT_DEF[x]).join('')}}\n${colors}\n${stylesheet}\n${lists}\n${info}\n` +
       `\\paperw${this.pageW}\\paperh${this.pageH}\\margl${m.left}\\margr${m.right}\\margt${m.top}\\margb${m.bottom}${this.pageW > this.pageH ? '\\landscape' : ''}\\viewkind4\n` +
-      `\\sectd\\pgwsxn${this.pageW}\\pghsxn${this.pageH}\\headery709\\footery709${header}${footer}\n${body}}`;
+      `\\sectd\\pgwsxn${this.pageW}\\pghsxn${this.pageH}${lead ? this.sectionProps(lead).replace(/\\sbk\w+/, '') : ''}\\headery709\\footery709${header}${footer}\n${body}}`;
     // RTF is 7-bit: every non-ASCII character was escaped above
     const out = new Uint8Array(rtf.length);
     for (let i = 0; i < rtf.length; i++) out[i] = rtf.charCodeAt(i) & 0x7f;

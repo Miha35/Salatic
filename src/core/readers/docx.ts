@@ -1,7 +1,7 @@
 /** DOCX (WordprocessingML) → Doc. */
 import { unzipSync } from 'fflate';
 import type { Align, Block, Doc, FontFamily, ListItem, PageSetup, ParaFormat, TableCell, TableRow, TextRun } from '../model';
-import { familyOf, normalizeRuns, trimRuns } from '../model';
+import { familyOf, normalizeRuns, normalizeSections, trimRuns } from '../model';
 import { child, childrenNamed, elements, find, findAll, findBy, parseXml, rootElement, textContent, type XNode } from '../xml';
 import { ConvertError, imageSize, sniffImageMime, unzipOffice } from '../util';
 import { chartToSvg } from '../chart';
@@ -636,11 +636,37 @@ class DocxReader {
     const doc = this.xml(this.mainPath)!;
     const body = find(doc, 'w:body');
     if (!body) throw new ConvertError('Документ Word не содержит тела (w:body).');
-    const blocks = this.body(elements(body));
+    // Sections: a paragraph carrying a sectPr ends a section; the body's last sectPr ends the final one
+    const finalSect = childrenNamed(body, 'w:sectPr').pop();
+    const groups: { nodes: XNode[]; sect?: XNode }[] = [];
+    let cur: XNode[] = [];
+    for (const n of elements(body)) {
+      if (n.name === 'w:sectPr') continue;
+      cur.push(n);
+      const sp = n.name === 'w:p' ? child(child(n, 'w:pPr'), 'w:sectPr') : undefined;
+      if (sp) {
+        groups.push({ nodes: cur, sect: sp });
+        cur = [];
+      }
+    }
+    groups.push({ nodes: cur, sect: finalSect });
+    const blocks: Block[] = [];
+    groups.forEach((g, i) => {
+      const cols = child(g.sect, 'w:cols');
+      const listed = childrenNamed(cols, 'w:col');
+      const columns = Math.max(1, Math.min(12, listed.length || +(cols?.attrs['w:num'] ?? 1) || 1));
+      const gapTw = listed.length > 1 ? listed.slice(0, -1).reduce((sum, c) => sum + (+(c.attrs['w:space'] ?? 0) || 0), 0) / (listed.length - 1) : +(cols?.attrs['w:space'] ?? 720);
+      const type = child(g.sect, 'w:type')?.attrs['w:val'] ?? 'nextPage';
+      const inner = this.body(g.nodes);
+      if (!inner.length && !g.sect) return;
+      if (i > 0 || columns > 1)
+        blocks.push({ type: 'section', columns, gap: (Number.isFinite(gapTw) ? gapTw : 720) / 20, ...(['1', 'true', 'on'].includes(cols?.attrs['w:sep'] ?? '') ? { separator: true } : {}), start: i > 0 && type !== 'continuous' && type !== 'nextColumn' ? 'page' : 'continuous' });
+      blocks.push(...inner);
+    });
     let title: string | undefined;
     const core = this.xml('docProps/core.xml');
     if (core) title = textContent(find(core, 'dc:title')).trim() || undefined;
-    const result: Doc = { title, blocks, font: this.defFont, size: this.defSize, defaults: this.defPara };
+    const result: Doc = { title, blocks: normalizeSections(blocks), font: this.defFont, size: this.defSize, defaults: this.defPara };
     const sect = childrenNamed(body, 'w:sectPr').pop() ?? findAll(body, 'w:sectPr').pop();
     if (sect) {
       const pg = child(sect, 'w:pgSz');

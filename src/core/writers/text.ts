@@ -306,8 +306,21 @@ function blocksHtml(blocks: Block[], notes: Notes, ctx: HtmlCtx = HTML): string 
   const br = ctx.xhtml ? '<br/>' : '<br>';
   const hr = ctx.xhtml ? '<hr/>' : '<hr>';
   let s = '';
+  let sectionOpen = false;
   for (const b of blocks) {
     switch (b.type) {
+      case 'section': {
+        // a section with columns (or starting a page) wraps the blocks up to the next section
+        if (sectionOpen) s += '</div>\n';
+        sectionOpen = false;
+        const n = Math.max(1, Math.round(b.columns));
+        if (n > 1 || b.start === 'page') {
+          const css = n > 1 ? ` style="column-count:${n};column-gap:${num(b.gap)}pt${b.separator ? ';column-rule:0.5pt solid currentColor' : ''}"` : '';
+          s += `<div class="doc-section" data-columns="${n}" data-gap="${num(b.gap)}" data-start="${b.start}"${b.separator ? ' data-separator="1"' : ''}${css}>\n`;
+          sectionOpen = true;
+        }
+        break;
+      }
       case 'paragraph':
         s += `<p${paraStyle(b)}>${htmlRuns(b.runs, notes, ctx) || br}</p>\n`;
         break;
@@ -359,6 +372,7 @@ function blocksHtml(blocks: Block[], notes: Notes, ctx: HtmlCtx = HTML): string 
         break;
     }
   }
+  if (sectionOpen) s += '</div>\n';
   return s;
 }
 

@@ -399,9 +399,24 @@ class DocxWriter {
   build(): Uint8Array {
     const doc = this.doc;
     const blocks = [...doc.blocks];
-    while (blocks.length && blocks[blocks.length - 1].type === 'pagebreak') blocks.pop();
-    let body = this.blocks(blocks, 0, this.contentW);
-    if (!body || body.endsWith('</w:tbl>')) body += '<w:p/>';
+    while (blocks.length && (blocks[blocks.length - 1].type === 'pagebreak' || blocks[blocks.length - 1].type === 'section')) blocks.pop();
+    // Sections: content between section markers, laid out at the width of one column
+    type Sect = { columns: number; gap: number; separator?: boolean; start: 'continuous' | 'page'; xml: string };
+    const sections: Sect[] = [];
+    let curSect: Omit<Sect, 'xml'> = { columns: 1, gap: 36, start: 'continuous' };
+    let pending: Block[] = [];
+    const flushSect = (): void => {
+      const colTw = Math.round((this.contentW - (curSect.columns - 1) * tw(curSect.gap)) / curSect.columns);
+      sections.push({ ...curSect, xml: this.blocks(pending, 0, curSect.columns > 1 ? Math.max(720, colTw) : this.contentW) });
+      pending = [];
+    };
+    for (const b of blocks) {
+      if (b.type === 'section') {
+        if (pending.length || sections.length) flushSect();
+        curSect = { columns: Math.max(1, Math.round(b.columns)), gap: b.gap, separator: b.separator, start: b.start };
+      } else pending.push(b);
+    }
+    flushSect();
     const files: Zippable = {};
     const overrides: string[] = [];
     const docRels = [
@@ -449,10 +464,32 @@ class DocxWriter {
       overrides.push('<Override PartName="/word/theme/theme1.xml" ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/>');
     }
     const m = this.margins;
-    const document =
-      `${XML_HEAD}<w:document ${NS_ALL}><w:body>${body}<w:sectPr>${refs}` +
+    // Every section repeats page setup and header/footer references (Word does not inherit them backwards)
+    const sectPr = (x: Omit<Sect, 'xml'>): string =>
+      `<w:sectPr>${refs}${x.start === 'continuous' ? '<w:type w:val="continuous"/>' : ''}` +
       `<w:pgSz w:w="${this.pageW}" w:h="${this.pageH}"${this.pageW > this.pageH ? ' w:orient="landscape"' : ''}/>` +
-      `<w:pgMar w:top="${m.top}" w:right="${m.right}" w:bottom="${m.bottom}" w:left="${m.left}" w:header="709" w:footer="709" w:gutter="0"/><w:cols w:space="708"/></w:sectPr></w:body></w:document>`;
+      `<w:pgMar w:top="${m.top}" w:right="${m.right}" w:bottom="${m.bottom}" w:left="${m.left}" w:header="709" w:footer="709" w:gutter="0"/>` +
+      (x.columns > 1 ? `<w:cols w:num="${x.columns}" w:space="${tw(x.gap)}"${x.separator ? ' w:sep="1"' : ''}/>` : '<w:cols w:space="708"/>') +
+      '</w:sectPr>';
+    let body = '';
+    sections.forEach((sec, i) => {
+      let xml = sec.xml;
+      if (i === sections.length - 1) {
+        if (!xml || xml.endsWith('</w:tbl>')) xml += '<w:p/>';
+        body += xml;
+        return;
+      }
+      // the section ends with the sectPr in the properties of its last paragraph
+      const end = xml.endsWith('</w:p>') ? Math.max(xml.lastIndexOf('<w:p>'), xml.lastIndexOf('<w:p ')) : -1;
+      if (end < 0) xml += `<w:p><w:pPr>${sectPr(sec)}</w:pPr></w:p>`;
+      else {
+        const para = xml.slice(end);
+        const fixed = para.startsWith('<w:p><w:pPr>') ? para.replace('</w:pPr>', `${sectPr(sec)}</w:pPr>`) : para.replace(/^<w:p( [^>]*)?>/, (t) => `${t}<w:pPr>${sectPr(sec)}</w:pPr>`);
+        xml = xml.slice(0, end) + fixed;
+      }
+      body += xml;
+    });
+    const document = `${XML_HEAD}<w:document ${NS_ALL}><w:body>${body}${sectPr(sections[sections.length - 1])}</w:body></w:document>`;
     const now = new Date().toISOString().replace(/\.\d+Z$/, 'Z');
     Object.assign(files, {
       '[Content_Types].xml': utf8(contentTypes(overrides)),

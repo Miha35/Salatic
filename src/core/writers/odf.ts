@@ -403,9 +403,36 @@ class OdtWriter {
   build(): Uint8Array {
     const doc = this.doc;
     const blocks = [...doc.blocks];
-    while (blocks.length && blocks[blocks.length - 1].type === 'pagebreak') blocks.pop();
+    while (blocks.length && (blocks[blocks.length - 1].type === 'pagebreak' || blocks[blocks.length - 1].type === 'section')) blocks.pop();
     while (blocks.length && blocks[0].type === 'pagebreak') blocks.shift();
-    let body = this.blocks(blocks, 0, this.contentW);
+    // Sections with columns become text:section elements with a column style
+    type Sect = Extract<Block, { type: 'section' }>;
+    const groups: { sec?: Sect; blocks: Block[] }[] = [{ blocks: [] }];
+    for (const b of blocks) {
+      if (b.type === 'section') groups.push({ sec: b, blocks: [] });
+      else groups[groups.length - 1].blocks.push(b);
+    }
+    let body = '';
+    groups.forEach((g, k) => {
+      if (!g.blocks.length) return;
+      if (g.sec?.start === 'page' && body) this.pendingBreak = true;
+      const n = Math.max(1, Math.round(g.sec?.columns ?? 1));
+      if (n < 2) {
+        body += this.blocks(g.blocks, 0, this.contentW);
+        return;
+      }
+      const gap = g.sec!.gap;
+      // like Word: balanced only when a continuous section follows
+      const balance = groups[k + 1]?.sec?.start === 'continuous';
+      const style = this.auto.get(
+        'section',
+        'Sect',
+        `<style:section-properties text:dont-balance-text-columns="${balance ? 'false' : 'true'}" style:editable="false"><style:columns fo:column-count="${n}" fo:column-gap="${Math.round(gap * 100) / 100}pt">` +
+          (g.sec!.separator ? '<style:column-sep style:width="0.5pt" style:color="#000000" style:height="100%" style:vertical-align="top"/>' : '') +
+          '</style:columns></style:section-properties>',
+      );
+      body += `<text:section text:style-name="${style}" text:name="Section${k}">${this.blocks(g.blocks, 0, (this.contentW - (n - 1) * gap) / n)}</text:section>`;
+    });
     if (!body) body = '<text:p text:style-name="Standard"/>';
     const contentAuto = this.auto.toString();
     // Header/footer automatic styles belong to styles.xml

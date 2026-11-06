@@ -28,6 +28,23 @@ export interface Gradient {
   matrix?: [number, number, number, number, number, number];
 }
 
+/**
+ * Tidy section markers: consecutive markers merge (the last one's columns, a page start wins),
+ * a marker at the very end is dropped, and so is a leading one that changes nothing.
+ */
+export function normalizeSections(blocks: Block[]): Block[] {
+  const out: Block[] = [];
+  for (const b of blocks) {
+    const prev = out[out.length - 1];
+    if (b.type === 'section' && prev?.type === 'section') out[out.length - 1] = { ...b, start: prev.start === 'page' || b.start === 'page' ? 'page' : 'continuous' };
+    else out.push(b);
+  }
+  while (out.length && out[out.length - 1].type === 'section') out.pop();
+  const first = out[0];
+  if (first?.type === 'section' && first.columns <= 1) out.shift();
+  return out;
+}
+
 /** One colour standing in for a gradient where it cannot be drawn (stops weighted by the span they cover). */
 export function gradientAverage(g: Gradient): string {
   const s = g.stops;
@@ -120,7 +137,13 @@ export type Block =
   | { type: 'code'; text: string }
   | { type: 'quote'; blocks: Block[] }
   | { type: 'hr' }
-  | { type: 'pagebreak' };
+  | { type: 'pagebreak' }
+  /**
+   * Starts a section: the blocks that follow (up to the next section) flow in `columns` columns
+   * `gap` points apart. `start: 'page'` begins it on a new page; 'continuous' on the same page
+   * (the columns of the section before are then balanced).
+   */
+  | { type: 'section'; columns: number; gap: number; separator?: boolean; start: 'continuous' | 'page' };
 
 export interface Doc {
   title?: string;
