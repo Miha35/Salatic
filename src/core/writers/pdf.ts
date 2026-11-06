@@ -14,7 +14,8 @@
 import { clip, clipEvenOdd, closePath, concatTransformationMatrix, lineTo, moveTo, degrees, drawSvgPath, endPath, PDFDict, PDFDocument, PDFName, PDFNumber, PDFOperator, PDFOperatorNames, PDFString, popGraphicsState, pushGraphicsState, rectangle, rgb, setGraphicsState, type PDFContext, type PDFImage, type PDFObject, type PDFPage, type PDFRef } from 'pdf-lib';
 import { parseMetafile, type Metafile } from '../metafile';
 import { parseSvg } from '../svg-render';
-import type { Align, Block, Doc, FontFamily, Gradient, ParaFormat, TextRun } from '../model';
+import type { Align, Block, Doc, FontFamily, Gradient, ParaFormat, PatternFill, TextRun } from '../model';
+import { PATTERNS } from '../drawingml';
 import { FontManager, styleOf, type FontKey, type FontLoader } from '../pdf-fonts';
 import type { Subsetter } from '../hb-subset';
 import { cleanText, maxOf } from '../util';
@@ -206,6 +207,59 @@ export class PdfWriter {
       popGraphicsState(),
     );
   }
+  private patterns = new Map<string, PDFRef>();
+
+  /**
+   * Fill SVG path `d` (at x, y, y down) with a two-colour preset pattern: a PDF tiling pattern whose
+   * 8×8 cell (6 pt, the size Office draws) holds the bitmap. The cell is anchored to the page.
+   */
+  protected fillPattern(page: PDFPage, d: string, p: PatternFill, x: number, y: number, opacity = 1, evenOdd = false): void {
+    const ctx = this.pdf.context;
+    const key = `${p.preset}|${p.fg}|${p.bg}|${p.bgClear ? 1 : 0}`;
+    let ref = this.patterns.get(key);
+    if (!ref) {
+      const rgb = (hex: string): string => [0, 2, 4].map((o) => Math.round(((parseInt(hex.slice(o, o + 2), 16) || 0) / 255) * 1000) / 1000).join(' ');
+      const bits = PATTERNS[p.preset] ?? PATTERNS.pct50;
+      let body = p.bgClear ? '' : `${rgb(p.bg)} rg 0 0 8 8 re f `;
+      body += `${rgb(p.fg)} rg`;
+      bits.forEach((row, r) => {
+        // runs of set bits on the row; row 0 is the top of the cell (pattern space is y up)
+        for (let c = 0; c < 8; ) {
+          if (!((row << c) & 0x80)) {
+            c++;
+            continue;
+          }
+          let e = c;
+          while (e < 8 && (row << e) & 0x80) e++;
+          body += ` ${c} ${7 - r} ${e - c} 1 re`;
+          c = e;
+        }
+      });
+      body += ' f';
+      ref = ctx.register(ctx.stream(body, { Type: 'Pattern', PatternType: 1, PaintType: 1, TilingType: 1, BBox: [0, 0, 8, 8], XStep: 8, YStep: 8, Resources: {}, Matrix: [0.75, 0, 0, 0.75, 0, 0] }));
+      this.patterns.set(key, ref);
+    }
+    const res = page.node.normalizedEntries().Resources;
+    let dict = res.lookupMaybe(PDFName.of('Pattern'), PDFDict);
+    if (!dict) {
+      dict = ctx.obj({});
+      res.set(PDFName.of('Pattern'), dict);
+    }
+    const name = PDFName.of(`Pt${dict.keys().length + 1}`);
+    dict.set(name, ref);
+    const gs = opacity < 0.999 ? page.node.newExtGState('GS', ctx.obj({ Type: 'ExtGState', ca: Math.round(opacity * 1000) / 1000 }) as PDFDict) : undefined;
+    const body = drawSvgPath(d, { x, y, scale: undefined, color: undefined, borderColor: undefined, borderWidth: 0 }).slice(1, -2);
+    page.pushOperators(
+      pushGraphicsState(),
+      ...(gs ? [setGraphicsState(gs)] : []),
+      PDFOperator.of(PDFOperatorNames.NonStrokingColorspace, [PDFName.of('Pattern')]),
+      PDFOperator.of(PDFOperatorNames.NonStrokingColorN, [name]),
+      ...body,
+      PDFOperator.of(evenOdd ? PDFOperatorNames.FillEvenOdd : PDFOperatorNames.FillNonZero),
+      popGraphicsState(),
+    );
+  }
+
   protected fm: FontManager;
   protected images = new Map<Uint8Array, PDFImage | null>();
   warnings = new Set<string>();

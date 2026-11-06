@@ -11,8 +11,8 @@ import type { Deck, Slide, SlideBullet, SlideElement, SlideLine, SlidePara, Slid
 import { child, childrenNamed, elements, find, parseXml, textContent, type XNode } from '../xml';
 import { ConvertError, sniffImageMime, unzipOffice } from '../util';
 import { chartToSvg } from '../chart';
-import { colorOf, gradientOf, hexToRgb, rgbToHex, type Theme } from '../drawingml';
-import { gradientAverage, type Gradient } from '../model';
+import { colorOf, gradientOf, hexToRgb, patternAverage, patternOf, rgbToHex, type Theme } from '../drawingml';
+import { gradientAverage, type Gradient, type PatternFill } from '../model';
 
 const decoder = new TextDecoder('utf-8');
 const EMU = 12700; // EMU per point
@@ -212,6 +212,11 @@ class PptxReader {
         const g = gradientOf(grad, this.width, this.height, this.theme, map);
         return g ? { color: gradientAverage(g), gradient: g } : undefined;
       }
+      const patt = child(pr, 'a:pattFill');
+      if (patt) {
+        const pt = patternOf(patt, this.theme, map);
+        return { color: patternAverage(pt), pattern: pt };
+      }
       const blip = child(pr, 'a:blipFill');
       if (blip) {
         const img = this.blip(p, find(blip, 'a:blip'));
@@ -374,10 +379,10 @@ class PptxReader {
       return;
     }
     if (!fill && !line && !text) return;
-    out.push({ kind: 'shape', ...geo, geom, rot: xf.rot || undefined, fill: fill?.hex, fillOpacity: fill && fill.alpha < 1 ? fill.alpha : undefined, ...(fill?.grad ? { gradient: fill.grad } : {}), line, text, role });
+    out.push({ kind: 'shape', ...geo, geom, rot: xf.rot || undefined, fill: fill?.hex, fillOpacity: fill && fill.alpha < 1 ? fill.alpha : undefined, ...(fill?.grad ? { gradient: fill.grad } : {}), ...(fill?.pattern ? { pattern: fill.pattern } : {}), line, text, role });
   }
 
-  private fill(spPr: XNode | undefined, style: XNode | undefined, ctx: ShapeCtx, w = 0, h = 0): { hex: string; alpha: number; grad?: Gradient } | undefined {
+  private fill(spPr: XNode | undefined, style: XNode | undefined, ctx: ShapeCtx, w = 0, h = 0): { hex: string; alpha: number; grad?: Gradient; pattern?: PatternFill } | undefined {
     if (child(spPr, 'a:noFill')) return undefined;
     const solid = child(spPr, 'a:solidFill');
     if (solid) return colorOf(solid, this.theme, ctx.map);
@@ -390,7 +395,12 @@ class PptxReader {
     };
     const grad = child(spPr, 'a:gradFill');
     if (grad) return fromGrad(grad);
-    if (child(spPr, 'a:blipFill') || child(spPr, 'a:pattFill') || child(spPr, 'a:grpFill')) return undefined;
+    const patt = child(spPr, 'a:pattFill');
+    if (patt) {
+      const pt = patternOf(patt, this.theme, ctx.map);
+      return { hex: patternAverage(pt), alpha: 1, pattern: pt };
+    }
+    if (child(spPr, 'a:blipFill') || child(spPr, 'a:grpFill')) return undefined;
     const ref = find(style, 'a:fillRef');
     const idx = +(ref?.attrs.idx ?? 0);
     if (ref && idx > 0) {
@@ -489,9 +499,14 @@ class PptxReader {
     childrenNamed(tbl, 'a:tr').forEach((tr, ri) => {
       const cells: SlideTableCell[] = [];
       const header = firstRow && ri === 0;
+      let colIndex = 0;
       for (const tc of childrenNamed(tr, 'a:tc')) {
         const tcPr = child(tc, 'a:tcPr');
-        let fill = this.fill(tcPr, undefined, ctx)?.hex;
+        const span = +(tc.attrs.gridSpan ?? 1) || 1;
+        const box: [number, number] = [cols.slice(colIndex, colIndex + span).reduce((a, b) => a + b, 0) || 72, pt(tr.attrs.h) || 20];
+        colIndex += span;
+        const filled = this.fill(tcPr, undefined, ctx, box[0], box[1]);
+        let fill = filled?.hex;
         // Default "Medium Style 2 – Accent 1" look when the cell has no fill of its own
         if (!fill && styled && !child(tcPr, 'a:noFill')) fill = header ? accent : bandRow && (ri - (firstRow ? 1 : 0)) % 2 === 0 ? light(0.2) : light(0.1);
         const text = this.text(child(tc, 'a:txBody'), [], 'tbl', ctx, header ? 'FFFFFF' : undefined) ?? emptyText();
@@ -507,6 +522,8 @@ class PptxReader {
         cells.push({
           text,
           fill,
+          ...(filled?.grad ? { gradient: filled.grad, box } : {}),
+          ...(filled?.pattern ? { pattern: filled.pattern } : {}),
           span: +(tc.attrs.gridSpan ?? 1) || 1,
           rowSpan: +(tc.attrs.rowSpan ?? 1) || 1,
           merged: tc.attrs.hMerge === '1' || tc.attrs.vMerge === '1',

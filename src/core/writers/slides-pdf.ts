@@ -50,7 +50,9 @@ export class SlidePdfWriter extends PdfWriter {
       const H = deck.height;
       cmds.push((page) => page.drawRectangle({ x: 0, y: 0, width: W, height: H, color: rgb(1, 1, 1) }));
       const bgGrad = slide.background?.gradient;
+      const bgPatt = slide.background?.pattern;
       if (bgGrad) cmds.push((page) => this.fillGradient(page, `M0 0 H${W} V${H} H0 Z`, bgGrad, 0, H));
+      else if (bgPatt) cmds.push((page) => this.fillPattern(page, `M0 0 H${W} V${H} H0 Z`, bgPatt, 0, H));
       else if (slide.background?.color) {
         const c = hexColor(slide.background.color);
         cmds.push((page) => page.drawRectangle({ x: 0, y: 0, width: W, height: H, color: rgb(...c) }));
@@ -210,8 +212,16 @@ export class SlidePdfWriter extends PdfWriter {
         if (fill || e.line) {
           const path = this.path(e.geom, e.w, e.h);
           const grad = e.gradient;
+          const patt = e.pattern;
           cmds.push((page) =>
             this.rotated(page, e, e.rot, () => {
+              if (patt) {
+                const round = e.geom === 'ellipse' || e.geom === 'flowChartConnector' || e.geom === 'donut';
+                const d = round ? ellipsePath(e.w, e.h) : (path ?? `M0 0 H${e.w} V${e.h} H0 Z`);
+                this.fillPattern(page, d, patt, e.x, H - e.y, e.fillOpacity ?? 1);
+                if (e.line) page.drawSvgPath(d, { x: e.x, y: H - e.y, ...border });
+                return;
+              }
               if (grad) {
                 // the shading fills the outline; the border is stroked on top
                 const round = e.geom === 'ellipse' || e.geom === 'flowChartConnector' || e.geom === 'donut';
@@ -282,7 +292,10 @@ export class SlidePdfWriter extends PdfWriter {
         const fill = cell.fill ? hexColor(cell.fill) : undefined;
         const b = cell.borders;
         cmds.push((page) => {
-          if (fill) page.drawRectangle({ x, y: H - top - h, width: w, height: h, color: rgb(...fill) });
+          const rect = `M0 0 H${w} V${h} H0 Z`;
+          if (cell.pattern) this.fillPattern(page, rect, cell.pattern, x, H - top);
+          else if (cell.gradient && cell.box) this.fillGradient(page, rect, { ...cell.gradient, matrix: [w / cell.box[0], 0, 0, h / cell.box[1], 0, 0] }, x, H - top);
+          else if (fill) page.drawRectangle({ x, y: H - top - h, width: w, height: h, color: rgb(...fill) });
           const edge = (ln: SlideLine | undefined, x1: number, y1: number, x2: number, y2: number): void => {
             if (ln) page.drawLine({ start: { x: x1, y: H - y1 }, end: { x: x2, y: H - y2 }, thickness: ln.width, color: rgb(...hexColor(ln.color)) });
           };

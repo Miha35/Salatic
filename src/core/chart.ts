@@ -202,9 +202,9 @@ function parseChart(xml: XNode, theme: Theme): { title?: string; titleSize: numb
     if (!sp) return undefined;
     const holder = kind === 'fill' ? sp : kid(sp, 'ln');
     if (!holder || kid(holder, 'noFill')) return undefined;
-    const solid = kid(holder, 'solidFill') ?? kid(holder, 'gradFill');
+    const solid = kid(holder, 'solidFill') ?? kid(holder, 'gradFill') ?? kid(holder, 'pattFill');
     if (!solid) return undefined;
-    const target = local(solid.name) === 'gradFill' ? deep(solid, 'gs') : solid;
+    const target = local(solid.name) === 'gradFill' ? deep(solid, 'gs') : local(solid.name) === 'pattFill' ? kid(solid, 'fgClr') : solid;
     return colorOf(target, theme, map)?.hex;
   };
   const groups: Group[] = [];

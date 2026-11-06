@@ -12,7 +12,8 @@ import type { MetaCmd } from '../../src/core/metafile';
 import type { SlideElement } from '../../src/core/slides';
 import { env, hasCmd, loadFonts, soffice, withTemp } from './helpers';
 import { PDFDocument, PDFRawStream } from 'pdf-lib';
-import { GRADIENT_SLIDE, makePptx, RECT_GRADIENT_SLIDE } from './pptx-fixture';
+import { GRADIENT_SLIDE, makePptx, PATTERN_SLIDE, RECT_GRADIENT_SLIDE } from './pptx-fixture';
+import { PATTERNS } from '../../src/core/drawingml';
 
 /** Rasterise one page at 72 dpi (1 px = 1 pt) and return an RGB sampler. */
 function pixels(pdf: Uint8Array, page: number): (x: number, y: number) => [number, number, number] {
@@ -160,6 +161,36 @@ describe.skipIf(!hasCmd('pdftoppm'))('gradients in PDF', () => {
     // shape 2 at (380,150): the focus rectangle 60..120 × 30..60 is white throughout
     for (const [x, y] of [[445, 185], [495, 205]]) expect(near(at(x, y), hex('FFFFFF'), 8), `${x},${y}`).toBe(true);
     expect(near(at(678, 295), hex('1F4E79'), 14)).toBe(true);
+  });
+
+  it('pattern fills: the preset bitmaps as tiling patterns, transparent backgrounds let content through', async () => {
+    const pptx = makePptx(undefined, PATTERN_SLIDE);
+    const shapes = pptxToDeck(pptx).deck.slides[4].elements.filter((e): e is Extract<SlideElement, { kind: 'shape' }> => e.kind === 'shape' && !!e.pattern);
+    expect(shapes.map((e) => e.pattern!.preset)).toEqual(['ltDnDiag', 'dkHorz', 'smCheck', 'cross', 'pct50']);
+    expect(shapes[4].pattern!.bgClear).toBe(true);
+    const pdf = (await convert(pptx, 'pptx', 'pdf', env)).data;
+    expect(await pdfObjects(pdf)).toMatch(/\/PatternType 1/);
+    // at 96 dpi one pattern pixel (0.75 pt) is one device pixel: count the foreground share
+    const buf = withTemp((dir) => {
+      writeFileSync(join(dir, 'in.pdf'), pdf);
+      execFileSync('pdftoppm', ['-r', '96', '-f', '4', '-l', '4', join(dir, 'in.pdf'), join(dir, 'p')]);
+      return readFileSync(join(dir, readdirSync(dir).find((n) => n.endsWith('.ppm'))!));
+    });
+    const head = /^P6\s+(\d+)\s+(\d+)\s+255\s/.exec(new TextDecoder('latin1').decode(buf.subarray(0, 30)))!;
+    const w = +head[1];
+    const px = (x: number, y: number): number[] => [...buf.subarray(head[0].length + (y * w + x) * 3, head[0].length + (y * w + x) * 3 + 3)];
+    const share = (x0: number, y0: number, test: (p: number[]) => boolean): number => {
+      let n = 0;
+      // 64 × 64 device pixels = 8 × 8 cells
+      for (let y = 0; y < 64; y++) for (let x = 0; x < 64; x++) if (test(px(Math.round(x0 * (96 / 72)) + x, Math.round(y0 * (96 / 72)) + y))) n++;
+      return n / 4096;
+    };
+    const red = (p: number[]): boolean => p[0] > 150 && p[1] < 80 && p[2] < 80;
+    const expected = (prst: string): number => PATTERNS[prst].reduce((n, row) => n + row.toString(2).split('1').length - 1, 0) / 64;
+    ['ltDnDiag', 'dkHorz', 'smCheck', 'cross'].forEach((prst, i) => expect(share(50 + i * 165, 160, red), prst).toBeCloseTo(expected(prst), 1));
+    // transparent background: blue dots on the yellow box underneath, never white
+    expect(share(300, 360, (p) => p.every((v) => v > 235))).toBe(0);
+    expect(share(300, 360, (p) => p[2] > p[0])).toBeCloseTo(0.5, 1);
   });
 
   const SVG =

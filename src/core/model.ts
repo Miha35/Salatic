@@ -48,6 +48,14 @@ export function normalizeSections(blocks: Block[]): Block[] {
   return out;
 }
 
+/** A two-colour preset pattern (DrawingML a:pattFill); `bgClear`: the background is transparent. */
+export interface PatternFill {
+  preset: string;
+  fg: string;
+  bg: string;
+  bgClear?: boolean;
+}
+
 /** One colour standing in for a gradient where it cannot be drawn (stops weighted by the span they cover). */
 export function gradientAverage(g: Gradient): string {
   const s = g.stops;

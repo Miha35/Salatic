@@ -259,3 +259,20 @@ export const RECT_GRADIENT_SLIDE: ExtraSlide = {
     )
     .join(''),
 };
+
+/** Pattern fills: several presets, a transparent background over a coloured box, a patterned slide background. */
+export const PATTERN_SLIDE: ExtraSlide = {
+  title: 'Узоры',
+  bg: '<p:bg><p:bgPr><a:pattFill prst="pct5"><a:fgClr><a:srgbClr val="A0A0A0"/></a:fgClr><a:bgClr><a:srgbClr val="FFFFFF"/></a:bgClr></a:pattFill><a:effectLst/></p:bgPr></p:bg>',
+  shapes:
+    ['ltDnDiag', 'dkHorz', 'smCheck', 'cross']
+      .map(
+        (prst, i) =>
+          `<p:sp><p:nvSpPr><p:cNvPr id="${30 + i}" name="p${i}"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="${E(40 + i * 165)}" y="${E(150)}"/><a:ext cx="${E(150)}" cy="${E(120)}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom>` +
+          `<a:pattFill prst="${prst}"><a:fgClr><a:srgbClr val="C00000"/></a:fgClr><a:bgClr><a:srgbClr val="FFFFFF"/></a:bgClr></a:pattFill><a:ln><a:noFill/></a:ln></p:spPr></p:sp>`,
+      )
+      .join('') +
+    `<p:sp><p:nvSpPr><p:cNvPr id="40" name="under"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="${E(40)}" y="${E(320)}"/><a:ext cx="${E(640)}" cy="${E(150)}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:solidFill><a:srgbClr val="FFC000"/></a:solidFill><a:ln><a:noFill/></a:ln></p:spPr></p:sp>` +
+    `<p:sp><p:nvSpPr><p:cNvPr id="41" name="over"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="${E(40)}" y="${E(320)}"/><a:ext cx="${E(640)}" cy="${E(150)}"/></a:xfrm><a:prstGeom prst="ellipse"><a:avLst/></a:prstGeom>` +
+    '<a:pattFill prst="pct50"><a:fgClr><a:srgbClr val="1F4E79"/></a:fgClr><a:bgClr><a:srgbClr val="FFFFFF"><a:alpha val="0"/></a:srgbClr></a:bgClr></a:pattFill><a:ln><a:noFill/></a:ln></p:spPr></p:sp>',
+};

@@ -3,7 +3,7 @@
  * the PPTX reader; rendered page-for-page to PDF, or flattened to a Doc for the
  * text formats. All lengths are in points, colours are hex RRGGBB.
  */
-import type { Align, Block, ChartSource, Gradient, TextRun } from './model';
+import type { Align, Block, ChartSource, Gradient, PatternFill, TextRun } from './model';
 
 export interface SlideBullet {
   /** Literal bullet character, or the formatted number for auto-numbered lists. */
@@ -64,6 +64,8 @@ export type SlideElement =
       fillOpacity?: number;
       /** Gradient fill in the shape's local space (0…w, 0…h, y down); `fill` is its average colour. */
       gradient?: Gradient;
+      /** Preset pattern fill; `fill` is its average colour. */
+      pattern?: PatternFill;
       line?: SlideLine;
       text?: SlideText;
       role: SlideRole;
@@ -75,6 +77,10 @@ export type SlideElement =
 export interface SlideTableCell {
   text: SlideText;
   fill?: string;
+  /** Gradient for a cell of `box` size (scaled to the laid-out cell); `fill` is its average. */
+  gradient?: Gradient;
+  box?: [number, number];
+  pattern?: PatternFill;
   span: number;
   rowSpan: number;
   /** Covered by a span of another cell. */
@@ -88,7 +94,7 @@ export interface SlideTableRow {
 }
 
 export interface Slide {
-  background?: { color?: string; gradient?: Gradient; image?: { data: Uint8Array; mime: string } };
+  background?: { color?: string; gradient?: Gradient; pattern?: PatternFill; image?: { data: Uint8Array; mime: string } };
   elements: SlideElement[];
   notes?: Block[];
   hidden?: boolean;
