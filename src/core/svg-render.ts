@@ -4,7 +4,9 @@
  * static subset documents use: shapes, paths (incl. arcs), transforms, groups,
  * <use>, presentation attributes, inline styles and simple class/type CSS rules,
  * text with tspans, embedded PNG/JPEG images, linear and radial gradient fills (drawn as PDF
- * shadings; writers without gradients use the average colour). Filters, masks and clip paths are ignored.
+ * shadings; writers without gradients use the average colour), clip paths, pattern fills (the shape
+ * clipped, the tiles drawn in it) and masks (as a clip: light shapes shown, dark ones cut out).
+ * Filters are ignored (the element is drawn without its effect).
  */
 import { familyOf, gradientAverage, type FontFamily, type Gradient, type GradientStop } from './model';
 import type { ClipPath, Metafile, MetaCmd } from './metafile';
@@ -277,6 +279,23 @@ interface Style {
   display: boolean;
   /** id of the gradient painting the fill (url(#id)) */
   fillGrad?: string;
+  /** id of the pattern painting the fill */
+  fillPattern?: string;
+}
+
+/** A frame far outside any drawing; with even-odd filling, frame + shape = everything but the shape. */
+const FAR = 'M-100000 -100000 L100000 -100000 L100000 100000 L-100000 100000 Z';
+
+/** Relative luminance (0–1) of a hex colour, as a mask uses it. */
+function luminance(hex: string): number {
+  const c = [0, 2, 4].map((o) => parseInt(hex.slice(o, o + 2), 16) / 255);
+  return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+}
+
+function invert(m: M): M | null {
+  const det = m[0] * m[3] - m[1] * m[2];
+  if (Math.abs(det) < 1e-12) return null;
+  return [m[3] / det, -m[1] / det, -m[2] / det, m[0] / det, (m[2] * m[5] - m[3] * m[4]) / det, (m[1] * m[4] - m[0] * m[5]) / det];
 }
 
 const len = (v: string | undefined, ref = 0): number | undefined => {
@@ -359,13 +378,16 @@ class SvgRenderer {
       if (v === undefined) return undefined;
       if (v === 'currentColor') return cssColor(props.color) ?? current;
       const url = /url\(\s*#([^)\s]+)\s*\)/.exec(v);
-      if (url) return this.gradientColor(url[1]) ?? null;
+      if (url) return this.isPattern(url[1]) ? this.patternColor(url[1]) : (this.gradientColor(url[1]) ?? null);
       return cssColor(v);
     };
     const f = paint(props.fill, parent.fill);
     if (f !== undefined) {
       s.fill = f;
-      s.fillGrad = /url\(\s*#([^)\s]+)\s*\)/.exec(props.fill ?? '')?.[1];
+      const id = /url\(\s*#([^)\s]+)\s*\)/.exec(props.fill ?? '')?.[1];
+      const pattern = !!id && this.isPattern(id);
+      s.fillGrad = pattern ? undefined : id;
+      s.fillPattern = pattern ? id : undefined;
     }
     const st = paint(props.stroke, parent.stroke);
     if (st !== undefined) s.stroke = st;
@@ -402,7 +424,8 @@ class SvgRenderer {
 
   private paint(d: string, s: Style, m: M): void {
     if (this.capture) {
-      if (d) this.capture.push(d);
+      // clip paths use the geometry; masks also how light the fill is
+      if (d && s.display) this.capture.push({ d, lum: s.fill ? luminance(s.fill) * s.opacity * s.fillOpacity : 0, evenOdd: s.evenOdd });
       return;
     }
     if (!d || !s.display) return;
@@ -410,9 +433,112 @@ class SvgRenderer {
     const stroke = s.stroke && s.strokeWidth > 0 ? s.stroke : undefined;
     if (!fill && !stroke) return;
     const k = scaleOf(m);
+    if (fill && s.fillPattern && this.patternFill(d, s)) {
+      if (!stroke) return;
+      fill = undefined; // the outline over the tiles
+    }
     const grad = fill && s.fillGrad ? this.gradient(s.fillGrad, this.lastBox, m) : undefined;
     if (grad) fill = gradientAverage(grad);
     this.cmds.push({ k: 'path', d, fill, evenOdd: s.evenOdd, stroke, width: s.strokeWidth * k, dash: s.dash?.map((x) => x * k), opacity: s.opacity * s.fillOpacity, strokeOpacity: s.opacity * s.strokeOpacity, ...(grad ? { grad } : {}) });
+  }
+
+  private isPattern(id: string): boolean {
+    const n = this.ids.get(id);
+    return !!n && local(n.name) === 'pattern';
+  }
+
+  /** A pattern and the patterns it inherits from (href), nearest first. */
+  private patternChain(id: string): XNode[] {
+    const chain: XNode[] = [];
+    for (let g = this.ids.get(id); g && local(g.name) === 'pattern' && chain.length < 8 && !chain.includes(g); ) {
+      chain.push(g);
+      const href = (g.attrs.href ?? g.attrs['xlink:href'] ?? '').replace(/^#/, '');
+      g = href ? this.ids.get(href) : undefined;
+    }
+    return chain;
+  }
+
+  /** The colour standing in for a pattern (writers that only know colours): its first filled shape. */
+  private patternColor(id: string): string | null {
+    const holder = this.patternChain(id).find((n) => elements(n).length);
+    const find = (n: XNode): string | null | undefined => {
+      const f = cssColor(declarations(n.attrs.style ?? '').fill ?? n.attrs.fill);
+      if (f) return f;
+      for (const c of elements(n)) {
+        const v = find(c);
+        if (v) return v;
+      }
+      return undefined;
+    };
+    return holder ? (find(holder) ?? '808080') : null;
+  }
+
+  private patternDepth = 0;
+
+  /**
+   * Fill `d` (output space) with the tiles of a pattern: the shape becomes the clip, each tile is drawn
+   * (clipped to its cell) where it meets the shape's box. False when it cannot be drawn this way.
+   */
+  private patternFill(d: string, s: Style): boolean {
+    const chain = this.patternChain(s.fillPattern!);
+    if (!chain.length || this.patternDepth >= 2) return false;
+    const attr = (k: string): string | undefined => chain.find((n) => n.attrs[k] !== undefined)?.attrs[k];
+    const holder = chain.find((n) => elements(n).length);
+    if (!holder) return true; // an empty pattern paints nothing
+    const [bx0, by0, bx1, by1] = this.lastBox;
+    const bw = bx1 - bx0;
+    const bh = by1 - by0;
+    const bboxUnits = attr('patternUnits') !== 'userSpaceOnUse';
+    const val = (k: string, ref: number): number => {
+      const v = attr(k);
+      if (v === undefined) return 0;
+      if (bboxUnits) return (v.trim().endsWith('%') ? parseFloat(v) / 100 : parseFloat(v) || 0) * ref;
+      return len(v, ref) ?? 0;
+    };
+    const px = (bboxUnits ? bx0 : 0) + val('x', bboxUnits ? bw : this.rootW);
+    const py = (bboxUnits ? by0 : 0) + val('y', bboxUnits ? bh : this.rootH);
+    const pw = val('width', bboxUnits ? bw : this.rootW);
+    const ph = val('height', bboxUnits ? bh : this.rootH);
+    if (!(pw > 0 && ph > 0)) return true; // a tile of no size paints nothing
+    // contents of a tile: its viewBox fitted in (xMidYMid meet), or the shape's box, or user units
+    let content: M = IDENT;
+    const vb = (attr('viewBox') ?? '').trim().split(/[\s,]+/).map(Number);
+    if (vb.length === 4 && vb.every((v) => Number.isFinite(v)) && vb[2] > 0 && vb[3] > 0) {
+      const k = Math.min(pw / vb[2], ph / vb[3]);
+      content = [k, 0, 0, k, -vb[0] * k + (pw - vb[2] * k) / 2, -vb[1] * k + (ph - vb[3] * k) / 2];
+    } else if (attr('patternContentUnits') === 'objectBoundingBox') content = [bw, 0, 0, bh, 0, 0];
+    const pt = parseTransform(attr('patternTransform'));
+    const inv = invert(pt);
+    if (!inv) return true;
+    // the tiles covering the shape's box (in pattern space)
+    const corners = [apply(inv, bx0, by0), apply(inv, bx1, by0), apply(inv, bx1, by1), apply(inv, bx0, by1)];
+    const i0 = Math.floor((Math.min(...corners.map((c) => c[0])) - px) / pw);
+    const i1 = Math.ceil((Math.max(...corners.map((c) => c[0])) - px) / pw);
+    const j0 = Math.floor((Math.min(...corners.map((c) => c[1])) - py) / ph);
+    const j1 = Math.ceil((Math.max(...corners.map((c) => c[1])) - py) / ph);
+    const tiles = (i1 - i0) * (j1 - j0);
+    if (!(tiles > 0) || tiles > 4000) return false;
+    const m = this.userToOut;
+    const prev = this.clip;
+    const shape: ClipPath = { d, evenOdd: s.evenOdd };
+    this.patternDepth++;
+    try {
+      for (let j = j0; j < j1; j++)
+        for (let i = i0; i < i1; i++) {
+          const tile = mul(m, mul(pt, [1, 0, 0, 1, px + i * pw, py + j * ph]));
+          // overflow is hidden: each tile is clipped to its cell
+          const cell = [apply(tile, 0, 0), apply(tile, pw, 0), apply(tile, pw, ph), apply(tile, 0, ph)].map(([x, y]) => `${Math.round(x * 100) / 100} ${Math.round(y * 100) / 100}`);
+          this.clip = [...prev, shape, { d: `M${cell[0]} L${cell[1]} L${cell[2]} L${cell[3]} Z`, evenOdd: false }];
+          this.cmds.push({ k: 'clip', paths: this.clip });
+          const cm = mul(tile, content);
+          for (const c of elements(holder)) this.walk(c, this.base, cm, this.rootW, this.rootH);
+        }
+    } finally {
+      this.patternDepth--;
+      this.clip = prev;
+      this.cmds.push({ k: 'clip', paths: prev });
+    }
+    return true;
   }
 
   /** Bounding box (user space) of the last path passed through pathD — the objectBoundingBox of gradients. */
@@ -466,7 +592,13 @@ class SvgRenderer {
     return { kind: tag === 'linearGradient' ? 'linear' : 'radial', stops, coords, matrix: mul(m, g) };
   }
 
+  /** The matrix of the last path passed through pathD (its user space → output). */
+  private userToOut: M = IDENT;
+  /** The initial style (patterns and masks do not inherit from the element they paint). */
+  base!: Style;
+
   private pathD(segs: ReturnType<typeof parsePath>, m: M): string {
+    this.userToOut = m;
     const f = (n: number): string => (Math.round(n * 100) / 100).toString();
     let d = '';
     const box: [number, number, number, number] = [Infinity, Infinity, -Infinity, -Infinity];
@@ -495,16 +627,45 @@ class SvgRenderer {
     return d.trim();
   }
 
-  /** Current clip (intersection of paths in output space) and, while reading a clipPath, its captured geometry. */
+  /** Current clip (intersection of paths in output space) and, while reading a clipPath or mask, its shapes. */
   private clip: ClipPath[] = [];
-  private capture: string[] | null = null;
+  private capture: { d: string; lum: number; evenOdd: boolean }[] | null = null;
 
+  /** The element with its mask applied (as a clip), then its clip path. */
   walk(n: XNode, parent: Style, m: M, viewW: number, viewH: number): void {
+    const ref = this.capture ? undefined : /url\(\s*#([^)\s]+)\s*\)/.exec(n.attrs.mask ?? declarations(n.attrs.style ?? '')['mask'] ?? '')?.[1];
+    const mk = ref ? this.ids.get(ref) : undefined;
+    if (!mk || local(mk.name) !== 'mask' || mk.attrs.maskContentUnits === 'objectBoundingBox') return this.walkClipped(n, parent, m, viewW, viewH);
+    const captured: { d: string; lum: number; evenOdd: boolean }[] = [];
+    this.capture = captured;
+    const mm = mul(m, parseTransform(n.attrs.transform));
+    try {
+      for (const c of elements(mk)) this.walkInner(c, this.base, mm, viewW, viewH);
+    } finally {
+      this.capture = null;
+    }
+    // light shapes show the element, dark ones painted over them cut it out (grey: the nearer of the two)
+    const first = captured.findIndex((c) => c.lum >= 0.5);
+    if (first < 0) return; // a dark (or empty) mask hides the element
+    const shown = captured.filter((c) => c.lum >= 0.5);
+    const holes = captured.slice(first).filter((c) => c.lum < 0.5);
+    const prev = this.clip;
+    this.clip = [...prev, { d: shown.map((c) => c.d).join(' '), evenOdd: shown.length === 1 && shown[0].evenOdd }, ...holes.map((c) => ({ d: `${FAR} ${c.d}`, evenOdd: true }))];
+    this.cmds.push({ k: 'clip', paths: this.clip });
+    try {
+      this.walkClipped(n, parent, m, viewW, viewH);
+    } finally {
+      this.clip = prev;
+      this.cmds.push({ k: 'clip', paths: prev });
+    }
+  }
+
+  private walkClipped(n: XNode, parent: Style, m: M, viewW: number, viewH: number): void {
     const ref = this.capture ? undefined : /url\(\s*#([^)\s]+)\s*\)/.exec(n.attrs['clip-path'] ?? declarations(n.attrs.style ?? '')['clip-path'] ?? '')?.[1];
     const cp = ref ? this.ids.get(ref) : undefined;
     if (!cp || local(cp.name) !== 'clipPath' || cp.attrs.clipPathUnits === 'objectBoundingBox') return this.walkInner(n, parent, m, viewW, viewH);
     // the clipPath's shapes, in the user space of the element (its transform included)
-    const captured: string[] = [];
+    const captured: { d: string; lum: number; evenOdd: boolean }[] = [];
     this.capture = captured;
     const mm = mul(mul(m, parseTransform(n.attrs.transform)), parseTransform(cp.attrs.transform));
     try {
@@ -515,7 +676,7 @@ class SvgRenderer {
     if (!captured.length) return; // an empty clip hides the element
     const prev = this.clip;
     const rule = declarations(cp.attrs.style ?? '')['clip-rule'] ?? elements(cp)[0]?.attrs['clip-rule'];
-    this.clip = [...prev, { d: captured.join(' '), evenOdd: rule === 'evenodd' }];
+    this.clip = [...prev, { d: captured.map((c) => c.d).join(' '), evenOdd: rule === 'evenodd' }];
     this.cmds.push({ k: 'clip', paths: this.clip });
     try {
       this.walkInner(n, parent, m, viewW, viewH);
@@ -711,6 +872,7 @@ export function parseSvg(data: Uint8Array | string): Metafile | null {
   r.rootW = vw;
   r.rootH = vh;
   const base: Style = { fill: '000000', fillOpacity: 1, stroke: null, strokeOpacity: 1, strokeWidth: 1, opacity: 1, evenOdd: false, fontSize: 16, fontFamily: 'sans-serif', fontWeight: '400', fontStyle: 'normal', anchor: 'start', display: true };
+  r.base = base;
   // viewBox → output units (uniform scale, centred: preserveAspectRatio xMidYMid meet)
   const k = Math.min(outW / vw, outH / vh);
   const m: M = [k, 0, 0, k, -vx * k + (outW - vw * k) / 2, -vy * k + (outH - vh * k) / 2];
