@@ -12,7 +12,16 @@ import type { MetaCmd } from '../../src/core/metafile';
 import { barChart, pieChart, sampleCharts, SAMPLE_CATS } from './chart-fixture';
 import { makePptx } from './pptx-fixture';
 import { sample } from './sample';
-import { env, hasCmd, pdfToText, renderPages, soffice } from './helpers';
+import { docToHtmlFragment } from '../../src/core/writers/text';
+import { htmlToDoc } from '../../src/core/readers/html';
+import { env, hasCmd, pdfToText, renderPages, soffice, withTemp } from './helpers';
+import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { metafileToEmf } from '../../src/core/writers/emf';
+import { parseEmf, type Metafile } from '../../src/core/metafile';
+import { decodePng, encodePng } from '../../src/core/png';
+import { sniffImageMime } from '../../src/core/util';
 
 const norm = (s: string): string => s.replace(/\s+/g, ' ');
 const texts = (svg: string): string[] => [...svg.matchAll(/<text[^>]*>([^<]*)<\/text>/g)].map((m) => norm(m[1]));
@@ -216,5 +225,212 @@ describe('charts in Office documents', () => {
     let dark = 0;
     for (const v of px) if (v < 200) dark++;
     expect(dark / px.length).toBeGreaterThan(0.03);
+  });
+});
+
+const SVG_PICTURE =
+  '<svg xmlns="http://www.w3.org/2000/svg" width="300" height="150" viewBox="0 0 300 150">' +
+  '<rect x="5" y="5" width="290" height="140" rx="12" fill="#E8F0FE" stroke="#1A73E8" stroke-width="3"/>' +
+  '<circle cx="60" cy="75" r="40" fill="#34A853" fill-opacity="0.6"/>' +
+  '<text x="120" y="70" font-family="Arial" font-size="22" font-weight="bold" fill="#202124">Схема</text>' +
+  '<text x="120" y="105" font-family="Arial" font-size="16" fill="#5F6368">вектор <tspan fill="#EA4335">SVG</tspan></text>' +
+  '</svg>';
+
+describe('EMF writer', () => {
+  it('round-trips a chart through EMF and our EMF reader', () => {
+    for (const [k, xml] of Object.entries(sampleCharts())) {
+      const mf = parseSvg(chartToSvg(xml, { width: 432, height: 252 })!)!;
+      const emf = metafileToEmf(mf);
+      expect(sniffImageMime(emf), k).toBe('image/emf');
+      const back = parseEmf(emf);
+      expect(back.widthPt, k).toBeCloseTo(432, 0);
+      expect(back.heightPt, k).toBeCloseTo(252, 0);
+      const kinds = (m: Metafile): number[] => ['path', 'text'].map((t) => m.cmds.filter((c) => c.k === t).length);
+      expect(kinds(back), k).toEqual(kinds(mf));
+      const txt = (m: Metafile): Extract<MetaCmd, { k: 'text' }>[] => m.cmds.filter((c): c is Extract<MetaCmd, { k: 'text' }> => c.k === 'text');
+      const [a, b] = [txt(back), txt(mf)];
+      expect(a.map((c) => c.text), k).toEqual(b.map((c) => c.text));
+      // positions survive within the 1/16-unit EMF grid
+      a.forEach((c, i) => expect(Math.hypot(c.x - b[i].x, c.y - b[i].y), `${k}: ${c.text}`).toBeLessThan(0.1));
+    }
+  });
+
+  it('keeps tspan runs flowing, colours, bold and opacity (blended with white)', () => {
+    const back = parseEmf(metafileToEmf(parseSvg(SVG_PICTURE)!));
+    const texts = back.cmds.filter((c): c is Extract<MetaCmd, { k: 'text' }> => c.k === 'text');
+    expect(texts.map((t) => [t.text.trim(), t.bold, t.color, !!t.flow])).toEqual([
+      ['Схема', true, '202124', false],
+      ['вектор', false, '5F6368', false],
+      ['SVG', false, 'EA4335', true],
+    ]);
+    const circle = back.cmds.filter((c): c is Extract<MetaCmd, { k: 'path' }> => c.k === 'path')[1];
+    // #34A853 at 60 % over white
+    expect(circle.fill).toBe('85CB98');
+  });
+
+  it('embeds raster images as bitmaps', () => {
+    const px = new Uint8Array([255, 0, 0, 255, 0, 0, 255, 128]);
+    const mf: Metafile = { width: 20, height: 10, widthPt: 15, heightPt: 7.5, cmds: [{ k: 'image', x: 0, y: 0, w: 20, h: 10, png: encodePng(px, 2, 1, 4) }] };
+    const back = parseEmf(metafileToEmf(mf));
+    const img = back.cmds.find((c) => c.k === 'image');
+    expect(img).toMatchObject({ x: 0, y: 0, w: 20, h: 10 });
+    const dec = decodePng((img as Extract<MetaCmd, { k: 'image' }>).png)!;
+    expect([...dec.rgba.subarray(0, 3)]).toEqual([255, 0, 0]);
+    // the half-transparent blue pixel is blended with white
+    expect([...dec.rgba.subarray(4, 7)]).toEqual([127, 127, 255]);
+  });
+
+  it.skipIf(!hasCmd('soffice') || !hasCmd('pdftotext'))('LibreOffice draws the EMF with its text', () => {
+    const emf = metafileToEmf(parseSvg(chartToSvg(sampleCharts().combo, { width: 432, height: 252 })!)!);
+    const t = norm(pdfToText(soffice(emf, 'emf', 'pdf')));
+    for (const s of ['Выручка и маржа', '1 500 000', '30%', 'Апр']) expect(t).toContain(s);
+  });
+});
+
+describe('PNG decoder', () => {
+  it('round-trips our encoder for gray, RGB and RGBA', () => {
+    const w = 7;
+    const h = 5;
+    for (const ch of [1, 3, 4] as const) {
+      const px = Uint8Array.from({ length: w * h * ch }, (_, i) => (i * 37 + ch) & 0xff);
+      const d = decodePng(encodePng(px, w, h, ch))!;
+      expect(d.width).toBe(w);
+      for (let i = 0; i < w * h; i++) {
+        const want = ch === 1 ? [px[i], px[i], px[i], 255] : ch === 3 ? [px[i * 3], px[i * 3 + 1], px[i * 3 + 2], 255] : [...px.subarray(i * 4, i * 4 + 4)];
+        expect([...d.rgba.subarray(i * 4, i * 4 + 4)]).toEqual(want);
+      }
+    }
+    expect(decodePng(new Uint8Array([1, 2, 3]))).toBeNull();
+  });
+
+  it.skipIf(!hasCmd('python3'))('decodes palette, 16-bit, low bit depth and interlaced PNGs made by Pillow', () => {
+    const script = [
+      'import sys',
+      'from PIL import Image',
+      'd = sys.argv[1]',
+      'im = Image.new("RGBA", (13, 9))',
+      'for y in range(9):',
+      '    for x in range(13):',
+      '        im.putpixel((x, y), ((x * 19) % 256, (y * 28) % 256, ((x + y) * 11) % 256, 255 if (x + y) % 3 else 0))',
+      'im.save(d + "/rgba_interlaced.png", interlace=1)',
+      'im.convert("RGB").quantize(16).save(d + "/palette.png")',
+      'g = im.convert("L")',
+      'g.save(d + "/gray.png")',
+      'g.convert("1").save(d + "/mono.png")',
+      'g16 = Image.new("I;16", g.size)',
+      'g16.putdata([v * 257 for v in g.getdata()])',
+      'g16.save(d + "/gray16.png")',
+      'im.convert("RGB").save(d + "/ref.ppm")',
+      'im.convert("RGB").quantize(16).convert("RGB").save(d + "/pal.ppm")',
+      'g.save(d + "/gray.pgm")',
+      'g.convert("1").convert("L").save(d + "/mono.pgm")',
+    ].join('\n');
+    withTemp((dir) => {
+      try {
+        execFileSync('python3', ['-I', '-c', script, dir], { stdio: 'ignore' });
+      } catch {
+        return; // Pillow not installed
+      }
+      const ppm = (name: string): Uint8Array => {
+        const b = readFileSync(join(dir, name));
+        // P5/P6 header: magic, width, height, maxval, then one whitespace byte
+        let fields = 0;
+        let i = 0;
+        while (fields < 4) {
+          while (/\s/.test(String.fromCharCode(b[i]))) i++;
+          while (!/\s/.test(String.fromCharCode(b[i]))) i++;
+          fields++;
+        }
+        return new Uint8Array(b.subarray(i + 1));
+      };
+      const rgb = (p: Uint8Array): number[] => [...p].filter((_, i) => i % 4 !== 3);
+      const gray = (p: Uint8Array): number[] => [...p].filter((_, i) => i % 4 === 0);
+      const png = (name: string) => decodePng(new Uint8Array(readFileSync(join(dir, name))))!;
+      const inter = png('rgba_interlaced.png');
+      expect(rgb(inter.rgba)).toEqual([...ppm('ref.ppm')]);
+      expect([...inter.rgba].filter((_, i) => i % 4 === 3).slice(0, 4)).toEqual([0, 255, 255, 0]);
+      expect(rgb(png('palette.png').rgba)).toEqual([...ppm('pal.ppm')]);
+      expect(gray(png('gray.png').rgba)).toEqual([...ppm('gray.pgm')]);
+      expect(gray(png('mono.png').rgba)).toEqual([...ppm('mono.pgm')]);
+      // 16-bit samples keep their high byte
+      expect(gray(png('gray16.png').rgba)).toEqual([...ppm('gray.pgm')]);
+    });
+  });
+});
+
+describe('charts and SVG in written documents', () => {
+  const chartXml = sampleCharts().bar;
+  const files = (zip: Uint8Array): Record<string, string> => Object.fromEntries(Object.entries(unzipSync(zip)).map(([k, v]) => [k, new TextDecoder().decode(v)]));
+
+  it('DOCX → DOCX keeps a native chart part, without the embedded-workbook link, and the theme colours', () => {
+    const withLink = chartXml.replace('</c:chartSpace>', '<c:externalData r:id="rId1"><c:autoUpdate val="0"/></c:externalData></c:chartSpace>');
+    const src = docxWithChart(withLink);
+    const { doc } = docxToDoc(src);
+    const out = docToDocx(doc).data;
+    const f = files(out);
+    expect(f['word/charts/chart1.xml']).toContain('<c:barChart>');
+    expect(f['word/charts/chart1.xml']).not.toContain('externalData');
+    expect(f['[Content_Types].xml']).toContain('/word/charts/chart1.xml');
+    expect(f['word/_rels/document.xml.rels']).toMatch(/relationships\/chart" Target="charts\/chart1\.xml"/);
+    expect(f['word/document.xml']).toContain('<c:chart xmlns:c=');
+    expect(f['word/theme/theme1.xml']).toContain('<a:accent1><a:srgbClr val="4472C4"/>');
+    // and reads back as the same chart
+    const again = docxToDoc(out).doc.blocks.find((b): b is Extract<Block, { type: 'image' }> => b.type === 'image' && !!b.chart);
+    expect(again?.chart?.xml).toContain('<c:barChart>');
+    expect(again?.mime).toBe('image/svg+xml');
+  });
+
+  it('the document editor round trip (DOCX → HTML → DOCX) keeps the native chart', () => {
+    const { doc } = docxToDoc(docxWithChart(chartXml));
+    const html = docToHtmlFragment(doc, { sources: true });
+    expect(html).toContain('data-chart=');
+    expect(docToHtmlFragment(doc)).not.toContain('data-chart=');
+    // the browser serialises the edited DOM; the worker reads it back
+    const edited = htmlToDoc(html.replace('</p>', ' (правка)</p>'));
+    const img = edited.blocks.find((b): b is Extract<Block, { type: 'image' }> => b.type === 'image' && !!b.chart);
+    expect(img?.chart?.xml).toBe(chartXml);
+    const original = doc.blocks.find((b): b is Extract<Block, { type: 'image' }> => b.type === 'image' && !!b.chart)!;
+    expect(img?.chart?.colors).toEqual(original.chart!.colors);
+    expect(files(docToDocx(edited).data)['word/charts/chart1.xml']).toContain('<c:barChart>');
+    // forged attributes are ignored
+    const forged = htmlToDoc(html.replace(/data-chart="[^"]*"/, 'data-chart="{&quot;xml&quot;:&quot;&lt;html/&gt;&quot;}"'));
+    expect(forged.blocks.some((b) => b.type === 'image' && b.chart)).toBe(false);
+  });
+
+  it('PPTX → DOCX turns slide charts into Word charts with the deck theme', async () => {
+    const out = (await convert(makePptx(chartXml), 'pptx', 'docx', env)).data;
+    const f = files(out);
+    expect(Object.keys(f).filter((k) => k.startsWith('word/charts/'))).toEqual(['word/charts/chart1.xml']);
+    expect(f['word/theme/theme1.xml']).toMatch(/<a:accent1><a:srgbClr val="[0-9A-F]{6}"\/>/);
+  });
+
+  it('a chart that references other parts falls back to a vector picture', () => {
+    const xml = chartXml.replace('</c:chartSpace>', '<c:userShapes r:id="rId9"/><c:printSettings><c:legacyDrawingHF r:id="rId3"/></c:printSettings></c:chartSpace>');
+    const doc = { blocks: [{ type: 'image' as const, data: new TextEncoder().encode(chartToSvg(xml, { width: 300, height: 200 })!), mime: 'image/svg+xml', width: 400, height: 267, chart: { xml } }] };
+    const f = files(docToDocx(doc).data);
+    expect(Object.keys(f).some((k) => k.startsWith('word/charts/'))).toBe(false);
+    expect(Object.keys(f)).toEqual(expect.arrayContaining(['word/media/image1.emf', 'word/media/image1.svg']));
+  });
+
+  it('SVG pictures go to DOCX as EMF with an SVG extension, and read back as SVG', () => {
+    const doc = { blocks: [{ type: 'paragraph' as const, runs: [{ text: 'До рисунка' }] }, { type: 'image' as const, data: new TextEncoder().encode(SVG_PICTURE), mime: 'image/svg+xml', width: 300, height: 150, alt: 'Схема' }] };
+    const out = docToDocx(doc).data;
+    const f = files(out);
+    expect(f['word/document.xml']).toMatch(/<a:blip r:embed="rId\d+"><a:extLst><a:ext uri="\{96DAC541-7B7A-43D3-8B79-37D633B846F1\}"><asvg:svgBlip [^>]*r:embed="rId\d+"\/>/);
+    expect(f['[Content_Types].xml']).toContain('Extension="svg"');
+    const img = docxToDoc(out).doc.blocks.find((b) => b.type === 'image');
+    expect(img).toMatchObject({ mime: 'image/svg+xml', width: 300, height: 150, alt: 'Схема' });
+  });
+
+  it.skipIf(!hasCmd('soffice') || !hasCmd('pdftotext'))('LibreOffice shows charts and SVG pictures from our DOCX and RTF', async () => {
+    const chartDocx = docToDocx(docxToDoc(docxWithChart(chartXml)).doc).data;
+    let t = norm(pdfToText(soffice(chartDocx, 'docx', 'pdf')));
+    for (const s of ['Продажи', 'План', 'Факт', 'Прогноз', 'Янв', 'Апр', '190']) expect(t, 'docx chart').toContain(s);
+    const doc = { blocks: [{ type: 'paragraph' as const, runs: [{ text: 'До рисунка' }] }, { type: 'image' as const, data: new TextEncoder().encode(SVG_PICTURE), mime: 'image/svg+xml', width: 300, height: 150 }] };
+    t = norm(pdfToText(soffice(docToDocx(doc).data, 'docx', 'pdf')));
+    for (const s of ['До рисунка', 'Схема', 'вектор', 'SVG']) expect(t, 'docx svg').toContain(s);
+    const rtf = (await convert(docxWithChart(chartXml), 'docx', 'rtf', env)).data;
+    t = norm(pdfToText(soffice(rtf, 'rtf', 'pdf')));
+    for (const s of ['Продажи', 'Прогноз', 'Апр', '190']) expect(t, 'rtf chart').toContain(s);
   });
 });

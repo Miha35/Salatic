@@ -1,7 +1,9 @@
 /** Doc → DOCX (Office Open XML). Element order follows the ECMA-376 schema so Word opens files without repair. */
 import { zipSync, type Zippable } from 'fflate';
-import type { Block, Doc, FontFamily, ParaFormat, TableCell, TextRun } from '../model';
+import type { Block, ChartSource, Doc, FontFamily, ParaFormat, TableCell, TextRun } from '../model';
 import { escapeXml, maxOf, utf8 } from '../util';
+import { parseSvg } from '../svg-render';
+import { metafileToEmf } from './emf';
 
 export interface DocxOptions {
   pageSize?: 'auto' | 'a4' | 'letter';
@@ -14,6 +16,39 @@ const REL = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships
 const XML_HEAD = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n';
 const EMU_PER_PX = 9525;
 const IMAGE_EXT: Record<string, string> = { 'image/png': 'png', 'image/jpeg': 'jpeg', 'image/gif': 'gif', 'image/bmp': 'bmp', 'image/emf': 'emf', 'image/wmf': 'wmf' };
+const CHART_CT = 'application/vnd.openxmlformats-officedocument.drawingml.chart+xml';
+const OFFICE_COLORS: Record<string, string> = { dk1: '000000', lt1: 'FFFFFF', dk2: '44546A', lt2: 'E7E6E6', accent1: '4472C4', accent2: 'ED7D31', accent3: 'A5A5A5', accent4: 'FFC000', accent5: '5B9BD5', accent6: '70AD47', hlink: '0563C1', folHlink: '954F72' };
+
+/**
+ * A chart part ready to live in this package: the link to the embedded workbook and user shapes
+ * (parts we do not carry) are removed. Charts that still reference other parts are not reusable.
+ */
+function portableChart(xml: string): string | null {
+  const s = xml
+    .replace(/<(\w+:)?externalData\b[^>]*?\/>/g, '')
+    .replace(/<(\w+:)?externalData\b[^>]*>[\s\S]*?<\/\1externalData>/g, '')
+    .replace(/<(\w+:)?userShapes\b[^>]*?\/>/g, '');
+  if (/\br:(id|embed|link)=/.test(s) || !/<(\w+:)?chartSpace\b/.test(s)) return null;
+  return s;
+}
+
+/** A minimal but complete theme carrying a chart's colour scheme. */
+function themeXml(colors: Record<string, string>): string {
+  const c = { ...OFFICE_COLORS, ...colors };
+  const clr = (k: string): string => `<a:${k}><a:srgbClr val="${/^[0-9A-F]{6}$/i.test(c[k]) ? c[k] : OFFICE_COLORS[k]}"/></a:${k}>`;
+  const ph = '<a:solidFill><a:schemeClr val="phClr"/></a:solidFill>';
+  return (
+    XML_HEAD +
+    '<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="Office Theme"><a:themeElements>' +
+    `<a:clrScheme name="Document">${['dk1', 'lt1', 'dk2', 'lt2', 'accent1', 'accent2', 'accent3', 'accent4', 'accent5', 'accent6', 'hlink', 'folHlink'].map(clr).join('')}</a:clrScheme>` +
+    '<a:fontScheme name="Office"><a:majorFont><a:latin typeface="Calibri Light"/><a:ea typeface=""/><a:cs typeface=""/></a:majorFont><a:minorFont><a:latin typeface="Calibri"/><a:ea typeface=""/><a:cs typeface=""/></a:minorFont></a:fontScheme>' +
+    `<a:fmtScheme name="Office"><a:fillStyleLst>${ph}${ph}${ph}</a:fillStyleLst>` +
+    `<a:lnStyleLst><a:ln w="6350">${ph}</a:ln><a:ln w="12700">${ph}</a:ln><a:ln w="19050">${ph}</a:ln></a:lnStyleLst>` +
+    '<a:effectStyleLst><a:effectStyle><a:effectLst/></a:effectStyle><a:effectStyle><a:effectLst/></a:effectStyle><a:effectStyle><a:effectLst/></a:effectStyle></a:effectStyleLst>' +
+    `<a:bgFillStyleLst>${ph}${ph}${ph}</a:bgFillStyleLst></a:fmtScheme>` +
+    '</a:themeElements><a:objectDefaults/><a:extraClrSchemeLst/></a:theme>'
+  );
+}
 const BULLETS = ['•', '◦', '▪'];
 const FONT_NAME: Record<FontFamily, string> = { sans: 'Arial', serif: 'Times New Roman', mono: 'Courier New', calibri: 'Calibri' };
 const tw = (pt: number): number => Math.round(pt * 20);
@@ -46,6 +81,8 @@ class Part {
 
 class DocxWriter {
   private media: Record<string, Uint8Array> = {};
+  private charts: Record<string, string> = {};
+  private chartColors: Record<string, string> | undefined;
   private imageCount = 0;
   private nums: string[] = [];
   private numId = 0;
@@ -183,16 +220,41 @@ class DocxWriter {
     return s ? `<w:pPr>${s}</w:pPr>` : '';
   }
 
+  /** A native, editable Word chart (the source chart part, with its cached values). */
+  private chartFrame(chart: ChartSource, cx: number, cy: number, n: number, descr: string): string | null {
+    const xml = portableChart(chart.xml);
+    if (!xml) return null;
+    const k = Object.keys(this.charts).length + 1;
+    this.charts[`word/charts/chart${k}.xml`] = xml;
+    this.chartColors ??= chart.colors;
+    const rid = this.part.add('chart', `charts/chart${k}.xml`);
+    return (
+      `<w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0"><wp:extent cx="${cx}" cy="${cy}"/>` +
+      `<wp:effectExtent l="0" t="0" r="0" b="0"/><wp:docPr id="${n}" name="Chart ${n}"${descr}/><wp:cNvGraphicFramePr/>` +
+      '<a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart">' +
+      `<c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" r:id="${rid}"/>` +
+      '</a:graphicData></a:graphic></wp:inline></w:drawing></w:r>'
+    );
+  }
+
   private image(b: Extract<Block, { type: 'image' }>, maxWidthTw: number): string {
-    const ext = IMAGE_EXT[b.mime];
-    if (!ext) {
+    let ext = IMAGE_EXT[b.mime];
+    let data = b.data;
+    let svg: Uint8Array | undefined;
+    if (b.mime === 'image/svg+xml' && !b.chart) {
+      // Word shows SVG through an extension (2016+); the EMF picture serves every other reader
+      const mf = parseSvg(b.data);
+      if (mf) {
+        ext = 'emf';
+        data = metafileToEmf(mf);
+        svg = b.data;
+      }
+    }
+    if (!ext && !b.chart) {
       this.warnings.push('Некоторые изображения пропущены: формат не поддерживается Word.');
       return '';
     }
     const n = ++this.imageCount;
-    const name = `image${n}.${ext}`;
-    this.media[`word/media/${name}`] = b.data;
-    const rid = this.part.add('image', `media/${name}`);
     const maxW = maxWidthTw * 635;
     const maxH = (this.pageH - this.margins.top - this.margins.bottom - 600) * 635;
     let cx = Math.max(1, b.width) * EMU_PER_PX;
@@ -201,13 +263,31 @@ class DocxWriter {
     cx = Math.round(cx * k);
     cy = Math.round(cy * k);
     const descr = b.alt ? ` descr="${escapeXml(b.alt)}"` : '';
+    if (b.chart) {
+      const frame = this.chartFrame(b.chart, cx, cy, n, descr);
+      if (frame) return frame;
+      const mf = parseSvg(b.data);
+      if (!mf) return '';
+      ext = 'emf';
+      data = metafileToEmf(mf);
+      svg = b.data;
+    }
+    const name = `image${n}.${ext}`;
+    this.media[`word/media/${name}`] = data;
+    const rid = this.part.add('image', `media/${name}`);
+    let ext2 = '';
+    if (svg) {
+      this.media[`word/media/image${n}.svg`] = svg;
+      const svgRid = this.part.add('image', `media/image${n}.svg`);
+      ext2 = `<a:extLst><a:ext uri="{96DAC541-7B7A-43D3-8B79-37D633B846F1}"><asvg:svgBlip xmlns:asvg="http://schemas.microsoft.com/office/drawing/2016/SVG/main" r:embed="${svgRid}"/></a:ext></a:extLst>`;
+    }
     return (
       `<w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0"><wp:extent cx="${cx}" cy="${cy}"/>` +
       `<wp:effectExtent l="0" t="0" r="0" b="0"/><wp:docPr id="${n}" name="Picture ${n}"${descr}/>` +
       '<wp:cNvGraphicFramePr><a:graphicFrameLocks noChangeAspect="1"/></wp:cNvGraphicFramePr>' +
       '<a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic>' +
       `<pic:nvPicPr><pic:cNvPr id="${n}" name="${name}"/><pic:cNvPicPr/></pic:nvPicPr>` +
-      `<pic:blipFill><a:blip r:embed="${rid}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>` +
+      `<pic:blipFill><a:blip r:embed="${rid}"${ext2 ? `>${ext2}</a:blip>` : '/>'}<a:stretch><a:fillRect/></a:stretch></pic:blipFill>` +
       `<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>` +
       '</pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>'
     );
@@ -358,6 +438,16 @@ class DocxWriter {
       docRels.push(`<Relationship Id="rId6" Type="${REL}/footnotes" Target="footnotes.xml"/>`);
       overrides.push('<Override PartName="/word/footnotes.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml"/>');
     }
+    for (const [path, xml] of Object.entries(this.charts)) {
+      files[path] = utf8(xml);
+      overrides.push(`<Override PartName="/${path}" ContentType="${CHART_CT}"/>`);
+    }
+    if (Object.keys(this.charts).length) {
+      // scheme colours in the charts resolve against the document theme
+      files['word/theme/theme1.xml'] = utf8(themeXml(this.chartColors ?? {}));
+      docRels.push(`<Relationship Id="rId7" Type="${REL}/theme" Target="theme/theme1.xml"/>`);
+      overrides.push('<Override PartName="/word/theme/theme1.xml" ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/>');
+    }
     const m = this.margins;
     const document =
       `${XML_HEAD}<w:document ${NS_ALL}><w:body>${body}<w:sectPr>${refs}` +
@@ -410,6 +500,7 @@ function contentTypes(overrides: string[]): string {
     '<Default Extension="bmp" ContentType="image/bmp"/>' +
     '<Default Extension="emf" ContentType="image/x-emf"/>' +
     '<Default Extension="wmf" ContentType="image/x-wmf"/>' +
+    '<Default Extension="svg" ContentType="image/svg+xml"/>' +
     '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>' +
     '<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>' +
     '<Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/>' +

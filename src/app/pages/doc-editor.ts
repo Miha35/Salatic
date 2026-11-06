@@ -15,7 +15,7 @@ const DRAFT_KEY = 'doc-draft';
 const MAX_DRAFT = 4_000_000;
 
 /** Sanitise arbitrary HTML through the document model (drops scripts, handlers, unknown markup). */
-const sanitize = (html: string): string => blocksToHtml(htmlToDoc(html).blocks);
+const sanitize = (html: string): string => blocksToHtml(htmlToDoc(html).blocks, { sources: true });
 
 const FONT_CHOICES: [FontFamily, string][] = [
   ['sans', 'Arial'],
@@ -511,7 +511,7 @@ export function mount(root: HTMLElement): () => void {
   const handed = takeHandoff('/doc-editor');
   if (handed) void openFile(handed);
   else if (draft?.html) {
-    editor.innerHTML = docToHtmlFragment(htmlToDoc(draft.html));
+    editor.innerHTML = docToHtmlFragment(htmlToDoc(draft.html), { sources: true });
     banner.replaceChildren(
       h(
         'div',

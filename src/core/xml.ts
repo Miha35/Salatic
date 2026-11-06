@@ -165,6 +165,18 @@ export function find(node: XNode | undefined, name: string): XNode | undefined {
   return undefined;
 }
 
+/** First descendant element matching a predicate (depth-first). */
+export function findBy(node: XNode | undefined, pred: (n: XNode) => boolean): XNode | undefined {
+  if (!node) return undefined;
+  for (const c of node.children) {
+    if (typeof c === 'string') continue;
+    if (pred(c)) return c;
+    const f = findBy(c, pred);
+    if (f) return f;
+  }
+  return undefined;
+}
+
 export function findAll(node: XNode | undefined, name: string, out: XNode[] = []): XNode[] {
   if (!node) return out;
   for (const c of node.children) {

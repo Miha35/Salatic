@@ -108,6 +108,8 @@ class Gdi {
   dc: DC;
   private stack: DC[] = [];
   objects: (GdiObj | undefined)[] = [];
+  /** The last command was text drawn at the current position (TA_UPDATECP), so the next such run continues it. */
+  private cpChain = false;
   /** Output = device units minus this origin, times `scale`. */
   origin: [number, number] = [0, 0];
   scale = 1;
@@ -270,6 +272,7 @@ class Gdi {
 
   moveTo(x: number, y: number): void {
     this.dc.cur = [x, y];
+    this.cpChain = false;
     if (this.path) {
       const [px, py] = this.pt(x, y);
       this.path.push(`M${this.f(px)} ${this.f(py)}`);
@@ -367,7 +370,11 @@ class Gdi {
   text(x: number, y: number, s: string, useCurrent: boolean): void {
     if (!s.trim()) return;
     const d = this.dc;
-    if (useCurrent || d.textAlign & 1) [x, y] = d.cur;
+    const updateCp = useCurrent || (d.textAlign & 1) !== 0;
+    if (updateCp) [x, y] = d.cur;
+    // GDI advances the current position after each run; without font metrics, mark the run as flowing instead
+    const flow = updateCp && this.cpChain;
+    this.cpChain = updateCp;
     const [ox, oy] = this.pt(x, y);
     const f = d.font;
     // Negative height = character height (em); positive = cell height (≈ 1.2 em)
@@ -388,6 +395,7 @@ class Gdi {
       angle: f.escapement / 10,
       anchor: h === 6 ? 'middle' : h === 2 ? 'end' : 'start',
       baseline: v === 24 ? 'alphabetic' : v === 8 ? 'bottom' : 'top',
+      ...(flow ? { flow: true } : {}),
     });
   }
 

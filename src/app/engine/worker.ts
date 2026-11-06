@@ -146,7 +146,7 @@ async function handle(id: number, req: EngineRequest): Promise<{ result: unknown
       const { content, warnings } = await readContent(req.bytes, req.from, env(id), req.title);
       const doc = asDoc(content, req.title);
       const meta = { font: doc.font, size: doc.size, page: doc.page, defaults: doc.defaults };
-      return { result: { html: docToHtmlFragment(doc), title: doc.title, meta, warnings }, transfer: [] };
+      return { result: { html: docToHtmlFragment(doc, { sources: true }), title: doc.title, meta, warnings }, transfer: [] };
     }
     case 'fromHtml': {
       const doc = { ...req.meta, ...htmlToDoc(req.html) };

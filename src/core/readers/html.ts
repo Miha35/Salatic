@@ -1,4 +1,4 @@
-import type { Align, Block, Doc, ListItem, ParaFormat, TableRow, TextRun } from '../model';
+import type { Align, Block, ChartSource, Doc, ListItem, ParaFormat, TableRow, TextRun } from '../model';
 import { familyOf, trimRuns } from '../model';
 import { findTag, htmlText, parseHtml, parseStyle, type HNode } from '../html';
 import { imageSize, parseDataUri, sniffImageMime } from '../util';
@@ -211,7 +211,20 @@ function imageFromNode(node: HNode): Block | null {
     w = w || 300;
     h = h || 200;
   }
-  return { type: 'image', data: parsed.data, mime, width: Math.round(w), height: Math.round(h), alt: node.attrs.alt || undefined };
+  return { type: 'image', data: parsed.data, mime, width: Math.round(w), height: Math.round(h), alt: node.attrs.alt || undefined, ...chartSource(node.attrs['data-chart'], mime) };
+}
+
+/** An Office chart part kept by the editor next to its SVG rendering (see HtmlCtx.sources). */
+function chartSource(attr: string | undefined, mime: string): { chart?: ChartSource } {
+  if (!attr || mime !== 'image/svg+xml') return {};
+  try {
+    const v = JSON.parse(attr) as Partial<ChartSource>;
+    if (typeof v.xml !== 'string' || !/^\s*(<\?xml[^>]*>\s*)?<(\w+:)?chartSpace\b/.test(v.xml)) return {};
+    const colors = v.colors && typeof v.colors === 'object' ? Object.fromEntries(Object.entries(v.colors).filter(([k, c]) => /^\w+$/.test(k) && typeof c === 'string' && /^[0-9A-F]{6}$/i.test(c))) : undefined;
+    return { chart: { xml: v.xml, colors } };
+  } catch {
+    return {};
+  }
 }
 
 class Ctx {

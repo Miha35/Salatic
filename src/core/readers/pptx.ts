@@ -447,8 +447,9 @@ class PptxReader {
       const rid = find(data, 'c:chart')?.attrs['r:id'];
       const target = rid ? ctx.part.rels.get(rid) : undefined;
       const xml = target && !target.external ? this.files[target.target] : undefined;
-      const svg = xml ? chartToSvg(decoder.decode(xml), { colors: this.theme.colors, width: geo.w, height: geo.h }) : null;
-      if (svg) out.push({ kind: 'image', ...geo, data: new TextEncoder().encode(svg), mime: 'image/svg+xml', alt: 'Диаграмма' });
+      const xmlText = xml ? decoder.decode(xml) : '';
+      const svg = xmlText ? chartToSvg(xmlText, { colors: this.theme.colors, width: geo.w, height: geo.h }) : null;
+      if (svg) out.push({ kind: 'image', ...geo, data: new TextEncoder().encode(svg), mime: 'image/svg+xml', alt: 'Диаграмма', chart: { xml: xmlText, colors: this.theme.colors } });
       else this.warnings.add('Некоторые диаграммы не удалось прочитать: в файле нет сохранённых значений.');
     } else if (uri.endsWith('/diagram')) this.warnings.add('Некоторые SmartArt-схемы не отображаются.');
     else if (uri.includes('ole')) {
@@ -824,7 +825,7 @@ export function deckToDoc(deck: Deck): Doc {
     for (const e of [...els].sort((a, b) => order(a) - order(b))) {
       if (e.kind === 'shape' && e.text) paragraphsToBlocks(e.text, e.role, blocks);
       else if (e.kind === 'image' && e.w > 20 && e.h > 20 && /^image\/(png|jpeg|gif|webp|bmp|svg\+xml|tiff|emf|wmf)$/.test(e.mime)) {
-        blocks.push({ type: 'image', data: e.data, mime: e.mime, width: Math.round((e.w * 96) / 72), height: Math.round((e.h * 96) / 72), alt: e.alt });
+        blocks.push({ type: 'image', data: e.data, mime: e.mime, width: Math.round((e.w * 96) / 72), height: Math.round((e.h * 96) / 72), alt: e.alt, ...(e.chart ? { chart: e.chart } : {}) });
       } else if (e.kind === 'table') {
         const rows = e.rows.map((r, ri) => ({
           cells: r.cells

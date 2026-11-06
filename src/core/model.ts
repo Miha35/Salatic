@@ -12,6 +12,12 @@ export type Align = 'left' | 'center' | 'right' | 'justify';
  */
 export type FontFamily = 'sans' | 'serif' | 'mono' | 'calibri';
 
+export interface ChartSource {
+  xml: string;
+  /** Theme colour scheme the chart resolves scheme colours against (dk1, lt1, accent1…). */
+  colors?: Record<string, string>;
+}
+
 export interface TextRun {
   text: string;
   bold?: boolean;
@@ -77,7 +83,7 @@ export type Block =
   | { type: 'list'; ordered: boolean; items: ListItem[]; start?: number }
   | { type: 'table'; rows: TableRow[] }
   /** width/height are the intended display size in CSS pixels (96 dpi). */
-  | { type: 'image'; data: Uint8Array; mime: string; width: number; height: number; alt?: string }
+  | { type: 'image'; data: Uint8Array; mime: string; width: number; height: number; alt?: string; /** Source Office chart part (c:chartSpace XML) and its theme colours; `data` holds its SVG rendering. */ chart?: ChartSource }
   | { type: 'code'; text: string }
   | { type: 'quote'; blocks: Block[] }
   | { type: 'hr' }

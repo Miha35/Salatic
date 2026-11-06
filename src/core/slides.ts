@@ -3,7 +3,7 @@
  * the PPTX reader; rendered page-for-page to PDF, or flattened to a Doc for the
  * text formats. All lengths are in points, colours are hex RRGGBB.
  */
-import type { Align, Block, TextRun } from './model';
+import type { Align, Block, ChartSource, TextRun } from './model';
 
 export interface SlideBullet {
   /** Literal bullet character, or the formatted number for auto-numbered lists. */
@@ -66,7 +66,7 @@ export type SlideElement =
       text?: SlideText;
       role: SlideRole;
     }
-  | { kind: 'image'; x: number; y: number; w: number; h: number; data: Uint8Array; mime: string; crop?: { l: number; t: number; r: number; b: number }; rot?: number; alt?: string }
+  | { kind: 'image'; x: number; y: number; w: number; h: number; data: Uint8Array; mime: string; crop?: { l: number; t: number; r: number; b: number }; rot?: number; alt?: string; chart?: ChartSource }
   | { kind: 'line'; x1: number; y1: number; x2: number; y2: number; line: SlideLine }
   | { kind: 'table'; x: number; y: number; w: number; h: number; cols: number[]; rows: SlideTableRow[] };
 

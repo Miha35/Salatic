@@ -249,6 +249,8 @@ export interface HtmlCtx {
   xhtml: boolean;
   /** Image source for a block; defaults to an inline data URI. */
   imageSrc?: (b: Extract<Block, { type: 'image' }>) => string;
+  /** Keep source data (Office chart parts) in data attributes, so an editing round trip loses nothing. */
+  sources?: boolean;
 }
 const HTML: HtmlCtx = { xhtml: false };
 
@@ -341,7 +343,7 @@ function blocksHtml(blocks: Block[], notes: Notes, ctx: HtmlCtx = HTML): string 
         s += '</table>\n';
         break;
       case 'image':
-        s += `<p><img src="${ctx.imageSrc ? escapeHtml(ctx.imageSrc(b)) : dataUri(b)}" width="${b.width}" height="${b.height}" alt="${escapeHtml(b.alt ?? '')}"${ctx.xhtml ? '/' : ''}></p>\n`;
+        s += `<p><img src="${ctx.imageSrc ? escapeHtml(ctx.imageSrc(b)) : dataUri(b)}" width="${b.width}" height="${b.height}" alt="${escapeHtml(b.alt ?? '')}"${ctx.sources && b.chart ? ` data-chart="${escapeHtml(JSON.stringify(b.chart))}"` : ''}${ctx.xhtml ? '/' : ''}></p>\n`;
         break;
       case 'code':
         s += `<pre><code>${escapeHtml(b.text)}</code></pre>\n`;
@@ -379,17 +381,18 @@ export function blocksToXhtml(blocks: Block[], imageSrc: HtmlCtx['imageSrc']): s
 }
 
 /** Blocks only (no header, footer or footnotes) – used where a bare fragment is needed. */
-export function blocksToHtml(blocks: Block[]): string {
+export function blocksToHtml(blocks: Block[], opts: { sources?: boolean } = {}): string {
   const notes = new Notes();
-  return blocksHtml(blocks, notes) + notesHtml(notes);
+  return blocksHtml(blocks, notes, { ...HTML, ...opts }) + notesHtml(notes);
 }
 
 /** Editable/printable body: header, content, footnotes, footer. */
-export function docToHtmlFragment(doc: Doc): string {
+export function docToHtmlFragment(doc: Doc, opts: { sources?: boolean } = {}): string {
   const notes = new Notes();
+  const ctx: HtmlCtx = { ...HTML, ...opts };
   let s = '';
-  if (doc.header?.length) s += `<header class="doc-header">\n${blocksHtml(doc.header, notes)}</header>\n`;
-  s += blocksHtml(doc.blocks, notes);
+  if (doc.header?.length) s += `<header class="doc-header">\n${blocksHtml(doc.header, notes, ctx)}</header>\n`;
+  s += blocksHtml(doc.blocks, notes, ctx);
   s += notesHtml(notes);
   if (doc.footer?.length) s += `<footer class="doc-footer">\n${blocksHtml(doc.footer, new Notes())}</footer>\n`;
   return s;

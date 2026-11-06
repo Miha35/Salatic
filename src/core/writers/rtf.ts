@@ -6,6 +6,8 @@
  */
 import type { Block, Doc, FontFamily, ParaFormat, TableCell, TextRun } from '../model';
 import { maxOf } from '../util';
+import { parseSvg } from '../svg-render';
+import { metafileToEmf } from './emf';
 
 const FONTS: FontFamily[] = ['sans', 'serif', 'mono', 'calibri'];
 const FONT_DEF: Record<FontFamily, string> = {
@@ -144,9 +146,14 @@ class RtfWriter {
   }
 
   private image(b: Extract<Block, { type: 'image' }>, maxW: number): string {
+    if (b.mime === 'image/svg+xml') {
+      // RTF has no SVG picture type: draw it as an EMF
+      const mf = parseSvg(b.data);
+      if (mf) b = { ...b, data: metafileToEmf(mf), mime: 'image/emf' };
+    }
     const kind = b.mime === 'image/png' ? 'pngblip' : b.mime === 'image/jpeg' ? 'jpegblip' : b.mime === 'image/emf' ? 'emfblip' : b.mime === 'image/wmf' ? 'wmetafile8' : null;
     if (!kind) {
-      this.warnings.add('Некоторые изображения пропущены: RTF поддерживает PNG, JPEG, EMF и WMF.');
+      this.warnings.add('Некоторые изображения пропущены: RTF поддерживает PNG, JPEG, SVG, EMF и WMF.');
       return '';
     }
     const maxH = this.pageH - this.margins.top - this.margins.bottom - 600;
