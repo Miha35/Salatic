@@ -2,12 +2,14 @@
  * Windows metafiles (EMF, WMF) – the vector pictures Office documents carry (logos,
  * charts, equations). A GDI interpreter turns the records into a small display list
  * (paths, text, bitmaps) in output units; it is rendered as SVG for web formats and
- * drawn as vectors into PDFs. EMF+ "dual" files are drawn from their GDI records.
+ * drawn as vectors into PDFs. EMF+ "dual" files are drawn from their GDI records, EMF+-only files
+ * (and dual ones whose GDI part draws nothing) from their EMF+ records (emfplus.ts).
  * Clipping regions and raster operations other than copy are not applied.
  */
 import { zlibSync } from 'fflate';
 import { familyOf, type FontFamily, type Gradient } from './model';
 import { bytesToBase64, escapeXml } from './util';
+import { playEmfPlus } from './emfplus';
 
 export type MetaCmd =
   | { k: 'path'; d: string; fill?: string; evenOdd: boolean; stroke?: string; width: number; dash?: number[]; opacity?: number; strokeOpacity?: number; /** Gradient fill (drawing space); `fill` is its average colour. */ grad?: Gradient }
@@ -632,11 +634,19 @@ export function parseEmf(data: Uint8Array): Metafile {
   const xform = (o: number): Xf => [f32(o), f32(o + 4), f32(o + 8), f32(o + 12), f32(o + 16), f32(o + 20)];
   let pos = 0;
   let guard = 0;
+  /** EMF+ records found in EMR_COMMENT records */
+  const plus: Uint8Array[] = [];
   while (pos + 8 <= data.length && guard++ < 1_000_000) {
     const type = u32(pos);
     const size = u32(pos + 4);
     if (size < 8 || pos + size > data.length) break;
     const p = pos + 8;
+    if (type === 70 && size >= 16 && u32(p + 4) === 0x2b464d45) {
+      // EMR_COMMENT holding EMF+ records ("EMF+" after the data size)
+      plus.push(data.subarray(p + 8, Math.min(pos + size, p + 4 + u32(p))));
+      pos += size;
+      continue;
+    }
     const pts16 = (count: number, o: number): [number, number][] => Array.from({ length: count }, (_, i) => [dv.getInt16(o + i * 4, true), dv.getInt16(o + i * 4 + 2, true)] as [number, number]);
     const pts32 = (count: number, o: number): [number, number][] => Array.from({ length: count }, (_, i) => [i32(o + i * 8), i32(o + i * 8 + 4)] as [number, number]);
     switch (type) {
@@ -918,6 +928,12 @@ export function parseEmf(data: Uint8Array): Metafile {
         break;
     }
     pos += size;
+  }
+  if (plus.length) {
+    // EMF+ only (or a dual file whose GDI records draw nothing): the EMF+ records are the picture
+    const drew = g.cmds.some((c) => c.k !== 'clip');
+    const r = playEmfPlus(plus, { devToOut: (x, y) => [(x - g.origin[0]) * g.scale, (y - g.origin[1]) * g.scale], devScale: g.scale, frame: [0, 0, width, height] });
+    if (r && (!r.dual || !drew) && r.cmds.some((c) => c.k !== 'clip')) return { width, height, widthPt, heightPt, cmds: r.cmds };
   }
   return { width, height, widthPt, heightPt, cmds: g.cmds };
 }
