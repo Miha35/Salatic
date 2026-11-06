@@ -205,6 +205,45 @@ describe.skipIf(!hasCmd('pdftoppm'))('gradients in PDF', () => {
     '<rect x="0" y="120" width="400" height="80" fill="url(#fade)"/>' +
     '</svg>';
 
+  it('SVG: text filled with a gradient is clipped to the glyphs and painted', async () => {
+    const svg =
+      '<svg xmlns="http://www.w3.org/2000/svg" width="400" height="100" viewBox="0 0 400 100">' +
+      '<defs><linearGradient id="t" gradientUnits="userSpaceOnUse" x1="20" y1="0" x2="380" y2="0"><stop offset="0" stop-color="#ff0000"/><stop offset="1" stop-color="#0000ff"/></linearGradient></defs>' +
+      '<text x="20" y="80" font-family="Arial" font-size="80" font-weight="bold" fill="url(#t)">MMMMMM</text></svg>';
+    const mf = parseSvg(svg)!;
+    const t = mf.cmds.find((c): c is Extract<MetaCmd, { k: 'text' }> => c.k === 'text')!;
+    expect(t.grad?.kind).toBe('linear');
+    const pdf = (await docToPdf({ blocks: [{ type: 'image', data: new TextEncoder().encode(svg), mime: 'image/svg+xml', width: 400, height: 100 }] }, { fonts: loadFonts })).data;
+    const px = pixels(pdf, 1);
+    // the text: colored pixels, red on the left, blue on the right; between glyph strokes stays white
+    const coloured: { x: number; c: number[] }[] = [];
+    for (let y = 0; y < 300; y++)
+      for (let x = 0; x < 595; x++) {
+        const c = px(x, y);
+        if (c[0] + c[1] + c[2] < 600 && Math.abs(c[0] - c[2]) > 60) coloured.push({ x, c });
+      }
+    expect(coloured.length).toBeGreaterThan(500);
+    const xs = coloured.map((p) => p.x);
+    const lo = Math.min(...xs);
+    const hi = Math.max(...xs);
+    const left = coloured.filter((p) => p.x < lo + (hi - lo) * 0.15);
+    const right = coloured.filter((p) => p.x > hi - (hi - lo) * 0.15);
+    expect(left.every((p) => p.c[0] > p.c[2]), 'red on the left').toBe(true);
+    expect(right.every((p) => p.c[2] > p.c[0]), 'blue on the right').toBe(true);
+    // clipped to the glyphs, not a filled box: white gaps between the strokes
+    const ys: number[] = [];
+    for (let y = 0; y < 300; y++) for (let x = lo; x <= hi; x++) if (coloured.length && px(x, y).every((v) => v < 250) && Math.abs(px(x, y)[0] - px(x, y)[2]) > 60) ys.push(y);
+    const [y0, y1] = [Math.min(...ys), Math.max(...ys)];
+    let white = 0;
+    let all = 0;
+    for (let y = y0; y <= y1; y += 2)
+      for (let x = lo; x <= hi; x += 2) {
+        all++;
+        if (px(x, y).every((v) => v > 240)) white++;
+      }
+    expect(white / all).toBeGreaterThan(0.2);
+  });
+
   it('SVG: bounding-box and user-space gradients, href templates, matrices', () => {
     const mf = parseSvg(SVG)!;
     const paths = mf.cmds.filter((c): c is Extract<MetaCmd, { k: 'path' }> => c.k === 'path');

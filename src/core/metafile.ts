@@ -27,6 +27,8 @@ export type MetaCmd =
       baseline: 'alphabetic' | 'top' | 'bottom';
       /** Continue right after the previous text command (SVG tspans). */
       flow?: boolean;
+      /** Gradient fill (drawing space); `color` is its average. */
+      grad?: Gradient;
     }
   | { k: 'image'; x: number; y: number; w: number; h: number; png: Uint8Array }
   /** Replace the clip: drawing is limited to the intersection of these paths (none: no clipping). */

@@ -635,7 +635,15 @@ class SvgRenderer {
       const angle = (-Math.atan2(m[1], m[0]) * 180) / Math.PI;
       const fam: FontFamily = /mono|courier|consol/i.test(st.fontFamily) ? 'mono' : (familyOf(st.fontFamily.split(',')[0].replace(/['"]/g, '').trim()) ?? 'sans');
       const bold = /bold|[6-9]00/.test(st.fontWeight);
+      // a gradient fill: its bounding box is estimated from the text (the exact width is known when drawn)
+      let grad: Gradient | undefined;
+      if (st.fillGrad) {
+        const est = t.length * 0.55 * st.fontSize;
+        const x0 = !flow && st.anchor === 'middle' ? xx - est / 2 : !flow && st.anchor === 'end' ? xx - est : xx;
+        grad = this.gradient(st.fillGrad, [x0, yy - st.fontSize * 0.8, x0 + est, yy + st.fontSize * 0.2], m);
+      }
       this.cmds.push({
+        ...(grad ? { grad } : {}),
         k: 'text',
         x: px,
         y: py,
@@ -645,7 +653,7 @@ class SvgRenderer {
         bold,
         italic: /italic|oblique/.test(st.fontStyle),
         underline: false,
-        color: st.fill,
+        color: grad ? gradientAverage(grad) : st.fill,
         angle,
         anchor: flow ? 'start' : st.anchor,
         baseline: 'alphabetic',

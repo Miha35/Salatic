@@ -11,7 +11,7 @@
  * per-character fallback (DejaVu Sans → Noto Sans CJK → Noto Emoji), Word-style line
  * spacing from the fonts' Windows metrics, subsetting with HarfBuzz.
  */
-import { clip, clipEvenOdd, closePath, concatTransformationMatrix, lineTo, moveTo, degrees, drawSvgPath, endPath, PDFDict, PDFDocument, PDFName, PDFNumber, PDFOperator, PDFOperatorNames, PDFString, popGraphicsState, pushGraphicsState, rectangle, rgb, setGraphicsState, type PDFContext, type PDFImage, type PDFObject, type PDFPage, type PDFRef } from 'pdf-lib';
+import { beginText, clip, clipEvenOdd, closePath, concatTransformationMatrix, endText, lineTo, moveTo, rotateAndSkewTextRadiansAndTranslate, setFontAndSize, setTextRenderingMode, showText, TextRenderingMode, degrees, drawSvgPath, endPath, PDFDict, PDFDocument, PDFName, PDFNumber, PDFOperator, PDFOperatorNames, PDFString, popGraphicsState, pushGraphicsState, rectangle, rgb, setGraphicsState, type PDFContext, type PDFImage, type PDFObject, type PDFPage, type PDFRef } from 'pdf-lib';
 import { parseMetafile, type Metafile } from '../metafile';
 import { parseSvg } from '../svg-render';
 import type { Align, Block, Doc, FontFamily, Gradient, ParaFormat, PatternFill, TextRun } from '../model';
@@ -125,6 +125,13 @@ export class PdfWriter {
    * clip and an axial/radial shading paints it, so colours blend smoothly in any viewer and printer.
    */
   protected fillGradient(page: PDFPage, d: string, g: Gradient, x: number, y: number, opacity = 1): void {
+    // drawSvgPath gives: q, transforms, path…, h, Q — keep the transforms and the path
+    const body = drawSvgPath(d, { x, y, scale: undefined, color: undefined, borderColor: undefined, borderWidth: 0 }).slice(1, -2);
+    page.pushOperators(pushGraphicsState(), ...body, clip(), endPath(), ...this.gradientPaint(page, g, opacity), popGraphicsState());
+  }
+
+  /** Operators painting a gradient over the current clip (in the current, y-down drawing space). */
+  protected gradientPaint(page: PDFPage, g: Gradient, opacity = 1): PDFOperator[] {
     const ctx = this.pdf.context;
     const r3 = (v: number): number => Math.round(v * 1000) / 1000;
     /**
@@ -192,20 +199,13 @@ export class PdfWriter {
       gsDict.set(PDFName.of('SMask'), ctx.obj({ Type: 'Mask', S: 'Luminosity', G: form }));
       gsUsed = true;
     }
-    // The mask is defined in the user space current when the state is set: after the path transforms
+    // The mask is defined in the user space current when the state is set: after the clip
     const gs = gsUsed ? page.node.newExtGState('GS', gsDict) : undefined;
-    // drawSvgPath gives: q, transforms, path…, h, Q — keep the transforms and the path
-    const body = drawSvgPath(d, { x, y, scale: undefined, color: undefined, borderColor: undefined, borderWidth: 0 }).slice(1, -2);
-    page.pushOperators(
-      pushGraphicsState(),
-      ...body,
-      clip(),
-      endPath(),
+    return [
       ...(gs ? [setGraphicsState(gs)] : []),
       ...(g.matrix ? [concatTransformationMatrix(...g.matrix)] : []),
       ...rgb.flatMap((pc, k) => (pc.clip ? [pushGraphicsState(), ...clipOps(pc.clip), PDFOperator.of(PDFOperatorNames.ShadingFill, [names[k]]), popGraphicsState()] : [PDFOperator.of(PDFOperatorNames.ShadingFill, [names[k]])])),
-      popGraphicsState(),
-    );
+    ];
   }
   private patterns = new Map<string, PDFRef>();
 
@@ -662,6 +662,24 @@ export class PdfWriter {
         const startX = cx;
         const base = c.baseline === 'top' ? c.y + c.size * 0.88 : c.baseline === 'bottom' ? c.y - c.size * 0.21 : c.y;
         const rad = (c.angle * Math.PI) / 180;
+        if (c.grad) {
+          // the glyph outlines become the clip (render mode 7), the gradient paints them
+          const ops: PDFOperator[] = [pushGraphicsState(), beginText(), setTextRenderingMode(TextRenderingMode.Clip)];
+          for (const sg of segs) {
+            const dx = cx - c.x;
+            const px = c.x + dx * Math.cos(rad) + (base - c.y) * Math.sin(rad);
+            const py = c.y - dx * Math.sin(rad) + (base - c.y) * Math.cos(rad);
+            const font = this.fm.pdfFont(sg.key);
+            const key = page.node.newFontDictionary(font.name, font.ref);
+            ops.push(setFontAndSize(key, c.size), rotateAndSkewTextRadiansAndTranslate(rad, 0, 0, px, -py), showText(font.encodeText(sg.text)));
+            cx += this.fm.width(sg.key, sg.text, c.size);
+          }
+          // back to the y-down drawing space of the picture for the gradient
+          ops.push(endText(), concatTransformationMatrix(1, 0, 0, -1, 0, 0), ...this.gradientPaint(page, c.grad), popGraphicsState());
+          page.pushOperators(...ops);
+          flowX = startX + width;
+          return;
+        }
         for (const sg of segs) {
           // rotation is around the reference point, counter-clockwise like GDI escapement
           const dx = cx - c.x;
