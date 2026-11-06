@@ -4,6 +4,7 @@ import type { Align, Block, Doc, FontFamily, ListItem, PageSetup, ParaFormat, Ta
 import { familyOf, normalizeRuns, trimRuns } from '../model';
 import { child, childrenNamed, elements, find, findAll, parseXml, rootElement, textContent, type XNode } from '../xml';
 import { ConvertError, imageSize, sniffImageMime, unzipOffice } from '../util';
+import { chartToSvg } from '../chart';
 
 type RStyle = Omit<TextRun, 'text'>;
 
@@ -125,6 +126,30 @@ class DocxReader {
     if (!theme) return;
     this.themeFonts.major = find(find(theme, 'a:majorFont'), 'a:latin')?.attrs.typeface ?? '';
     this.themeFonts.minor = find(find(theme, 'a:minorFont'), 'a:latin')?.attrs.typeface ?? '';
+    for (const c of elements(find(theme, 'a:clrScheme'))) {
+      const v = find(c, 'a:srgbClr')?.attrs.val ?? find(c, 'a:sysClr')?.attrs.lastClr;
+      if (v) this.themeColors[c.name.replace(/^a:/, '')] = v.toUpperCase();
+    }
+  }
+
+  private themeColors: Record<string, string> = {};
+
+  /** Chart parts are drawn from their cached values (SVG, vector in PDF). */
+  private chart(el: XNode): Block | null {
+    const ref = find(el, 'c:chart');
+    const rid = ref?.attrs['r:id'];
+    const rel = rid ? this.rels.get(rid) : undefined;
+    const data = rel && !rel.external ? this.files[rel.target] : undefined;
+    if (!data) return null;
+    const extent = find(el, 'wp:extent');
+    const w = extent ? +extent.attrs.cx / 12700 : 360;
+    const h = extent ? +extent.attrs.cy / 12700 : 216;
+    const svg = chartToSvg(decoder.decode(data), { colors: this.themeColors, width: w, height: h });
+    if (!svg) {
+      this.warnings.push('Некоторые диаграммы не удалось прочитать: в файле нет сохранённых значений.');
+      return null;
+    }
+    return { type: 'image', data: new TextEncoder().encode(svg), mime: 'image/svg+xml', width: Math.round((w * 96) / 72), height: Math.round((h * 96) / 72), alt: 'Диаграмма' };
   }
 
   private fontName(rFonts: XNode | undefined): string | undefined {
@@ -304,6 +329,7 @@ class DocxReader {
   }
 
   private image(el: XNode): Block | null {
+    if (find(el, 'c:chart')) return this.chart(el);
     const blip = find(el, 'a:blip') ?? find(el, 'v:imagedata');
     const rid = blip?.attrs['r:embed'] ?? blip?.attrs['r:id'];
     const rel = rid ? this.rels.get(rid) : undefined;

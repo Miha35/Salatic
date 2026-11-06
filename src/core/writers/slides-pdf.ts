@@ -170,8 +170,8 @@ export class SlidePdfWriter extends PdfWriter {
         return;
       }
       case 'image': {
-        if (/emf|wmf/.test(e.mime)) {
-          const op = await this.metaOp(e.data, e.x, e.y, e.w, e.h);
+        if (/emf|wmf|svg/.test(e.mime)) {
+          const op = await this.metaOp(e.data, e.x, e.y, e.w, e.h, e.mime);
           if (op) cmds.push((page) => this.rotated(page, e, e.rot, () => this.drawMeta(page, op, e.x, H - e.y)));
           return;
         }

@@ -13,6 +13,7 @@
  */
 import { clip, concatTransformationMatrix, degrees, endPath, PDFDocument, PDFName, PDFString, popGraphicsState, pushGraphicsState, rectangle, rgb, type PDFImage, type PDFPage } from 'pdf-lib';
 import { parseMetafile, type Metafile } from '../metafile';
+import { parseSvg } from '../svg-render';
 import type { Align, Block, Doc, FontFamily, ParaFormat, TextRun } from '../model';
 import { FontManager, styleOf, type FontKey, type FontLoader } from '../pdf-fonts';
 import type { Subsetter } from '../hb-subset';
@@ -408,10 +409,10 @@ export class PdfWriter {
   // ------------------------------------------------------------------ blocks
 
   /** Vector picture (EMF/WMF): parse, prepare its fonts and bitmaps; drawn by draw(). */
-  protected async metaOp(data: Uint8Array, x: number, y: number, w: number, h: number): Promise<Extract<Op, { k: 'meta' }> | null> {
-    const meta = parseMetafile(data);
+  protected async metaOp(data: Uint8Array, x: number, y: number, w: number, h: number, mime = 'image/emf'): Promise<Extract<Op, { k: 'meta' }> | null> {
+    const meta = mime === 'image/svg+xml' ? parseSvg(data) : parseMetafile(data);
     if (!meta || !meta.cmds.length) {
-      this.warnings.add('Некоторые векторные рисунки (EMF/WMF) не удалось прочитать и они пропущены.');
+      this.warnings.add(mime === 'image/svg+xml' ? 'Некоторые рисунки SVG не удалось прочитать и они пропущены.' : 'Некоторые векторные рисунки (EMF/WMF) не удалось прочитать и они пропущены.');
       return null;
     }
     const fonts: ({ key: FontKey; text: string }[] | null)[] = [];
@@ -437,7 +438,7 @@ export class PdfWriter {
         fonts.push(null);
         let img: PDFImage | null = null;
         try {
-          img = await this.pdf.embedPng(c.png);
+          img = c.png[0] === 0xff && c.png[1] === 0xd8 ? await this.pdf.embedJpg(c.png) : await this.pdf.embedPng(c.png);
         } catch {
           img = null;
         }
@@ -456,6 +457,7 @@ export class PdfWriter {
     const sx = o.w / m.width;
     const sy = o.h / m.height;
     page.pushOperators(pushGraphicsState(), rectangle(x, top - o.h, o.w, o.h), clip(), endPath(), concatTransformationMatrix(sx, 0, 0, sy, x, top));
+    let flowX = 0;
     m.cmds.forEach((c, i) => {
       if (c.k === 'path') {
         page.drawSvgPath(c.d, {
@@ -465,6 +467,8 @@ export class PdfWriter {
           borderColor: c.stroke ? rgb(...hexColor(c.stroke)) : undefined,
           borderWidth: c.stroke ? c.width : 0,
           borderDashArray: c.dash,
+          opacity: c.opacity !== undefined && c.opacity < 1 ? c.opacity : undefined,
+          borderOpacity: c.strokeOpacity !== undefined && c.strokeOpacity < 1 ? c.strokeOpacity : undefined,
         });
       } else if (c.k === 'image') {
         const img = o.imgs[i];
@@ -472,7 +476,8 @@ export class PdfWriter {
       } else {
         const segs = o.fonts[i] ?? [];
         const width = segs.reduce((s, sg) => s + this.fm.width(sg.key, sg.text, c.size), 0);
-        let cx = c.anchor === 'middle' ? c.x - width / 2 : c.anchor === 'end' ? c.x - width : c.x;
+        let cx = c.flow ? flowX : c.anchor === 'middle' ? c.x - width / 2 : c.anchor === 'end' ? c.x - width : c.x;
+        const startX = cx;
         const base = c.baseline === 'top' ? c.y + c.size * 0.88 : c.baseline === 'bottom' ? c.y - c.size * 0.21 : c.y;
         const rad = (c.angle * Math.PI) / 180;
         for (const sg of segs) {
@@ -483,6 +488,7 @@ export class PdfWriter {
           page.drawText(sg.text, { x: px, y: -py, size: c.size, font: this.fm.pdfFont(sg.key), color: rgb(...hexColor(c.color)), rotate: c.angle ? degrees(c.angle) : undefined });
           cx += this.fm.width(sg.key, sg.text, c.size);
         }
+        flowX = startX + width;
       }
     });
     page.pushOperators(popGraphicsState());
@@ -574,7 +580,7 @@ export class PdfWriter {
           boxes.push(...(await this.table(b, x, width, ctx, depth)));
           break;
         case 'image': {
-          if (b.mime === 'image/emf' || b.mime === 'image/wmf') {
+          if (b.mime === 'image/emf' || b.mime === 'image/wmf' || b.mime === 'image/svg+xml') {
             let w = (b.width * 72) / 96;
             let h = (b.height * 72) / 96;
             const maxH = this.contentBottom - this.contentTop - 20;
@@ -582,7 +588,7 @@ export class PdfWriter {
             w *= k;
             h *= k;
             const ix = w < width ? x + (width - w) / 2 : x;
-            const op = await this.metaOp(b.data, ix, 0, w, h);
+            const op = await this.metaOp(b.data, ix, 0, w, h, b.mime);
             if (op) boxes.push({ height: h, ops: [op], spaceBefore: 4, spaceAfter: 8 });
             break;
           }

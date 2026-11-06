@@ -10,7 +10,7 @@ import { familyOf, type FontFamily } from './model';
 import { bytesToBase64, escapeXml } from './util';
 
 export type MetaCmd =
-  | { k: 'path'; d: string; fill?: string; evenOdd: boolean; stroke?: string; width: number; dash?: number[] }
+  | { k: 'path'; d: string; fill?: string; evenOdd: boolean; stroke?: string; width: number; dash?: number[]; opacity?: number; strokeOpacity?: number }
   | {
       k: 'text';
       x: number;
@@ -25,6 +25,8 @@ export type MetaCmd =
       angle: number;
       anchor: 'start' | 'middle' | 'end';
       baseline: 'alphabetic' | 'top' | 'bottom';
+      /** Continue right after the previous text command (SVG tspans). */
+      flow?: boolean;
     }
   | { k: 'image'; x: number; y: number; w: number; h: number; png: Uint8Array };
 
@@ -1046,7 +1048,9 @@ export function metafileToSvg(m: Metafile): string {
   let body = '';
   for (const c of m.cmds) {
     if (c.k === 'path') {
-      body += `<path d="${c.d}" fill="${c.fill ? '#' + c.fill : 'none'}"${c.evenOdd ? ' fill-rule="evenodd"' : ''}${c.stroke ? ` stroke="#${c.stroke}" stroke-width="${f(c.width)}"${c.dash ? ` stroke-dasharray="${c.dash.map(f).join(' ')}"` : ''}` : ''}/>`;
+      body += `<path d="${c.d}" fill="${c.fill ? '#' + c.fill : 'none'}"${c.opacity !== undefined && c.opacity < 1 ? ` fill-opacity="${f(c.opacity)}"` : ''}${c.strokeOpacity !== undefined && c.strokeOpacity < 1 ? ` stroke-opacity="${f(c.strokeOpacity)}"` : ''}${c.evenOdd ? ' fill-rule="evenodd"' : ''}${c.stroke ? ` stroke="#${c.stroke}" stroke-width="${f(c.width)}"${c.dash ? ` stroke-dasharray="${c.dash.map(f).join(' ')}"` : ''}` : ''}/>`;
+    } else if (c.k === 'text' && c.flow && body.endsWith('</text>')) {
+      body = body.slice(0, -7) + `<tspan font-family="${SVG_FAMILY[c.family]}" font-size="${f(c.size)}"${c.bold ? ' font-weight="bold"' : ' font-weight="normal"'}${c.italic ? ' font-style="italic"' : ''} fill="#${c.color}">${escapeXml(c.text)}</tspan></text>`;
     } else if (c.k === 'text') {
       const rot = c.angle ? ` transform="rotate(${f(-c.angle)} ${f(c.x)} ${f(c.y)})"` : '';
       const base = c.baseline === 'top' ? ' dominant-baseline="text-before-edge"' : c.baseline === 'bottom' ? ' dominant-baseline="text-after-edge"' : '';

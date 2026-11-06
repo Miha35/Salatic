@@ -58,7 +58,7 @@ export function samplePng(w = 40, h = 20): Uint8Array {
   return Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, ...chunk('IHDR', [...u32(w), ...u32(h), 8, 2, 0, 0, 0]), ...chunk('IDAT', z), ...chunk('IEND', [])]);
 }
 
-export function makePptx(): Uint8Array {
+export function makePptx(chartXml?: string): Uint8Array {
   const theme =
     `<?xml version="1.0" encoding="UTF-8"?><a:theme ${NS} name="Office"><a:themeElements><a:clrScheme name="Office">` +
     '<a:dk1><a:sysClr val="windowText" lastClr="000000"/></a:dk1><a:lt1><a:sysClr val="window" lastClr="FFFFFF"/></a:lt1>' +
@@ -144,14 +144,15 @@ export function makePptx(): Uint8Array {
     `<?xml version="1.0" encoding="UTF-8"?><p:notes ${NS}>` + tree(sp(2, ph('body', 1), '', txBody(para('Не забыть про сроки')))) + '</p:notes>';
   const pres =
     `<?xml version="1.0" encoding="UTF-8"?><p:presentation ${NS}><p:sldMasterIdLst><p:sldMasterId id="2147483648" r:id="rId1"/></p:sldMasterIdLst>` +
-    '<p:sldIdLst><p:sldId id="256" r:id="rId2"/><p:sldId id="257" r:id="rId3"/><p:sldId id="258" r:id="rId4"/><p:sldId id="259" r:id="rId5"/></p:sldIdLst>' +
+    `<p:sldIdLst><p:sldId id="256" r:id="rId2"/><p:sldId id="257" r:id="rId3"/><p:sldId id="258" r:id="rId4"/><p:sldId id="259" r:id="rId5"/>${chartXml ? '<p:sldId id="260" r:id="rId7"/>' : ''}</p:sldIdLst>` +
     `<p:sldSz cx="${E(720)}" cy="${E(540)}"/><p:notesSz cx="6858000" cy="9144000"/></p:presentation>`;
   const ct =
     '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="png" ContentType="image/png"/>' +
     '<Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>' +
     '<Override PartName="/ppt/slideMasters/slideMaster1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideMaster+xml"/>' +
     [1, 2].map((i) => `<Override PartName="/ppt/slideLayouts/slideLayout${i}.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml"/>`).join('') +
-    [1, 2, 3, 4].map((i) => `<Override PartName="/ppt/slides/slide${i}.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>`).join('') +
+    (chartXml ? [1, 2, 3, 4, 5] : [1, 2, 3, 4]).map((i) => `<Override PartName="/ppt/slides/slide${i}.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>`).join('') +
+    (chartXml ? '<Override PartName="/ppt/charts/chart1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/>' : '') +
     '<Override PartName="/ppt/notesSlides/notesSlide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.notesSlide+xml"/>' +
     '<Override PartName="/ppt/theme/theme1.xml" ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/></Types>';
   return zipSync({
@@ -166,6 +167,7 @@ export function makePptx(): Uint8Array {
         ['rId4', 'slide', 'slides/slide3.xml'],
         ['rId5', 'slide', 'slides/slide4.xml'],
         ['rId6', 'theme', 'theme/theme1.xml'],
+        ...(chartXml ? [['rId7', 'slide', 'slides/slide5.xml'] as [string, string, string]] : []),
       ]),
     ),
     'ppt/theme/theme1.xml': strToU8(theme),
@@ -195,6 +197,26 @@ export function makePptx(): Uint8Array {
     'ppt/slides/slide3.xml': strToU8(slide3),
     'ppt/slides/_rels/slide3.xml.rels': strToU8(rels([['rId1', 'slideLayout', '../slideLayouts/slideLayout2.xml']])),
     'ppt/slides/slide4.xml': strToU8(slide4),
+    ...(chartXml
+      ? {
+          'ppt/slides/slide5.xml': strToU8(
+            `<?xml version="1.0" encoding="UTF-8"?><p:sld ${NS}>` +
+              tree(
+                sp(2, ph('title'), '', txBody(para('Слайд с диаграммой'))) +
+                  `<p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id="5" name="Chart"/><p:cNvGraphicFramePr/><p:nvPr/></p:nvGraphicFramePr><p:xfrm><a:off x="${E(60)}" y="${E(140)}"/><a:ext cx="${E(600)}" cy="${E(350)}"/></p:xfrm>` +
+                  '<a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" r:id="rId2"/></a:graphicData></a:graphic></p:graphicFrame>',
+              ) +
+              '<p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sld>',
+          ),
+          'ppt/slides/_rels/slide5.xml.rels': strToU8(
+            rels([
+              ['rId1', 'slideLayout', '../slideLayouts/slideLayout2.xml'],
+              ['rId2', 'chart', '../charts/chart1.xml'],
+            ]),
+          ),
+          'ppt/charts/chart1.xml': strToU8(chartXml),
+        }
+      : {}),
     'ppt/slides/_rels/slide4.xml.rels': strToU8(rels([['rId1', 'slideLayout', '../slideLayouts/slideLayout2.xml']])),
     'ppt/notesSlides/notesSlide1.xml': strToU8(notes),
     'ppt/media/image1.png': samplePng(),
