@@ -1,4 +1,5 @@
 /** PDF assembly: images → PDF, and page composition for the PDF editor (merge, reorder, rotate, annotate). */
+import { redactPage, type Rect, type RedactOptions } from './pdf-redact';
 import { concatTransformationMatrix, degrees, drawObject, LineCapStyle, PDFDocument, popGraphicsState, pushGraphicsState, rgb, type PDFImage, type PDFPage } from 'pdf-lib';
 import { FontManager, styleOf, type FontKey, type FontLoader } from './pdf-fonts';
 import type { FontFamily } from './model';
@@ -117,7 +118,11 @@ export async function overlayTextLayers(base: Uint8Array, layers: TextLayer[]): 
 /** Annotation coordinates are in PDF user space of the target page (already converted by the editor). */
 export type Annotation =
   | { type: 'text'; x: number; y: number; size: number; color: [number, number, number]; text: string; rotate: number; bold?: boolean; italic?: boolean; font?: FontFamily }
-  | { type: 'rect'; x: number; y: number; w: number; h: number; color: [number, number, number]; opacity: number; rotate: number }
+  | { type: 'rect'; x: number; y: number; w: number; h: number; color: [number, number, number]; opacity: number; rotate: number; /** also remove the page's text underneath (whiteout) */ erase?: boolean }
+  /** Redaction: text, graphics, image pixels and annotations underneath are removed, then the area is filled. */
+  | { type: 'redact'; x: number; y: number; w: number; h: number; color: [number, number, number]; rotate: number }
+  /** Remove the page's text in the area (editing existing text); `fallback` covers it if no text could be removed. */
+  | { type: 'erase'; x: number; y: number; w: number; h: number; rotate: number; fallback?: [number, number, number] }
   | { type: 'image'; x: number; y: number; w: number; h: number; data: Uint8Array; mime: 'image/png' | 'image/jpeg'; rotate: number }
   | { type: 'path'; points: [number, number][]; color: [number, number, number]; width: number; opacity: number };
 
@@ -135,7 +140,26 @@ export interface PageSpec {
 /** Font of a text annotation: family (sans by default) and style. */
 const textKey = (a: { font?: FontFamily; bold?: boolean; italic?: boolean }): FontKey => `${a.font ?? 'sans'}-${styleOf(!!a.bold, !!a.italic)}`;
 
-export async function composePdf(sources: Uint8Array[], pages: PageSpec[], fonts?: FontLoader, subsetter?: Subsetter): Promise<Uint8Array> {
+/** Axis-aligned area (user space) of a rectangle drawn at x, y rotated by `rotate` degrees around (x, y). */
+function areaOf(a: { x: number; y: number; w: number; h: number; rotate: number }): Rect {
+  const rad = (a.rotate * Math.PI) / 180;
+  const pts = [
+    [0, 0],
+    [a.w, 0],
+    [a.w, a.h],
+    [0, a.h],
+  ].map(([x, y]) => [a.x + x * Math.cos(rad) - y * Math.sin(rad), a.y + x * Math.sin(rad) + y * Math.cos(rad)]);
+  return { x0: Math.min(...pts.map((p) => p[0])), y0: Math.min(...pts.map((p) => p[1])), x1: Math.max(...pts.map((p) => p[0])), y1: Math.max(...pts.map((p) => p[1])) };
+}
+
+export interface ComposeOptions {
+  /** JPEG → RGBA decoder for redacting photos (browser: createImageBitmap). */
+  decodeJpeg?: RedactOptions['decodeJpeg'];
+  /** Collects warnings from redaction. */
+  warnings?: string[];
+}
+
+export async function composePdf(sources: Uint8Array[], pages: PageSpec[], fonts?: FontLoader, subsetter?: Subsetter, opts: ComposeOptions = {}): Promise<Uint8Array> {
   if (!pages.length) throw new ConvertError('В документе не осталось страниц.');
   const out = await PDFDocument.create();
   // Text annotations: fonts (with per-character fallback) are prepared and subset up front
@@ -212,8 +236,37 @@ export async function composePdf(sources: Uint8Array[], pages: PageSpec[], fonts
       page = out.addPage(list[k]);
     }
     if (spec.rotate) page.setRotation(degrees((((page.getRotation().angle + spec.rotate) % 360) + 360) % 360));
-    for (const a of spec.annotations ?? []) {
+    // Content removal first: redaction areas, then text under whiteout / edited text
+    const anns = spec.annotations ?? [];
+    const redactAreas = anns.filter((a): a is Extract<Annotation, { type: 'redact' }> => a.type === 'redact').map(areaOf);
+    const eraseAnns = anns.filter((a): a is Extract<Annotation, { type: 'erase' }> => a.type === 'erase');
+    const eraseAreas = [...eraseAnns, ...anns.filter((a): a is Extract<Annotation, { type: 'rect' }> => a.type === 'rect' && !!a.erase)].map(areaOf);
+    const removedIn = new Map<Extract<Annotation, { type: 'erase' }>, number>();
+    if (spec.src >= 0 && redactAreas.length) {
+      const r = await redactPage(out, page, redactAreas, { redact: true, decodeJpeg: opts.decodeJpeg });
+      opts.warnings?.push(...r.warnings);
+    }
+    if (spec.src >= 0 && eraseAreas.length) {
+      // one pass per edited-text area, so a failed removal can fall back to covering
+      for (const a of eraseAnns) {
+        const r = await redactPage(out, page, [areaOf(a)]);
+        removedIn.set(a, r.glyphs);
+        opts.warnings?.push(...r.warnings);
+      }
+      const rest = anns.filter((a): a is Extract<Annotation, { type: 'rect' }> => a.type === 'rect' && !!a.erase).map(areaOf);
+      if (rest.length) {
+        const r = await redactPage(out, page, rest);
+        opts.warnings?.push(...r.warnings);
+      }
+    }
+    for (const a of anns) {
       switch (a.type) {
+        case 'redact':
+          page.drawRectangle({ x: a.x, y: a.y, width: a.w, height: a.h, color: rgb(...a.color), rotate: degrees(a.rotate) });
+          break;
+        case 'erase':
+          if (a.fallback && !removedIn.get(a)) page.drawRectangle({ x: a.x, y: a.y, width: a.w, height: a.h, color: rgb(...a.fallback), rotate: degrees(a.rotate) });
+          break;
         case 'text': {
           const rad = (a.rotate * Math.PI) / 180;
           a.text.split('\n').forEach((line, i) => {

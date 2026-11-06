@@ -48,6 +48,7 @@ const ICONS: Record<string, string> = {
   type: '<path d="M5 6V4h14v2M12 4v16M9 20h6"/>',
   'edit-text': '<path d="M4 7V5h11v2M9.5 5v12M7 17h5"/><path d="m14 20 1-3 5-5a1.4 1.4 0 0 1 2 2l-5 5z"/>',
   square: '<rect x="4" y="4" width="16" height="16" rx="1"/>',
+  redact: '<rect x="3" y="9" width="18" height="6" rx="1" fill="currentColor"/><path d="M3 5h8M3 19h12M15 5h6M18 19h3"/>',
   eraser: '<path d="M8 20h12M5.5 13.5l7-7a2 2 0 0 1 2.8 0l2.2 2.2a2 2 0 0 1 0 2.8L11 18H8.5z"/>',
   highlighter: '<path d="m9 11 6 6M4 20h6l9.5-9.5a2.1 2.1 0 0 0-3-3L7 17z"/>',
   pen: '<path d="M4 20l4-1 11-11a2.1 2.1 0 0 0-3-3L5 16z"/>',

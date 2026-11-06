@@ -93,6 +93,18 @@ async function decodePages(bytes: Uint8Array, format: 'tiff' | 'heic'): Promise<
   return format === 'tiff' ? decodeTiff(bytes) : decodeHeic(bytes, heifWasm);
 }
 
+/** JPEG → RGBA with the browser's decoder (used to redact photos inside PDFs). */
+async function decodeJpeg(data: Uint8Array): Promise<{ width: number; height: number; rgba: Uint8Array } | null> {
+  if (typeof OffscreenCanvas === 'undefined' || typeof createImageBitmap === 'undefined') return null;
+  const bmp = await createImageBitmap(new Blob([data as BlobPart], { type: 'image/jpeg' }), { colorSpaceConversion: 'none', premultiplyAlpha: 'none' });
+  const canvas = new OffscreenCanvas(bmp.width, bmp.height);
+  const g = canvas.getContext('2d')!;
+  g.drawImage(bmp, 0, 0);
+  bmp.close();
+  const img = g.getImageData(0, 0, canvas.width, canvas.height);
+  return { width: img.width, height: img.height, rgba: new Uint8Array(img.data.buffer) };
+}
+
 async function transcodeImage(data: Uint8Array, mime: string): Promise<{ data: Uint8Array; mime: string } | null> {
   if (typeof OffscreenCanvas === 'undefined' || typeof createImageBitmap === 'undefined') return null;
   if (mime === 'image/tiff' || mime === 'image/heic' || mime === 'image/heif') {
@@ -190,7 +202,7 @@ async function handle(id: number, req: EngineRequest): Promise<{ result: unknown
     case 'composePdf': {
       const { composePdf } = await import('../../core/pdf-tools');
       const needsFonts = req.pages.some((p) => p.annotations?.some((a) => a.type === 'text'));
-      const data = await composePdf(req.sources, req.pages, loadFont, needsFonts ? await loadSubsetter() : undefined);
+      const data = await composePdf(req.sources, req.pages, loadFont, needsFonts ? await loadSubsetter() : undefined, { decodeJpeg });
       return { result: data, transfer: [data.buffer] };
     }
   }

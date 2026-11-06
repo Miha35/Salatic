@@ -19,6 +19,7 @@
   },
   "dependencies": {
     "@pdf-lib/fontkit": "^1.1.1",
+    "@pdf-lib/standard-fonts": "^1.0.0",
     "fflate": "^0.8.3",
     "harfbuzzjs": "1.6.4",
     "libheif-js": "1.23.5",

@@ -11,8 +11,8 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
-import { unzipSync } from 'fflate';
-import { PDFDocument } from 'pdf-lib';
+import { unzipSync, unzlibSync } from 'fflate';
+import { PDFDocument, PDFName, StandardFonts } from 'pdf-lib';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, '../..');
@@ -403,6 +403,70 @@ test('PDF editor: edit a line of the page text in place', async () => {
     const saved = await downloadFrom(page, () => page.locator('.toolbar').getByRole('button', { name: 'Сохранить PDF' }).click());
     const t = (await pdfText(saved.bytes))[0];
     expect(t.includes('Отчёт о продажах за 2025 год'), `new text in PDF: ${t.slice(0, 200)}`);
+    // the old heading is removed from the file, not just covered
+    expect(t.split('Отчёт о продажах').length - 1 === 1, `old heading still in the text layer: ${t.slice(0, 200)}`);
+  });
+});
+
+test('PDF editor: redaction removes text and photo pixels from the file', async () => {
+  await withPage(async (page) => {
+    // Fixture: a line of text and a JPEG photo (decoded for redaction by the browser in the worker)
+    await page.goto(`${BASE}/`);
+    // a copy: small Buffers share a pool (byteOffset ≠ 0), which pdf-lib's JPEG parser does not expect
+    const jpeg = new Uint8Array(Buffer.from(
+      await page.evaluate(() => {
+        const c = document.createElement('canvas');
+        c.width = 200;
+        c.height = 100;
+        const g = c.getContext('2d');
+        g.fillStyle = 'rgb(200,60,40)';
+        g.fillRect(0, 0, 200, 100);
+        return c.toDataURL('image/jpeg', 0.95).split(',')[1];
+      }),
+      'base64',
+    ));
+    const doc = await PDFDocument.create();
+    const font = await doc.embedFont(StandardFonts.Helvetica);
+    const pg = doc.addPage([400, 300]);
+    pg.drawText('Secret code 7755331 here', { x: 30, y: 250, size: 16, font });
+    pg.drawText('Public line stays', { x: 30, y: 210, size: 16, font });
+    pg.drawImage(await doc.embedJpg(jpeg), { x: 30, y: 40, width: 200, height: 100 });
+    writeFileSync(F('redact.pdf'), await doc.save());
+    const codeX = 30 + font.widthOfTextAtSize('Secret code ', 16);
+    const codeW = font.widthOfTextAtSize('7755331', 16);
+
+    await page.goto(`${BASE}/pdf-editor`);
+    await page.setInputFiles('.dropzone input[type=file]', F('redact.pdf'));
+    await page.waitForSelector('.page-card canvas');
+    await page.locator('.page-card').first().locator('button[aria-label="Редактировать страницу"]').click();
+    await page.waitForSelector('.page-stage canvas');
+    await page.click('button[aria-label="Скрыть данные (удалить из файла)"]');
+    const box = await page.locator('.page-stage canvas').first().boundingBox();
+    const k = box.width / 400;
+    const drag = async (x0, y0, x1, y1) => {
+      // PDF user space (y up) → screen
+      await page.mouse.move(box.x + x0 * k, box.y + (300 - y1) * k);
+      await page.mouse.down();
+      await page.mouse.move(box.x + x1 * k, box.y + (300 - y0) * k, { steps: 4 });
+      await page.mouse.up();
+    };
+    await drag(codeX - 2, 244, codeX + codeW + 2, 266);
+    await drag(20, 30, 130, 150); // the left half of the photo
+    expect((await page.$$('.page-stage svg g')).length === 2, 'two redaction boxes');
+    await page.getByRole('button', { name: 'К страницам' }).click();
+    const saved = await downloadFrom(page, () => page.locator('.toolbar').getByRole('button', { name: 'Сохранить PDF' }).click());
+    const t = (await pdfText(saved.bytes))[0];
+    expect(!t.includes('7755331') && t.includes('Secret code') && t.includes('here') && t.includes('Public line stays'), `text after redaction: ${t}`);
+    // the photo was decoded, its left half zeroed and stored losslessly
+    const out = await PDFDocument.load(saved.bytes);
+    const xo = out.getPage(0).node.Resources().lookup(PDFName.of('XObject'));
+    const img = xo.entries().map(([, r]) => out.context.lookup(r)).find((o) => o.dict?.lookup(PDFName.of('Subtype'))?.toString() === '/Image');
+    expect(img && img.dict.lookup(PDFName.of('Filter'))?.toString() === '/FlateDecode', `image filter ${img?.dict.lookup(PDFName.of('Filter'))}`);
+    const px = unzlibSync(img.getContents());
+    const at = (x, y) => [...px.subarray((y * 200 + x) * 3, (y * 200 + x) * 3 + 3)];
+    expect(at(20, 50).every((v) => v === 0), `redacted pixel ${at(20, 50)}`);
+    const keep = at(180, 50);
+    expect(Math.abs(keep[0] - 200) < 12 && Math.abs(keep[1] - 60) < 12 && Math.abs(keep[2] - 40) < 12, `kept pixel ${keep}`);
   });
 });
 

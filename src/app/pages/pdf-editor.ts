@@ -93,7 +93,7 @@ const cssFont = (a: { font?: FontFamily }): string => CSS_FAMILY[a.font ?? 'sans
 
 
 
-type Tool = 'select' | 'edittext' | 'text' | 'whiteout' | 'highlight' | 'pen' | 'image';
+type Tool = 'select' | 'edittext' | 'text' | 'whiteout' | 'redact' | 'highlight' | 'pen' | 'image';
 
 const A4: [number, number] = [595.28, 841.89];
 
@@ -145,9 +145,10 @@ function paintAnnotations(ctx: CanvasRenderingContext2D, vp: Viewport, anns: Ann
         ctx.fillStyle = rgbCss(a.color);
         ctx.font = `${a.italic ? 'italic ' : ''}${a.bold ? 700 : 400} ${a.size * s}px ${cssFont(a)}`;
         a.text.split('\n').forEach((line, i) => ctx.fillText(line, 0, i * a.size * 1.25 * s));
-      } else if (a.type === 'rect') {
-        ctx.globalAlpha = a.opacity;
-        ctx.fillStyle = rgbCss(a.color);
+      } else if (a.type === 'rect' || a.type === 'redact' || a.type === 'erase') {
+        // erase: the old text is removed on saving; the preview covers it with the background colour
+        ctx.globalAlpha = a.type === 'rect' ? a.opacity : 1;
+        ctx.fillStyle = rgbCss(a.type === 'erase' ? (a.fallback ?? [1, 1, 1]) : a.color);
         ctx.fillRect(0, -a.h * s, a.w * s, a.h * s);
       } else if (a.type === 'image') {
         const img = images.get(a.data);
@@ -503,6 +504,10 @@ export function mount(root: HTMLElement): () => void {
   // ------------------------------------------------------------------ page editor
   let tool: Tool = 'select';
   let color = '#d92d3a';
+  /** Fill of redaction boxes: black unless chosen while the redaction tool is active. */
+  let redactFill = '#000000';
+  let redactNoted = false;
+  const redactColor = (): string => redactFill;
   let fontSize = 14;
   let strokeWidth = 2;
   let zoom = 1.4;
@@ -554,13 +559,14 @@ export function mount(root: HTMLElement): () => void {
         selectedIdx = -1;
         void renderEditor();
       }, { 'aria-pressed': String(tool === t) });
-    const colorIn = h('input', { type: 'color', class: 'input', value: color, title: 'Цвет', 'aria-label': 'Цвет' });
+    const colorIn = h('input', { type: 'color', class: 'input', value: tool === 'redact' ? redactFill : color, title: tool === 'redact' ? 'Цвет закраски' : 'Цвет', 'aria-label': 'Цвет' });
     colorIn.addEventListener('input', () => {
-      color = colorIn.value;
+      if (tool === 'redact') redactFill = colorIn.value;
+      else color = colorIn.value;
       const a = editing?.annotations[selectedIdx];
-      if (a && a.type !== 'image' && !(a.type === 'rect' && a.opacity === 1 && tool === 'whiteout')) {
+      if (a && a.type !== 'image' && a.type !== 'erase' && !(a.type === 'rect' && a.opacity === 1 && tool === 'whiteout')) {
         snapshot();
-        a.color = hexToRgb(color);
+        a.color = hexToRgb(colorIn.value);
         drawOverlay();
       }
     });
@@ -588,6 +594,7 @@ export function mount(root: HTMLElement): () => void {
       toolBtn('edittext', 'edit-text', 'Править текст страницы'),
       toolBtn('text', 'type', 'Добавить текст'),
       toolBtn('whiteout', 'eraser', 'Закрасить (замазка)'),
+      toolBtn('redact', 'redact', 'Скрыть данные (удалить из файла)'),
       toolBtn('highlight', 'highlighter', 'Выделить маркером'),
       toolBtn('pen', 'pen', 'Рисовать'),
       iconButton('image-plus', 'Вставить изображение или подпись', () => void addImage()),
@@ -609,9 +616,10 @@ export function mount(root: HTMLElement): () => void {
           ? 'На пустой странице нет текста для правки — используйте «Добавить текст».'
           : rot !== 0
             ? 'Правка текста доступна на неповёрнутых страницах: верните поворот страницы к 0°.'
-            : 'Нажмите на строку текста страницы, исправьте её и нажмите Ctrl+Enter или щёлкните вне поля. Старая строка закрывается цветом фона, новая подбирает шрифт, размер и цвет.',
+            : 'Нажмите на строку текста страницы, исправьте её и нажмите Ctrl+Enter или щёлкните вне поля. Старая строка удаляется из файла, новая подбирает шрифт, размер и цвет.',
       text: 'Нажмите на страницу, введите текст. Ctrl+Enter или щелчок вне поля — готово.',
-      whiteout: 'Протяните прямоугольник, чтобы закрыть часть страницы белым (или выбранным) цветом.',
+      whiteout: 'Протяните прямоугольник, чтобы закрыть часть страницы белым (или выбранным) цветом. Текст под ним удаляется из файла.',
+      redact: 'Протяните прямоугольник над конфиденциальными данными: текст, графика, фрагменты изображений и ссылки под ним будут удалены из файла безвозвратно, а область закрашена (цвет — в палитре).',
       highlight: 'Протяните прямоугольник поверх текста, чтобы выделить его маркером.',
       pen: 'Рисуйте мышью, пером или пальцем.',
       image: '',
@@ -814,6 +822,10 @@ export function mount(root: HTMLElement): () => void {
           });
           g.append(t);
         } else if (a.type === 'rect') g.append(svgEl('rect', { x: 0, y: -a.h * s, width: a.w * s, height: a.h * s, fill: rgbCss(a.color), opacity: a.opacity }));
+        else if (a.type === 'redact') {
+          g.append(svgEl('rect', { x: 0, y: -a.h * s, width: a.w * s, height: a.h * s, fill: rgbCss(a.color) }));
+          g.append(svgEl('rect', { x: 0.75, y: -a.h * s + 0.75, width: Math.max(0, a.w * s - 1.5), height: Math.max(0, a.h * s - 1.5), fill: 'none', stroke: '#ef4444', 'stroke-width': 1.5, 'stroke-dasharray': '6 3', 'pointer-events': 'none' }));
+        } else if (a.type === 'erase') g.append(svgEl('rect', { x: 0, y: -a.h * s, width: a.w * s, height: a.h * s, fill: rgbCss(a.fallback ?? [1, 1, 1]) }));
         else if (a.type === 'image') {
           const img = imageCache.get(a.data);
           g.append(svgEl('image', { x: 0, y: -a.h * s, width: a.w * s, height: a.h * s, href: img?.src ?? '', preserveAspectRatio: 'none' }));
@@ -841,7 +853,7 @@ export function mount(root: HTMLElement): () => void {
       if (box) {
         svg.append(svgEl('rect', { x: box.x - 3, y: box.y - 3, width: box.w + 6, height: box.h + 6, fill: 'none', stroke: '#4f46e5', 'stroke-width': 1.5, 'stroke-dasharray': '5 4', 'pointer-events': 'none' }));
         const aligned = sel.type !== 'path' && normRot(vp.rotation - sel.rotate) === 0;
-        if (aligned && (sel.type === 'rect' || sel.type === 'image')) {
+        if (aligned && (sel.type === 'rect' || sel.type === 'redact' || sel.type === 'image')) {
           const handle = svgEl('rect', { x: box.x + box.w - 6, y: box.y + box.h - 6, width: 12, height: 12, fill: '#fff', stroke: '#4f46e5', 'stroke-width': 1.5, 'data-handle': 'se' });
           handle.style.cursor = 'nwse-resize';
           svg.append(handle);
@@ -900,8 +912,8 @@ export function mount(root: HTMLElement): () => void {
           drawOverlay();
           refreshToolbarState();
         }
-      } else if (tool === 'whiteout' || tool === 'highlight') {
-        const temp = svgEl('rect', { x: pt[0], y: pt[1], width: 0, height: 0, fill: tool === 'whiteout' ? color : '#ffe94d', opacity: tool === 'whiteout' ? 1 : 0.4, stroke: '#4f46e5', 'stroke-dasharray': '4 3' });
+      } else if (tool === 'whiteout' || tool === 'highlight' || tool === 'redact') {
+        const temp = svgEl('rect', { x: pt[0], y: pt[1], width: 0, height: 0, fill: tool === 'highlight' ? '#ffe94d' : tool === 'redact' ? redactColor() : color, opacity: tool === 'highlight' ? 0.4 : 1, stroke: tool === 'redact' ? '#ef4444' : '#4f46e5', 'stroke-dasharray': '4 3' });
         svg!.append(temp);
         action = { kind: 'rect', start: pt, temp };
       } else if (tool === 'pen') {
@@ -928,7 +940,7 @@ export function mount(root: HTMLElement): () => void {
       } else if (action.kind === 'move' && action.orig) {
         editing.annotations[selectedIdx] = shifted(action.orig, dx, dy);
         drawOverlay();
-      } else if (action.kind === 'resize' && action.orig && (action.orig.type === 'rect' || action.orig.type === 'image')) {
+      } else if (action.kind === 'resize' && action.orig && (action.orig.type === 'rect' || action.orig.type === 'redact' || action.orig.type === 'image')) {
         const o = action.orig;
         const s = viewport.scale;
         const [px, py] = viewport.toView(o.x, o.y);
@@ -956,7 +968,13 @@ export function mount(root: HTMLElement): () => void {
           snapshot();
           const [px, py] = vp.toPdf(x, y + hh);
           const highlight = tool === 'highlight';
-          editing.annotations.push({ type: 'rect', x: px, y: py, w: w / vp.scale, h: hh / vp.scale, color: highlight ? hexToRgb('#ffe94d') : hexToRgb(color), opacity: highlight ? 0.4 : 1, rotate: vp.rotation });
+          if (tool === 'redact') {
+            editing.annotations.push({ type: 'redact', x: px, y: py, w: w / vp.scale, h: hh / vp.scale, color: hexToRgb(redactColor()), rotate: vp.rotation });
+            if (!redactNoted) {
+              redactNoted = true;
+              toast('Данные под чёрными областями будут удалены из PDF при сохранении. Проверьте результат перед отправкой.');
+            }
+          } else editing.annotations.push({ type: 'rect', x: px, y: py, w: w / vp.scale, h: hh / vp.scale, color: highlight ? hexToRgb('#ffe94d') : hexToRgb(color), opacity: highlight ? 0.4 : 1, rotate: vp.rotation, ...(highlight ? {} : { erase: true }) });
         }
       } else if (action.kind === 'pen' && action.points && action.points.length > 1) {
         snapshot();
@@ -1058,12 +1076,12 @@ export function mount(root: HTMLElement): () => void {
     const text = ta.value.replace(/\s+$/, '');
     ta.remove();
     if (meta.replace) {
-      // Editing the page's own text: cover the old line, write the new one in its place
+      // Editing the page's own text: remove the old line from the page, write the new one in its place
       const seg = meta.replace.seg;
       if (text !== seg.text) {
         snapshot();
         const pad = seg.size * 0.08;
-        editing.annotations.push({ type: 'rect', x: seg.x - pad, y: seg.y - seg.size * 0.26, w: seg.w + 2 * pad, h: seg.size * 1.2, color: meta.replace.bg, opacity: 1, rotate: viewport.rotation });
+        editing.annotations.push({ type: 'erase', x: seg.x - pad, y: seg.y - seg.size * 0.26, w: seg.w + 2 * pad, h: seg.size * 1.2, fallback: meta.replace.bg, rotate: viewport.rotation });
         if (text) editing.annotations.push({ type: 'text', x: seg.x, y: seg.y, size: meta.size, color: meta.color, text, rotate: viewport.rotation, bold: meta.bold, italic: meta.italic, font: meta.font });
         // The page is not reflowed: warn when the new text runs into the text that follows it
         const ctx = document.createElement('canvas').getContext('2d');
