@@ -40,7 +40,7 @@ export function mount(root: HTMLElement): () => void {
     role: 'textbox',
     'aria-multiline': 'true',
     'aria-label': 'Текст документа',
-    'data-placeholder': 'Начните печатать или откройте файл (DOCX, PDF, Markdown, HTML, TXT)…',
+    'data-placeholder': 'Начните печатать или откройте файл (Word, PDF, ODT, RTF, EPUB, Markdown, HTML, TXT)…',
   });
   const titleInput = h('input', { class: 'input', value: draft?.title ?? 'Документ', placeholder: 'Название файла', 'aria-label': 'Название документа', style: 'min-width:0;flex:1;max-width:320px' });
   const statusLeft = h('span');
@@ -269,7 +269,7 @@ export function mount(root: HTMLElement): () => void {
   }
 
   root.append(
-    h('div', { class: 'page-head' }, h('h1', null, 'Редактор документов'), h('p', null, 'Откройте Word, PDF, Markdown, HTML или текст, отредактируйте и сохраните в нужном формате. Черновик сохраняется автоматически в этом браузере.')),
+    h('div', { class: 'page-head' }, h('h1', null, 'Редактор документов'), h('p', null, 'Откройте Word (DOCX/DOC), PDF, ODT, RTF, EPUB, презентацию, Markdown или HTML, отредактируйте и сохраните в нужном формате. Черновик сохраняется автоматически в этом браузере.')),
     toolbar,
     banner,
     h('div', { class: 'row', style: 'margin-top:12px' }, h('label', { class: 'sr-only', for: 'doc-title' }, 'Название'), Object.assign(titleInput, { id: 'doc-title' })),

@@ -532,11 +532,32 @@ input[type='range'] {
   pointer-events: none;
 }
 
+.presets {
+  display: grid;
+  gap: 10px;
+  margin: 18px 0 0;
+}
+
+.presets__row {
+  display: grid;
+  grid-template-columns: 110px minmax(0, 1fr);
+  align-items: start;
+  gap: 12px;
+}
+
+.presets__label {
+  padding-top: 7px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
 .chips {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
-  margin: 16px 0 0;
 }
 
 .chip {
@@ -1340,6 +1361,28 @@ dialog::backdrop {
 
   .toolbar {
     top: 56px;
+    /* one scrollable row: the page itself stays visible on phones */
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    scrollbar-width: thin;
+  }
+
+  .toolbar > * {
+    flex: none;
+  }
+
+  .toolbar__spacer {
+    flex: 1 0 8px;
+  }
+
+  .presets__row {
+    grid-template-columns: 1fr;
+    gap: 6px;
+  }
+
+  .presets__label {
+    padding-top: 0;
   }
 
   .pages {

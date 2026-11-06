@@ -99,7 +99,7 @@ export function mount(root: HTMLElement): () => void {
   const workspace = h('div', { class: 'workspace', hidden: true }, toolbar, h('div', { class: 'img-layout' }, stage, panel));
 
   root.append(
-    h('div', { class: 'page-head' }, h('h1', null, 'Редактор изображений'), h('p', null, 'Обрезка, поворот, изменение размера, цветокоррекция, рисование и надписи. Всё выполняется в браузере.')),
+    h('div', { class: 'page-head' }, h('h1', null, 'Редактор изображений'), h('p', null, 'Обрезка, поворот, изменение размера, цветокоррекция, рисование и надписи. Открывает и фото HEIC, и TIFF. Всё выполняется в браузере.')),
     empty,
     workspace,
   );

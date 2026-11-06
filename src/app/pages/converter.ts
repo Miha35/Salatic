@@ -39,26 +39,49 @@ interface Item {
   el: HTMLElement;
 }
 
-const POPULAR: { label: string; from: FormatId[]; to: FormatId }[] = [
-  { label: 'PDF → Word', from: ['pdf'], to: 'docx' },
-  { label: 'Word → PDF', from: ['docx'], to: 'pdf' },
-  { label: 'JPG → PDF', from: ['jpg', 'png'], to: 'pdf' },
-  { label: 'PDF → JPG', from: ['pdf'], to: 'jpg' },
-  { label: 'PNG → JPG', from: ['png'], to: 'jpg' },
-  { label: 'WebP → PNG', from: ['webp'], to: 'png' },
-  { label: 'Excel → CSV', from: ['xlsx'], to: 'csv' },
-  { label: 'CSV → Excel', from: ['csv'], to: 'xlsx' },
-  { label: 'Word → Markdown', from: ['docx'], to: 'md' },
-  { label: 'Markdown → PDF', from: ['md'], to: 'pdf' },
-  { label: 'HTML → Word', from: ['html'], to: 'docx' },
-  { label: 'JSON → Excel', from: ['json'], to: 'xlsx' },
-  { label: 'DOC → DOCX', from: ['doc'], to: 'docx' },
-  { label: 'XLS → XLSX', from: ['xls'], to: 'xlsx' },
-  { label: 'ODT → Word', from: ['odt'], to: 'docx' },
-  { label: 'RTF → Word', from: ['rtf'], to: 'docx' },
-  { label: 'PowerPoint → PDF', from: ['pptx'], to: 'pdf' },
-  { label: 'EPUB → PDF', from: ['epub'], to: 'pdf' },
-  { label: 'Word → EPUB', from: ['docx'], to: 'epub' },
+const POPULAR: { group: string; items: { label: string; from: FormatId[]; to: FormatId }[] }[] = [
+  {
+    group: 'PDF',
+    items: [
+      { label: 'PDF → Word', from: ['pdf'], to: 'docx' },
+      { label: 'Word → PDF', from: ['docx'], to: 'pdf' },
+      { label: 'JPG → PDF', from: ['jpg', 'png'], to: 'pdf' },
+      { label: 'PDF → JPG', from: ['pdf'], to: 'jpg' },
+      { label: 'PowerPoint → PDF', from: ['pptx'], to: 'pdf' },
+      { label: 'Скан → PDF с текстом', from: ['pdf'], to: 'pdf' },
+    ],
+  },
+  {
+    group: 'Документы',
+    items: [
+      { label: 'DOC → DOCX', from: ['doc'], to: 'docx' },
+      { label: 'ODT → Word', from: ['odt'], to: 'docx' },
+      { label: 'RTF → Word', from: ['rtf'], to: 'docx' },
+      { label: 'Word → Markdown', from: ['docx'], to: 'md' },
+      { label: 'Markdown → PDF', from: ['md'], to: 'pdf' },
+      { label: 'HTML → Word', from: ['html'], to: 'docx' },
+      { label: 'Word → EPUB', from: ['docx'], to: 'epub' },
+      { label: 'EPUB → PDF', from: ['epub'], to: 'pdf' },
+    ],
+  },
+  {
+    group: 'Таблицы',
+    items: [
+      { label: 'Excel → CSV', from: ['xlsx'], to: 'csv' },
+      { label: 'CSV → Excel', from: ['csv'], to: 'xlsx' },
+      { label: 'XLS → XLSX', from: ['xls'], to: 'xlsx' },
+      { label: 'JSON → Excel', from: ['json'], to: 'xlsx' },
+    ],
+  },
+  {
+    group: 'Изображения',
+    items: [
+      { label: 'HEIC → JPG', from: ['heic'], to: 'jpg' },
+      { label: 'PNG → JPG', from: ['png'], to: 'jpg' },
+      { label: 'WebP → PNG', from: ['webp'], to: 'png' },
+      { label: 'TIFF → PDF', from: ['tiff'], to: 'pdf' },
+    ],
+  },
 ];
 
 const DEFAULT_TARGET: Partial<Record<FormatId, FormatId>> = {
@@ -107,39 +130,39 @@ export function mount(root: HTMLElement, params: URLSearchParams): () => void {
   let preferred: FormatId | null = urlTo && FORMATS[urlTo] ? urlTo : null;
 
   // ------------------------------------------------------------------ layout
+  const chip = (p: (typeof POPULAR)[number]['items'][number]): HTMLElement =>
+    h(
+      'button',
+      {
+        type: 'button',
+        class: 'chip',
+        'aria-pressed': String(preferred === p.to && params.get('from') === p.from[0]),
+        onclick: (e: MouseEvent) => {
+          const btn = e.currentTarget as HTMLButtonElement;
+          const on = btn.getAttribute('aria-pressed') !== 'true';
+          chips.querySelectorAll('.chip').forEach((c) => c.setAttribute('aria-pressed', 'false'));
+          btn.setAttribute('aria-pressed', String(on));
+          preferred = on ? p.to : null;
+          history.replaceState(null, '', on ? `/?from=${p.from[0]}&to=${p.to}` : '/');
+          // Apply to files that are waiting
+          for (const it of items) {
+            if (on && it.format && p.from.includes(it.format) && it.status !== 'working') setTarget(it, p.to);
+          }
+          if (on && !items.length) zone.click();
+        },
+      },
+      p.label,
+    );
   const chips = h(
     'div',
-    { class: 'chips', role: 'group', 'aria-label': 'Популярные преобразования' },
-    POPULAR.map((p) =>
-      h(
-        'button',
-        {
-          type: 'button',
-          class: 'chip',
-          'aria-pressed': String(preferred === p.to && params.get('from') === p.from[0]),
-          onclick: (e: MouseEvent) => {
-            const btn = e.currentTarget as HTMLButtonElement;
-            const on = btn.getAttribute('aria-pressed') !== 'true';
-            chips.querySelectorAll('.chip').forEach((c) => c.setAttribute('aria-pressed', 'false'));
-            btn.setAttribute('aria-pressed', String(on));
-            preferred = on ? p.to : null;
-            history.replaceState(null, '', on ? `/?from=${p.from[0]}&to=${p.to}` : '/');
-            // Apply to files that are waiting
-            for (const it of items) {
-              if (on && it.format && p.from.includes(it.format) && it.status !== 'working') setTarget(it, p.to);
-            }
-            if (on && !items.length) zone.click();
-          },
-        },
-        p.label,
-      ),
-    ),
+    { class: 'presets', role: 'group', 'aria-label': 'Популярные преобразования' },
+    POPULAR.map((g) => h('div', { class: 'presets__row' }, h('span', { class: 'presets__label' }, g.group), h('div', { class: 'chips' }, g.items.map(chip)))),
   );
 
   const zone = dropzone({
     accept: ACCEPT,
     title: 'Перетащите файлы сюда или нажмите, чтобы выбрать',
-    hint: 'PDF, Word (DOCX/DOC), Excel (XLSX/XLS), PowerPoint, OpenDocument, RTF, EPUB, CSV, JSON, Markdown, HTML, TXT, JPG, PNG, WebP, GIF, SVG и другие · можно вставить из буфера (Ctrl+V)',
+    hint: 'PDF, Word (DOCX/DOC), Excel (XLSX/XLS), PowerPoint, OpenDocument, RTF, EPUB, CSV, JSON, Markdown, HTML, TXT, JPG, PNG, HEIC, TIFF, WebP, SVG и другие · можно вставить из буфера (Ctrl+V)',
     onFiles: addFiles,
   });
   onPasteFiles(root, addFiles);
@@ -152,7 +175,7 @@ export function mount(root: HTMLElement, params: URLSearchParams): () => void {
       'div',
       { class: 'page-head' },
       h('h1', null, 'Конвертер файлов'),
-      h('p', null, 'Быстро и приватно: файлы обрабатываются прямо в вашем браузере и никуда не загружаются. PDF в Word, Word в PDF, изображения, таблицы и текстовые форматы.'),
+      h('p', null, 'Быстро и приватно: файлы обрабатываются прямо в вашем браузере и никуда не загружаются. Документы, PDF и сканы, таблицы, презентации, электронные книги и изображения — более 30 форматов.'),
     ),
     zone,
     chips,
@@ -161,9 +184,9 @@ export function mount(root: HTMLElement, params: URLSearchParams): () => void {
     h(
       'section',
       { class: 'features', 'aria-label': 'Возможности' },
-      feature('Редактор PDF', 'Объединяйте, переставляйте, поворачивайте и удаляйте страницы, добавляйте текст, подписи, выделения и пометки.', '/pdf-editor'),
-      feature('Редактор изображений', 'Обрезка, поворот, изменение размера, яркость и контраст, рисование и текст, экспорт в JPG/PNG/WebP.', '/image-editor'),
-      feature('Редактор документов', 'Откройте DOCX, PDF, Markdown или HTML, отредактируйте и сохраните в Word, PDF и другие форматы.', '/doc-editor'),
+      feature('Редактор PDF', 'Исправляйте текст прямо на странице, объединяйте и переставляйте страницы, добавляйте подписи и пометки. Открывает и защищённые паролем PDF.', '/pdf-editor'),
+      feature('Редактор изображений', 'Обрезка, поворот, размер, яркость и контраст, рисование и текст. Открывает фото HEIC и TIFF, сохраняет в JPG, PNG, WebP и другие.', '/image-editor'),
+      feature('Редактор документов', 'Откройте Word, PDF, ODT, RTF, EPUB или презентацию, отредактируйте и сохраните в Word, PDF, ODT, RTF и другие форматы.', '/doc-editor'),
       h('div', { class: 'feature card' }, h('h3', null, 'Конфиденциально'), h('p', null, 'Преобразование выполняется локально на вашем устройстве. Файлы не отправляются на сервер и не сохраняются.')),
     ),
   );
