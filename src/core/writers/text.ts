@@ -360,9 +360,22 @@ function blocksHtml(blocks: Block[], notes: Notes, ctx: HtmlCtx = HTML): string 
         }
         s += '</table>\n';
         break;
-      case 'image':
-        s += `<p><img src="${ctx.imageSrc ? escapeHtml(ctx.imageSrc(b)) : dataUri(b)}" width="${b.width}" height="${b.height}" alt="${escapeHtml(b.alt ?? '')}"${ctx.sources && b.chart ? ` data-chart="${escapeHtml(JSON.stringify(b.chart))}"` : ''}${ctx.xhtml ? '/' : ''}></p>\n`;
+      case 'image': {
+        // a floating picture: CSS float to its side (text around it), its placement kept in data-float
+        const f = b.float;
+        let css = '';
+        let pAttr = '';
+        if (f) {
+          const [t, r, bt, l] = (f.dist ?? [0, 9, 0, 9]).map(num);
+          const side = f.h.align === 'right' || f.h.align === 'outside' ? 'right' : f.h.align === 'center' ? 'center' : f.h.align ? 'left' : (f.h.offset ?? 0) > 200 ? 'right' : 'left';
+          if (f.wrap === 'square' && side !== 'center') css = ` style="float:${side};margin:${t}pt ${r}pt ${bt}pt ${l}pt"`;
+          else if (side !== 'left') pAttr = ` style="text-align:${side}"`;
+          pAttr += ' class="doc-float"';
+        }
+        const data = f ? ` data-float="${escapeHtml(JSON.stringify(f))}"` : '';
+        s += `<p${pAttr}><img src="${ctx.imageSrc ? escapeHtml(ctx.imageSrc(b)) : dataUri(b)}" width="${b.width}" height="${b.height}" alt="${escapeHtml(b.alt ?? '')}"${css}${data}${ctx.sources && b.chart ? ` data-chart="${escapeHtml(JSON.stringify(b.chart))}"` : ''}${ctx.xhtml ? '/' : ''}></p>\n`;
         break;
+      }
       case 'code':
         s += `<pre><code>${escapeHtml(b.text)}</code></pre>\n`;
         break;

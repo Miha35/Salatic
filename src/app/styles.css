@@ -1120,6 +1120,14 @@ input[type='range'] {
   height: auto;
 }
 
+/* Floating pictures (Word anchors, CSS floats): the paragraph holding one takes no room of its own */
+.doc-page p.doc-float {
+  margin: 0;
+}
+.doc-page img[style*='float'] {
+  max-width: 60%;
+}
+
 .doc-page table {
   border-collapse: collapse;
   width: 100%;

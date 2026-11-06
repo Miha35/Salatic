@@ -77,6 +77,53 @@ export function gradientAverage(g: Gradient): string {
   return acc.map((v) => Math.round(v / total).toString(16).padStart(2, '0')).join('').toUpperCase();
 }
 
+/**
+ * A floating picture (Word's wp:anchor, an ODF frame, a CSS float). `square`: text flows beside it;
+ * `topBottom`: nothing beside it; `none`: placed without moving the text, in front of it or behind it.
+ * Positions are in points from the frame named by `from`; `paragraph`/`line` mean where it is anchored.
+ */
+export interface ImageFloat {
+  wrap: 'square' | 'topBottom' | 'none';
+  behind?: boolean;
+  /** square: the sides text flows on (both/largest: the wider one) */
+  side?: 'both' | 'left' | 'right' | 'largest';
+  h: { from: 'page' | 'margin' | 'column' | 'character' | 'leftMargin' | 'rightMargin'; align?: 'left' | 'center' | 'right' | 'inside' | 'outside'; offset?: number };
+  v: { from: 'page' | 'margin' | 'paragraph' | 'line' | 'topMargin' | 'bottomMargin'; align?: 'top' | 'center' | 'bottom' | 'inside' | 'outside'; offset?: number };
+  /** Distance kept from the text: top, right, bottom, left (pt) */
+  dist?: [number, number, number, number];
+}
+
+const FLOAT_H = ['page', 'margin', 'column', 'character', 'leftMargin', 'rightMargin'];
+const FLOAT_V = ['page', 'margin', 'paragraph', 'line', 'topMargin', 'bottomMargin'];
+const FLOAT_HA = ['left', 'center', 'right', 'inside', 'outside'];
+const FLOAT_VA = ['top', 'center', 'bottom', 'inside', 'outside'];
+
+/** A float description from untrusted data (an editor attribute), or undefined when it is not one. */
+export function sanitizeFloat(v: unknown): ImageFloat | undefined {
+  if (!v || typeof v !== 'object') return undefined;
+  const o = v as Record<string, unknown>;
+  const fin = (x: unknown): number | undefined => (typeof x === 'number' && Number.isFinite(x) && Math.abs(x) < 1e5 ? x : undefined);
+  const axis = (a: unknown, froms: string[], aligns: string[], def: string): { from: string; align?: string; offset?: number } => {
+    const r = a && typeof a === 'object' ? (a as Record<string, unknown>) : {};
+    const from = typeof r.from === 'string' && froms.includes(r.from) ? r.from : def;
+    const align = typeof r.align === 'string' && aligns.includes(r.align) ? r.align : undefined;
+    const offset = fin(r.offset);
+    return { from, ...(align ? { align } : {}), ...(offset !== undefined ? { offset } : {}) };
+  };
+  const wrap = o.wrap === 'square' || o.wrap === 'topBottom' || o.wrap === 'none' ? o.wrap : undefined;
+  if (!wrap) return undefined;
+  const side = o.side === 'both' || o.side === 'left' || o.side === 'right' || o.side === 'largest' ? o.side : undefined;
+  const dist = Array.isArray(o.dist) && o.dist.length === 4 && o.dist.every((x) => fin(x) !== undefined && (x as number) >= 0) ? (o.dist as [number, number, number, number]) : undefined;
+  return {
+    wrap,
+    ...(o.behind === true ? { behind: true } : {}),
+    ...(side ? { side } : {}),
+    h: axis(o.h, FLOAT_H, FLOAT_HA, 'column') as ImageFloat['h'],
+    v: axis(o.v, FLOAT_V, FLOAT_VA, 'paragraph') as ImageFloat['v'],
+    ...(dist ? { dist } : {}),
+  };
+}
+
 export interface ChartSource {
   xml: string;
   /** Theme colour scheme the chart resolves scheme colours against (dk1, lt1, accent1…). */
@@ -148,7 +195,7 @@ export type Block =
   | { type: 'list'; ordered: boolean; items: ListItem[]; start?: number }
   | { type: 'table'; rows: TableRow[] }
   /** width/height are the intended display size in CSS pixels (96 dpi). */
-  | { type: 'image'; data: Uint8Array; mime: string; width: number; height: number; alt?: string; /** Source Office chart part (c:chartSpace XML) and its theme colours; `data` holds its SVG rendering. */ chart?: ChartSource }
+  | { type: 'image'; data: Uint8Array; mime: string; width: number; height: number; alt?: string; /** Source Office chart part (c:chartSpace XML) and its theme colours; `data` holds its SVG rendering. */ chart?: ChartSource; /** A floating picture: where it goes and how text flows around it */ float?: ImageFloat }
   | { type: 'code'; text: string }
   | { type: 'quote'; blocks: Block[] }
   | { type: 'hr' }

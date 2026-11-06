@@ -4,7 +4,7 @@
  * (default style → named styles → automatic styles) the way office suites do.
  */
 import { unzipSync } from 'fflate';
-import { familyOf, normalizeRuns, normalizeSections, trimRuns, type Align, type Block, type CellValue, type Doc, type FontFamily, type ListItem, type PageSetup, type ParaFormat, type Sheet, type TableRow, type TextRun, type Workbook } from '../model';
+import { familyOf, normalizeRuns, normalizeSections, trimRuns, type Align, type Block, type CellValue, type Doc, type FontFamily, type ImageFloat, type ListItem, type PageSetup, type ParaFormat, type Sheet, type TableRow, type TextRun, type Workbook } from '../model';
 import { childrenNamed, elements, find, parseXml, textContent, type XNode } from '../xml';
 import { base64ToBytes, ConvertError, imageSize, sniffImageMime, unzipOffice } from '../util';
 
@@ -65,6 +65,8 @@ interface OdfStyle {
   listStyle?: string;
   pageLayout?: string;
   masterPage?: string;
+  /** style:graphic-properties (frames: wrapping, position, margins) */
+  graphic?: Record<string, string>;
   /** Section columns (style:section-properties) */
   columns?: { count: number; gap: number; sep: boolean; rel?: number[]; starts?: number[]; ends?: number[] };
 }
@@ -151,6 +153,8 @@ class OdfStyles {
           listStyle: el.attrs['style:list-style-name'],
           masterPage: el.attrs['style:master-page-name'] || undefined,
         };
+        const gp = find(el, 'style:graphic-properties');
+        if (gp) st.graphic = { ...gp.attrs };
         const cols = find(find(el, 'style:section-properties'), 'style:columns');
         const count = +(cols?.attrs['fo:column-count'] ?? 1);
         if (count > 1) {
@@ -522,14 +526,19 @@ class OdtReader {
       } else out.push(b);
     };
     let hadBlock = false;
+    const start = out.length;
+    const floats: Block[] = [];
     for (const it of items) {
-      if (isBlock(it)) {
+      if (isBlock(it) && it.type === 'image' && it.float) floats.push(it);
+      else if (isBlock(it)) {
         flush(false);
         out.push(it);
         hadBlock = true;
       } else runs.push(it);
     }
-    flush(!emitted && !hadBlock);
+    flush(!emitted && !hadBlock && !floats.length);
+    // floating frames before the paragraph they are anchored in: its text flows around them
+    if (floats.length) out.splice(start, 0, ...floats);
     if (p.breakAfter) out.push({ type: 'pagebreak' });
   }
 
@@ -662,7 +671,36 @@ class OdtReader {
       height = sz.height;
     }
     const alt = textContent(childrenNamed(frame, 'svg:title')[0] ?? childrenNamed(frame, 'svg:desc')[0]).trim() || frame.attrs['draw:name'] || undefined;
-    return { type: 'image', data, mime, width: Math.round(width), height: Math.round(height), alt };
+    const float = this.floatOf(frame);
+    return { type: 'image', data, mime, width: Math.round(width), height: Math.round(height), alt, ...(float ? { float } : {}) };
+  }
+
+  /** A frame anchored to the paragraph, character or page floats: wrapping, position and margins from its style. */
+  private floatOf(frame: XNode): ImageFloat | undefined {
+    const anchor = frame.attrs['text:anchor-type'] ?? 'paragraph';
+    if (anchor === 'as-char' || anchor === 'frame') return undefined;
+    const chain = this.styles.chain(frame.attrs['draw:style-name'] ?? '', 'graphic');
+    const g: Record<string, string> = Object.assign({}, ...chain.map((x) => x.graphic ?? {}));
+    const wrapAttr = g['style:wrap'] ?? 'none';
+    const wrap: ImageFloat['wrap'] = wrapAttr === 'none' ? 'topBottom' : wrapAttr === 'run-through' ? 'none' : 'square';
+    const side = ({ left: 'left', right: 'right', dynamic: 'largest', parallel: 'both', biggest: 'largest' } as const)[wrapAttr as 'left'];
+    const H: Record<string, ImageFloat['h']['from']> = { page: 'page', 'page-content': 'margin', 'page-start-margin': 'leftMargin', 'page-end-margin': 'rightMargin', paragraph: 'column', 'paragraph-content': 'column', char: 'character' };
+    const V: Record<string, ImageFloat['v']['from']> = { page: 'page', 'page-content': 'margin', paragraph: 'paragraph', 'paragraph-content': 'paragraph', line: 'line', char: 'line', baseline: 'line', text: 'line' };
+    const hp = g['style:horizontal-pos'] ?? 'center';
+    const vp = g['style:vertical-pos'] ?? 'top';
+    const hAlign = ({ left: 'left', right: 'right', center: 'center', inside: 'inside', outside: 'outside' } as const)[hp as 'left'];
+    const vAlign = ({ top: 'top', middle: 'center', bottom: 'bottom' } as const)[vp as 'top'];
+    const len = (v: string | undefined): number => Math.round((odfLength(v) ?? 0) * 100) / 100;
+    const hFrom = H[g['style:horizontal-rel'] ?? (anchor === 'page' ? 'page' : 'paragraph')] ?? 'column';
+    const vFrom = anchor === 'page' ? 'page' : (V[g['style:vertical-rel'] ?? 'paragraph'] ?? 'paragraph');
+    return {
+      wrap,
+      ...(wrap === 'none' && g['style:run-through'] === 'background' ? { behind: true } : {}),
+      ...(wrap === 'square' && side ? { side } : {}),
+      h: hAlign ? { from: hFrom, align: hAlign } : { from: hFrom, offset: len(frame.attrs['svg:x']) },
+      v: vAlign && vFrom !== 'paragraph' && vFrom !== 'line' ? { from: vFrom, align: vAlign } : { from: vFrom, offset: len(frame.attrs['svg:y']) },
+      dist: [len(g['fo:margin-top']), len(g['fo:margin-right']), len(g['fo:margin-bottom']), len(g['fo:margin-left'])],
+    };
   }
 
   private list(el: XNode, depth: number, inherited?: string): Block[] {

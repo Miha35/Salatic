@@ -1,5 +1,5 @@
-import type { Align, Block, ChartSource, Doc, ListItem, ParaFormat, TableRow, TextRun } from '../model';
-import { familyOf, normalizeSections, trimRuns } from '../model';
+import type { Align, Block, ChartSource, Doc, ImageFloat, ListItem, ParaFormat, TableRow, TextRun } from '../model';
+import { familyOf, normalizeSections, sanitizeFloat, trimRuns } from '../model';
 import { findTag, htmlText, parseHtml, parseStyle, type HNode } from '../html';
 import { imageSize, parseDataUri, sniffImageMime } from '../util';
 
@@ -211,7 +211,28 @@ function imageFromNode(node: HNode): Block | null {
     w = w || 300;
     h = h || 200;
   }
-  return { type: 'image', data: parsed.data, mime, width: Math.round(w), height: Math.round(h), alt: node.attrs.alt || undefined, ...chartSource(node.attrs['data-chart'], mime) };
+  const float = floatOf(node, st);
+  return { type: 'image', data: parsed.data, mime, width: Math.round(w), height: Math.round(h), alt: node.attrs.alt || undefined, ...chartSource(node.attrs['data-chart'], mime), ...(float ? { float } : {}) };
+}
+
+/** A floating picture: our own data-float, or CSS float: left/right (text flows beside it). */
+function floatOf(node: HNode, st: Record<string, string>): ImageFloat | undefined {
+  const own = node.attrs['data-float'];
+  if (own) {
+    try {
+      const f = sanitizeFloat(JSON.parse(own));
+      if (f) return f;
+    } catch {
+      /* not ours: fall back to the CSS */
+    }
+  }
+  const side = (st.float ?? node.attrs.align ?? '').trim().toLowerCase();
+  if (side !== 'left' && side !== 'right') return undefined;
+  // margins (pt): the distance kept from the text
+  const parts = (st.margin ?? '').trim().split(/\s+/).filter(Boolean).map((v) => lengthPt(v) ?? 0);
+  const [t, r, b, l] = parts.length === 4 ? parts : parts.length === 2 ? [parts[0], parts[1], parts[0], parts[1]] : parts.length === 1 ? [parts[0], parts[0], parts[0], parts[0]] : [0, side === 'left' ? 9 : 0, 0, side === 'right' ? 9 : 0];
+  const px = (k: string, d: number): number => lengthPt(st[k]) ?? d;
+  return { wrap: 'square', h: { from: 'column', align: side }, v: { from: 'paragraph', offset: 0 }, dist: [px('margin-top', t), px('margin-right', r), px('margin-bottom', b), px('margin-left', l)] };
 }
 
 /** An Office chart part kept by the editor next to its SVG rendering (see HtmlCtx.sources). */
@@ -327,12 +348,20 @@ function collectBlocks(children: HNode[], style: InlineStyle, ctx: Ctx, fmt?: Pa
   const out: Block[] = [];
   let runs: TextRun[] = [];
   const f: ParaFormat = typeof fmt === 'string' ? { align: fmt } : (fmt ?? {});
+  let floats: Block[] = [];
   const flush = (): void => {
     const r = tidyRuns(runs);
+    out.push(...floats);
+    floats = [];
     if (r.length) out.push({ type: 'paragraph', runs: r, ...f });
     runs = [];
   };
   const sink = (b: Block): void => {
+    // a floating picture is anchored in the paragraph: placed before it, its text flows around it
+    if (b.type === 'image' && b.float) {
+      floats.push(b);
+      return;
+    }
     flush();
     out.push(b);
   };
@@ -373,12 +402,13 @@ function blockFrom(node: HNode, style: InlineStyle, ctx: Ctx, out: Block[], inhe
     case 'h5':
     case 'h6': {
       const { runs, images } = headingRuns(node, st);
+      out.push(...images.filter((b) => b.type === 'image' && b.float));
       if (runs.length) {
         const h: Block = { type: 'heading', level: +tag[1] as 1, runs, ...paraFormatOf(node) };
         if (align) h.align = align;
         out.push(h);
       }
-      out.push(...images);
+      out.push(...images.filter((b) => !(b.type === 'image' && b.float)));
       break;
     }
     case 'p':

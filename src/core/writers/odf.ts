@@ -234,10 +234,30 @@ class OdtWriter {
     const k = Math.min(1, maxW / w, maxH / h);
     w *= k;
     h *= k;
-    const fr = this.auto.get('graphic', 'fr', '<style:graphic-properties style:vertical-pos="top" style:vertical-rel="baseline" style:mirror="none" fo:clip="rect(0cm, 0cm, 0cm, 0cm)" draw:luminance="0%" draw:contrast="0%" draw:red="0%" draw:green="0%" draw:blue="0%" draw:gamma="100%" draw:color-inversion="false" draw:image-opacity="100%" draw:color-mode="standard"/>', 'Graphics');
+    const look = 'style:mirror="none" fo:clip="rect(0cm, 0cm, 0cm, 0cm)" draw:luminance="0%" draw:contrast="0%" draw:red="0%" draw:green="0%" draw:blue="0%" draw:gamma="100%" draw:color-inversion="false" draw:image-opacity="100%" draw:color-mode="standard"';
     const title = b.alt ? `<svg:title>${escapeXml(b.alt)}</svg:title>` : '';
+    let fr: string;
+    let anchor = 'text:anchor-type="as-char"';
+    const f = b.float;
+    if (f) {
+      // a floating frame anchored to the paragraph: position, wrapping and distance in its graphic style
+      const H: Record<string, string> = { page: 'page', margin: 'page-content', column: 'paragraph', character: 'char', leftMargin: 'page-start-margin', rightMargin: 'page-end-margin' };
+      const V: Record<string, string> = { page: 'page', margin: 'page-content', paragraph: 'paragraph', line: 'paragraph', topMargin: 'page', bottomMargin: 'page' };
+      const HA: Record<string, string> = { left: 'left', center: 'center', right: 'right', inside: 'inside', outside: 'outside' };
+      const VA: Record<string, string> = { top: 'top', center: 'middle', bottom: 'bottom', inside: 'top', outside: 'bottom' };
+      const hp = f.h.align ? HA[f.h.align] : 'from-left';
+      const vp = f.v.align && f.v.from !== 'paragraph' && f.v.from !== 'line' ? VA[f.v.align] : 'from-top';
+      const wrap = f.wrap === 'square' ? ({ left: 'left', right: 'right', largest: 'dynamic', both: 'parallel' } as const)[f.side ?? 'both'] : f.wrap === 'topBottom' ? 'none' : 'run-through';
+      const [t, r, bt, l] = f.dist ?? [0, 9, 0, 9];
+      const props =
+        `<style:graphic-properties style:wrap="${wrap}"${f.wrap === 'none' ? ` style:run-through="${f.behind ? 'background' : 'foreground'}"` : ''} style:number-wrapped-paragraphs="no-limit" style:wrap-contour="false" ` +
+        `fo:margin-top="${cm(t)}" fo:margin-right="${cm(r)}" fo:margin-bottom="${cm(bt)}" fo:margin-left="${cm(l)}" ` +
+        `style:horizontal-pos="${hp}" style:horizontal-rel="${H[f.h.from] ?? 'paragraph'}" style:vertical-pos="${vp}" style:vertical-rel="${V[f.v.from] ?? 'paragraph'}" ${look}/>`;
+      fr = this.auto.get('graphic', 'fr', props, 'Graphics');
+      anchor = `text:anchor-type="paragraph"${hp === 'from-left' ? ` svg:x="${cm(f.h.offset ?? 0)}"` : ''}${vp === 'from-top' ? ` svg:y="${cm(f.v.offset ?? 0)}"` : ''}`;
+    } else fr = this.auto.get('graphic', 'fr', `<style:graphic-properties style:vertical-pos="top" style:vertical-rel="baseline" ${look}/>`, 'Graphics');
     return (
-      `<draw:frame draw:style-name="${fr}" draw:name="Image${n}" text:anchor-type="as-char" svg:width="${cm(w)}" svg:height="${cm(h)}" draw:z-index="${n}">` +
+      `<draw:frame draw:style-name="${fr}" draw:name="Image${n}" ${anchor} svg:width="${cm(w)}" svg:height="${cm(h)}" draw:z-index="${n}">` +
       `<draw:image xlink:href="${path}" xlink:type="simple" xlink:show="embed" xlink:actuate="onLoad" draw:mime-type="${b.mime === 'image/emf' || b.mime === 'image/wmf' ? b.mime.replace('/', '/x-') : b.mime}"/>${title}</draw:frame>`
     );
   }
@@ -304,13 +324,25 @@ class OdtWriter {
 
   blocks(blocks: Block[], indent: number, width: number, paraStyle = 'Standard'): string {
     let s = '';
+    // floating frames are anchored in the paragraph that follows them
+    let floats = '';
     for (const b of blocks) {
+      if (b.type === 'image' && b.float) {
+        floats += this.image(b, width - indent);
+        continue;
+      }
+      if (floats && b.type !== 'paragraph' && b.type !== 'heading') {
+        s += `<text:p text:style-name="${this.pStyle(paraStyle, {}, indent)}">${floats}</text:p>`;
+        floats = '';
+      }
       switch (b.type) {
         case 'paragraph':
-          s += `<text:p text:style-name="${this.pStyle(paraStyle, b, indent)}">${this.runs(b.runs)}</text:p>`;
+          s += `<text:p text:style-name="${this.pStyle(paraStyle, b, indent)}">${floats}${this.runs(b.runs)}</text:p>`;
+          floats = '';
           break;
         case 'heading':
-          s += `<text:h text:style-name="${this.pStyle(`Heading_20_${b.level}`, b, indent)}" text:outline-level="${b.level}">${this.runs(b.runs)}</text:h>`;
+          s += `<text:h text:style-name="${this.pStyle(`Heading_20_${b.level}`, b, indent)}" text:outline-level="${b.level}">${floats}${this.runs(b.runs)}</text:h>`;
+          floats = '';
           break;
         case 'list': {
           const style = this.listStyle(b.ordered, b.start ?? 1);

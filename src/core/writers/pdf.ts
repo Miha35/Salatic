@@ -11,10 +11,10 @@
  * per-character fallback (DejaVu Sans → Noto Sans CJK → Noto Emoji), Word-style line
  * spacing from the fonts' Windows metrics, subsetting with HarfBuzz.
  */
-import { beginText, clip, clipEvenOdd, closePath, concatTransformationMatrix, endText, lineTo, moveTo, rotateAndSkewTextRadiansAndTranslate, setFontAndSize, setTextRenderingMode, showText, TextRenderingMode, degrees, drawSvgPath, endPath, PDFDict, PDFDocument, PDFName, PDFNumber, PDFOperator, PDFOperatorNames, PDFString, popGraphicsState, pushGraphicsState, rectangle, rgb, setGraphicsState, type PDFContext, type PDFImage, type PDFObject, type PDFPage, type PDFRef } from 'pdf-lib';
+import { beginText, clip, clipEvenOdd, PDFArray, closePath, concatTransformationMatrix, endText, lineTo, moveTo, rotateAndSkewTextRadiansAndTranslate, setFontAndSize, setTextRenderingMode, showText, TextRenderingMode, degrees, drawSvgPath, endPath, PDFDict, PDFDocument, PDFName, PDFNumber, PDFOperator, PDFOperatorNames, PDFString, popGraphicsState, pushGraphicsState, rectangle, rgb, setGraphicsState, type PDFContext, type PDFImage, type PDFObject, type PDFPage, type PDFRef } from 'pdf-lib';
 import { parseMetafile, type Metafile } from '../metafile';
 import { parseSvg } from '../svg-render';
-import type { Align, Block, Doc, FontFamily, Gradient, PageSetup, ParaFormat, PatternFill, TextRun } from '../model';
+import type { Align, Block, Doc, FontFamily, Gradient, ImageFloat, PageSetup, ParaFormat, PatternFill, TextRun } from '../model';
 import { PATTERNS } from '../drawingml';
 import { FontManager, styleOf, type FontKey, type FontLoader } from '../pdf-fonts';
 import type { Subsetter } from '../hb-subset';
@@ -59,6 +59,21 @@ export interface Box {
   section?: Section;
   /** A paragraph's lines, to lay its rest out again at another width (columns of unequal width) */
   src?: { tokens: Token[]; lines: Token[][]; tops: number[]; x: number; width: number; ctx: Ctx; p: ParaFmt; keepIndent: boolean };
+  /** Ops added around the laid-out text (a list marker): kept, moved with the first line, when it is laid out again */
+  deco?: Op[];
+  /** Never laid out around floating pictures (drawn with a frame of its own height): goes below them */
+  noWrap?: boolean;
+  /** A floating picture (zero height): placed where its position says; `fallback` where floats are not possible */
+  float?: { spec: ImageFloat; w: number; h: number; op: Op; fallback: Box };
+}
+
+/** Where text may not go on the current page: a floating picture with its distance (page coordinates, y down). */
+interface Exclusion {
+  x0: number;
+  x1: number;
+  y0: number;
+  y1: number;
+  side?: ImageFloat['side'];
 }
 
 type ParaFmt = Required<Omit<ParaFormat, 'align'>> & { align?: Align };
@@ -519,12 +534,12 @@ export class PdfWriter {
   }
 
   /** Group tokens into unbreakable units (a word possibly made of several fonts). */
-  protected breakLines(tokens: Token[], firstWidth: number, width: number, keepIndent = false): Token[][] {
+  protected breakLines(tokens: Token[], firstWidth: number, width: number, keepIndent = false, narrower?: number[]): Token[][] {
     const lines: Token[][] = [];
     let line: Token[] = [];
     let w = 0;
     let afterNewline = true;
-    const lineWidth = (): number => (lines.length ? width : firstWidth);
+    const lineWidth = (): number => (lines.length ? width : firstWidth) - (narrower?.[lines.length] ?? 0);
     const push = (): void => {
       while (line.length && line[line.length - 1].space) line.pop();
       lines.push(line);
@@ -605,10 +620,14 @@ export class PdfWriter {
 
   /** Lay out runs as a paragraph box. */
   protected async textBox(runs: TextRun[], x: number, width: number, ctx: Ctx, p: ReturnType<PdfWriter['para']>, keepIndent = false): Promise<Box> {
-    const tokens = await this.tokens(runs, ctx);
+    return this.layoutTokens(await this.tokens(runs, ctx), x, width, ctx, p, keepIndent);
+  }
+
+  /** `shape`: per line, how far its start moves right and how much narrower it gets (text around floats). */
+  private async layoutTokens(tokens: Token[], x: number, width: number, ctx: Ctx, p: ParaFmt, keepIndent: boolean, shape?: { dx: number[]; dw: number[] }): Promise<Box> {
     const left = x + p.indent;
     const firstX = left + p.firstLine;
-    const lines = this.breakLines(tokens, width - p.indent - p.firstLine, width - p.indent, keepIndent);
+    const lines = this.breakLines(tokens, width - p.indent - p.firstLine, width - p.indent, keepIndent, shape?.dw);
     const ops: Op[] = [];
     const tops: number[] = [];
     let y = 0;
@@ -616,8 +635,8 @@ export class PdfWriter {
     await this.fm.load([baseKey]);
     lines.forEach((line, li) => {
       tops.push(y);
-      const lx = li === 0 ? firstX : left;
-      const lw = li === 0 ? width - p.indent - p.firstLine : width - p.indent;
+      const lx = (li === 0 ? firstX : left) + (shape?.dx[li] ?? 0);
+      const lw = (li === 0 ? width - p.indent - p.firstLine : width - p.indent) - (shape?.dw[li] ?? 0);
       // Line box from the tallest font on the line
       let asc = 0;
       let desc = 0;
@@ -879,7 +898,9 @@ export class PdfWriter {
               this.fm.markUsed(key, marker);
               const mw = this.fm.width(key, marker, ctx.size);
               // Marker first in the content stream so text extractors read it before the item text
-              first.ops.unshift({ k: 'text', x: b.ordered ? x + markerW - mw - 3 : x + 3, y: baseline, top: 0, bottom: firstText ? firstText.bottom : ctx.size * 1.3, text: marker, font: key, size: ctx.size, color: ctx.color ?? BLACK });
+              const markerOp: Op = { k: 'text', x: b.ordered ? x + markerW - mw - 3 : x + 3, y: baseline, top: 0, bottom: firstText ? firstText.bottom : ctx.size * 1.3, text: marker, font: key, size: ctx.size, color: ctx.color ?? BLACK };
+              first.ops.unshift(markerOp);
+              first.deco = [...(first.deco ?? []), markerOp];
               inner[inner.length - 1].spaceAfter = 3;
             }
             boxes.push(...inner);
@@ -901,7 +922,7 @@ export class PdfWriter {
             h *= k;
             const ix = w < width ? x + (width - w) / 2 : x;
             const op = await this.metaOp(b.data, ix, 0, w, h, b.mime);
-            if (op) boxes.push({ height: h, ops: [op], spaceBefore: 4, spaceAfter: 8 });
+            if (op) boxes.push(this.imageBox(b, op, x, width, w, h, depth));
             break;
           }
           const img = await this.image(b);
@@ -913,7 +934,7 @@ export class PdfWriter {
           w *= k;
           h *= k;
           const ix = w < width ? x + (width - w) / 2 : x;
-          boxes.push({ height: h, ops: [{ k: 'image', x: ix, y: 0, w, h, img, top: 0, bottom: h }], spaceBefore: 4, spaceAfter: 8 });
+          boxes.push(this.imageBox(b, { k: 'image', x: ix, y: 0, w, h, img, top: 0, bottom: h }, x, width, w, h, depth));
           break;
         }
         case 'code': {
@@ -930,7 +951,10 @@ export class PdfWriter {
         }
         case 'quote': {
           const inner = await this.layout(b.blocks, x + 14, width - 14, { ...ctx, color: [0.27, 0.27, 0.3] }, depth);
-          for (const ib of inner) ib.ops.unshift({ k: 'rect', x, y: -ib.spaceBefore, w: 3, h: ib.height + ib.spaceBefore + ib.spaceAfter, fill: [0.8, 0.8, 0.84], clip: true, top: 0, bottom: ib.height });
+          for (const ib of inner) {
+            ib.ops.unshift({ k: 'rect', x, y: -ib.spaceBefore, w: 3, h: ib.height + ib.spaceBefore + ib.spaceAfter, fill: [0.8, 0.8, 0.84], clip: true, top: 0, bottom: ib.height });
+            ib.noWrap = true;
+          }
           boxes.push(...inner);
           break;
         }
@@ -943,6 +967,220 @@ export class PdfWriter {
       }
     }
     return boxes;
+  }
+
+  /** Where floating pictures are possible: the main flow, or headers and footers (drawn on each page). */
+  private floatMode: 'flow' | 'stack' | null = null;
+
+  /** The box of a picture: centred in the flow, or a float (text around it, behind or in front of it). */
+  private imageBox(b: Extract<Block, { type: 'image' }>, op: Extract<Op, { k: 'image' | 'meta' }>, x: number, width: number, w: number, h: number, depth: number): Box {
+    const box: Box = { height: h, ops: [op], spaceBefore: 4, spaceAfter: 8 };
+    const f = b.float;
+    if (!f || depth > 0 || !this.floatMode) return box;
+    if (f.wrap === 'topBottom' && this.floatMode === 'flow') {
+      // nothing beside it: a block of its own, at its horizontal position
+      const fx = this.floatX(f, w, x, width, this.pageW);
+      const moved: Op = { ...op, x: Math.max(x, Math.min(x + width - w, fx)) };
+      const off = f.v.from === 'paragraph' || f.v.from === 'line' ? Math.max(0, f.v.offset ?? 0) : 0;
+      return { height: h, ops: [moved], spaceBefore: 4 + off, spaceAfter: 8 + (f.dist?.[2] ?? 0) };
+    }
+    return { height: 0, ops: [], spaceBefore: 0, spaceAfter: 0, float: { spec: f, w, h, op, fallback: box } };
+  }
+
+  /** Horizontal position of a float in its frame (page coordinates). */
+  private floatX(f: ImageFloat, w: number, colX: number, colW: number, pageW: number, margins = this.margins): number {
+    const fr = f.h.from;
+    const [x0, x1] = fr === 'page' ? [0, pageW] : fr === 'leftMargin' ? [0, margins.left] : fr === 'rightMargin' ? [pageW - margins.right, pageW] : fr === 'column' || fr === 'character' ? [colX, colX + colW] : [margins.left, pageW - margins.right];
+    const a = f.h.align;
+    if (a === 'right' || a === 'outside') return x1 - w;
+    if (a === 'center') return (x0 + x1 - w) / 2;
+    if (a === 'left' || a === 'inside') return x0;
+    return x0 + (f.h.offset ?? 0);
+  }
+
+  /** Vertical position of a float (page coordinates, y down); `anchorY`: the top of its paragraph. */
+  private floatY(f: ImageFloat, h: number, anchorY: number, pageH: number, margins = this.margins): number {
+    const fr = f.v.from;
+    const [y0, y1] = fr === 'page' ? [0, pageH] : fr === 'margin' ? [margins.top, pageH - margins.bottom] : fr === 'topMargin' ? [0, margins.top] : fr === 'bottomMargin' ? [pageH - margins.bottom, pageH] : [anchorY, anchorY];
+    const a = f.v.align;
+    if (fr !== 'paragraph' && fr !== 'line') {
+      if (a === 'bottom' || a === 'outside') return y1 - h;
+      if (a === 'center') return (y0 + y1 - h) / 2;
+      if (a === 'top' || a === 'inside') return y0;
+    }
+    return y0 + (f.v.offset ?? 0);
+  }
+
+  /**
+   * Draw into a content stream of its own put first on the page: under everything drawn on it before
+   * and after (pictures behind the text). Relies on pdf-lib creating a stream when it has none.
+   */
+  private drawBehind(page: PDFPage, fn: () => void): void {
+    const p = page as unknown as { contentStream?: unknown; contentStreamRef?: PDFRef };
+    const saved = { s: p.contentStream, r: p.contentStreamRef };
+    p.contentStream = undefined;
+    p.contentStreamRef = undefined;
+    try {
+      fn();
+      const ref = p.contentStreamRef;
+      const contents = page.node.Contents();
+      if (ref && contents instanceof PDFArray) {
+        const at = contents.asArray().findIndex((x) => x === ref);
+        if (at > 0) {
+          contents.remove(at);
+          contents.insert(0, ref);
+        }
+      }
+    } finally {
+      p.contentStream = saved.s;
+      p.contentStreamRef = saved.r;
+    }
+  }
+
+  /** Floats of the main flow: exclusions of the current page, and pictures to draw over its text at its end. */
+  private exclusions: Exclusion[] = [];
+  private front: (() => void)[] = [];
+
+  private flushFront(): void {
+    for (const f of this.front) f();
+    this.front = [];
+  }
+
+  /** Place a float of the main flow at the cursor (its anchor): draw it and keep text out of its area. */
+  private placeFloat(fl: NonNullable<Box['float']>): void {
+    const { spec, w, h } = fl;
+    let y = this.floatY(spec, h, this.cursor, this.pageH);
+    const anchored = spec.v.from === 'paragraph' || spec.v.from === 'line';
+    // a float anchored to text that no longer fits on the page goes to the next one with it
+    if (anchored && y + h > this.limit + 0.01 && this.cursor > this.contentTop + 0.01) {
+      this.newPage();
+      y = this.floatY(spec, h, this.cursor, this.pageH);
+    }
+    const x = Math.max(0, Math.min(this.pageW - w, this.floatX(spec, w, this.margins.left, this.contentW, this.pageW)));
+    y = Math.max(0, Math.min(this.pageH - h, y));
+    const op = { ...fl.op, x } as Op;
+    const page = this.page;
+    const H = this.pageH;
+    const paint = (): void => {
+      const keep = this.pageH;
+      this.pageH = H;
+      this.draw([op], y, 0, h, page);
+      this.pageH = keep;
+    };
+    if (spec.wrap === 'none') {
+      if (spec.behind) this.drawBehind(page, paint);
+      else this.front.push(paint);
+      return;
+    }
+    paint();
+    const [dt, dr, db, dl] = spec.dist ?? [0, 9, 0, 9];
+    this.exclusions.push({ x0: x - dl, x1: x + w + dr, y0: y - dt, y1: y + h + db, side: spec.side });
+  }
+
+  /** Whether a text box can be split within `room` keeping at least two lines on either side. */
+  private splitsWell(box: Box, room: number): boolean {
+    if (!box.src || box.keepWithNext || box.noWrap) return false;
+    const tops = box.src.tops;
+    const n = tops.length;
+    if (n < 4) return false;
+    let fit = 0;
+    for (let k = 0; k < n; k++) if ((k + 1 < n ? tops[k + 1] : box.height) <= room + 0.01) fit = k + 1;
+    // the break may move up to leave two lines for the next page (widow control)
+    return Math.min(fit, n - 2) >= 2;
+  }
+
+  /** A break of a text box at `c` (from `from`) keeps two lines on this page and two for the next. */
+  private breakOk(box: Box, from: number, c: number): boolean {
+    const t = box.src?.tops;
+    if (!t || t.length < 4) return true;
+    const n = t.length;
+    return (from > 0.01 || c >= t[2] - 0.01) && c <= t[n - 2] + 0.01;
+  }
+
+  /** Whether a box can start on the current page: it fits, or splits well where it would start. */
+  private canStartHere(box: Box, contentH: number): boolean {
+    const room = this.limit - this.cursor - box.spaceBefore;
+    return box.height <= room + 0.01 || box.height > contentH || this.splitsWell(box, room);
+  }
+
+  /** The horizontal extent of a box's ops. */
+  private xRange(box: Box): [number, number] {
+    if (box.src) return [box.src.x, box.src.x + box.src.width];
+    let a = Infinity;
+    let b = -Infinity;
+    for (const o of box.ops) {
+      if (o.k === 'line') {
+        a = Math.min(a, o.x1, o.x2);
+        b = Math.max(b, o.x1, o.x2);
+      } else if (o.k === 'text') {
+        a = Math.min(a, o.x);
+        b = Math.max(b, o.x + 1);
+      } else {
+        a = Math.min(a, o.x);
+        b = Math.max(b, o.x + o.w);
+      }
+    }
+    return a <= b ? [a, b] : [this.margins.left, this.pageW - this.margins.right];
+  }
+
+  /** A box at the cursor next to floats: text laid out around them, anything else moved below them. */
+  private async aroundFloats(box: Box): Promise<Box> {
+    for (let guard = 0; guard < 50; guard++) {
+      const top = this.cursor;
+      const [bx0, bx1] = this.xRange(box);
+      const hit = this.exclusions.filter((e) => e.y1 > top + 0.01 && e.y0 < top + Math.max(box.height, 1) - 0.01 && e.x1 > bx0 && e.x0 < bx1);
+      if (!hit.length) return box;
+      if (box.src && !box.noWrap) {
+        const shaped = await this.wrapLines(box, top);
+        if (shaped) return shaped;
+      }
+      // no room beside them: below the floats it would run into
+      this.cursor = Math.max(...hit.map((e) => e.y1));
+    }
+    return box;
+  }
+
+  /** Lay a paragraph out with every line narrowed to the room the floats leave it; null when too narrow. */
+  private async wrapLines(box: Box, top: number): Promise<Box | null> {
+    const src = box.src!;
+    // a list marker hangs left of the text: the room it needs moves with the lines
+    const marks = (box.deco ?? []).filter((o): o is Extract<Op, { k: 'text' }> => o.k === 'text').map((o) => o.x);
+    const hang = marks.length ? Math.max(0, src.x + src.p.indent - Math.min(...marks)) : 0;
+    let cur = box;
+    let prev = '';
+    let firstShift = 0;
+    for (let iter = 0; iter < 6; iter++) {
+      const dx: number[] = [];
+      const dw: number[] = [];
+      const tops = cur.src!.tops;
+      for (let i = 0; i < tops.length; i++) {
+        const y0 = top + tops[i];
+        const y1 = top + (i + 1 < tops.length ? tops[i + 1] : cur.height);
+        const lineLeft = src.x + src.p.indent + (i === 0 ? src.p.firstLine : 0) - hang;
+        const lineRight = src.x + src.width;
+        let L = lineLeft;
+        let R = lineRight;
+        for (const e of this.exclusions) {
+          if (e.y1 <= y0 + 0.01 || e.y0 >= y1 - 0.01 || e.x1 <= L || e.x0 >= R) continue;
+          // text on the side the float leaves free (or the wider side)
+          const side = e.side === 'left' ? 'left' : e.side === 'right' ? 'right' : e.x0 - L >= R - e.x1 ? 'left' : 'right';
+          if (side === 'left') R = Math.min(R, e.x0);
+          else L = Math.max(L, e.x1);
+        }
+        if (R - L - hang < Math.min(54, (lineRight - lineLeft - hang) / 2)) return null;
+        dx.push(L - lineLeft);
+        dw.push(L - lineLeft + (lineRight - R));
+      }
+      const key = `${dx.join()}|${dw.join()}`;
+      if (key === prev) break;
+      if (iter === 0 && dw.every((v) => v === 0)) return box;
+      prev = key;
+      firstShift = dx[0] ?? 0;
+      cur = await this.layoutTokens(src.tokens, src.x, src.width, src.ctx, src.p, src.keepIndent, { dx, dw });
+    }
+    // the first line may have moved: a list marker goes with it
+    const deco = (box.deco ?? []).map((o) => (o.k === 'text' ? { ...o, x: o.x + firstShift } : o));
+    return { ...cur, ops: [...deco, ...cur.ops], deco, keepWithNext: box.keepWithNext, spaceBefore: box.spaceBefore, spaceAfter: box.spaceAfter, pageBreak: box.pageBreak };
   }
 
   private async table(b: Extract<Block, { type: 'table' }>, x: number, width: number, ctx: Ctx, depth: number): Promise<Box[]> {
@@ -1053,8 +1291,10 @@ export class PdfWriter {
     const small = { ...ctx, size: Math.max(7, ctx.size - 1) };
     this.headerBlocks = doc.header ?? [];
     this.footerBlocks = doc.footer ?? [];
+    this.floatMode = 'stack';
     if (this.headerBlocks.length) this.headerBoxes = strip(await this.layout(this.headerBlocks, x, w, small));
     if (this.footerBlocks.length) this.footerBoxes = strip(await this.layout(this.footerBlocks, x, w, small));
+    this.floatMode = null;
     const stack = (boxes: Box[]): number => boxes.reduce((s, b, i) => s + b.height + (i ? b.spaceBefore : 0) + (i < boxes.length - 1 ? b.spaceAfter : 0), 0);
     this.headerH = stack(this.headerBoxes);
     this.footerH = stack(this.footerBoxes);
@@ -1064,7 +1304,9 @@ export class PdfWriter {
     let sectionW = w;
     let pending: Block[] = [];
     const flush = async (): Promise<void> => {
+      this.floatMode = 'flow';
       if (pending.length) main.push(...(await this.layout(pending, x, sectionW, ctx)));
+      this.floatMode = null;
       pending = [];
     };
     for (const b of doc.blocks.length ? doc.blocks : [{ type: 'paragraph', runs: [] } as Block]) {
@@ -1112,7 +1354,11 @@ export class PdfWriter {
   // ------------------------------------------------------------------ placement
 
   private newPage(next?: Geom): void {
-    if (this.page) this.flushNotes();
+    if (this.page) {
+      this.flushNotes();
+      this.flushFront();
+    }
+    this.exclusions = [];
     if (next) this.applyGeom(next);
     this.page = this.pdf.addPage([this.pageW, this.pageH]);
     this.pages.push(this.page);
@@ -1241,13 +1487,15 @@ export class PdfWriter {
       }
       // Word balances the columns of a section only when a continuous section follows it
       if (sec && sec.columns > 1) await this.placeColumns(run, sec, boxes[j]?.section?.start === 'continuous');
-      else this.placeFlow(run);
+      else await this.placeFlow(run);
       i = j;
     }
   }
 
   /** Lay `boxes` out in the section's columns from the cursor on, page after page. */
   private async placeColumns(boxes: Box[], sec: Section, balance: boolean): Promise<void> {
+    // floating pictures in columns are placed in the column like any picture
+    boxes = boxes.map((b) => b.float?.fallback ?? b);
     const geo = columnGeometry(sec, this.contentW);
     let state: ColState = { i: 0, from: 0 };
     let guard = 0;
@@ -1381,10 +1629,10 @@ export class PdfWriter {
   }
 
   /** Single-column flow from the cursor on. */
-  private placeFlow(boxes: Box[]): void {
+  private async placeFlow(boxes: Box[]): Promise<void> {
     const contentH = this.contentBottom - this.contentTop;
     for (let i = 0; i < boxes.length; i++) {
-      const box = boxes[i];
+      let box = boxes[i];
       if (box.pageBreak) {
         this.pendingBreak = true;
         continue;
@@ -1393,15 +1641,35 @@ export class PdfWriter {
         this.pendingBreak = false;
         if (this.cursor > this.contentTop) this.newPage();
       }
+      if (box.float) {
+        // its paragraph would not start on this page: both go to the next one
+        const anchored = box.float.spec.v.from === 'paragraph' || box.float.spec.v.from === 'line';
+        const next = boxes.slice(i + 1).find((b) => !b.float);
+        if (anchored && next && !next.pageBreak && this.cursor > this.contentTop + 0.01 && !this.canStartHere(next, contentH)) this.newPage();
+        this.placeFloat(box.float);
+        continue;
+      }
       const atTop = this.cursor <= this.contentTop + 0.01;
       if (!atTop) this.cursor += box.spaceBefore;
-      let need = box.height;
-      if (box.keepWithNext && boxes[i + 1] && !boxes[i + 1].pageBreak) {
-        const next = boxes[i + 1];
-        const firstLine = next.ops.filter((o) => o.k !== 'rect').reduce((m, o) => Math.min(m, o.bottom), next.height);
-        need += next.spaceBefore + Math.min(firstLine, contentH / 3);
+      // next to floating pictures: text flows around them, anything else goes below them
+      if (this.exclusions.length && box.height > 0) box = await this.aroundFloats(box);
+      const needOf = (b: Box): number => {
+        let need = b.height;
+        if (b.keepWithNext && boxes[i + 1] && !boxes[i + 1].pageBreak && !boxes[i + 1].float) {
+          const next = boxes[i + 1];
+          const firstLine = next.ops.filter((o) => o.k !== 'rect').reduce((m, o) => Math.min(m, o.bottom), next.height);
+          need += next.spaceBefore + Math.min(firstLine, contentH / 3);
+        }
+        return need;
+      };
+      const need = needOf(box);
+      // a paragraph that does not fit is split when at least two lines stay on each page (widows and
+      // orphans), else it starts the next page; one laid out around floats is always split here
+      const splittable = box !== boxes[i] || this.splitsWell(box, this.limit - this.cursor);
+      if (this.cursor + need > this.limit && this.cursor > this.contentTop + 0.01 && need <= contentH && !splittable) {
+        this.newPage();
+        box = boxes[i]; // laid out around the previous page's floats: as it was
       }
-      if (this.cursor + need > this.limit && !atTop && need <= contentH) this.newPage();
       let from = 0;
       while (from < box.height - 0.01) {
         const rest = this.notesIn(box, from, box.height);
@@ -1413,6 +1681,7 @@ export class PdfWriter {
         }
         let cut = from;
         for (const c of this.candidates(box, from, from + (this.limit - this.cursor))) {
+          if (!this.breakOk(box, from, c)) continue;
           const notes = this.notesIn(box, from, c);
           if (this.cursor + (c - from) + this.notesHeight([...this.pageNotes, ...notes]) - this.notesHeight(this.pageNotes) <= this.limit + 0.01) {
             cut = c;
@@ -1448,6 +1717,7 @@ export class PdfWriter {
 
   async finish(): Promise<Uint8Array> {
     this.flushNotes();
+    this.flushFront();
     this.pageNotes = [];
     const total = this.pages.length;
     const small = { ...this.base, size: Math.max(7, this.base.size - 1) };
@@ -1479,10 +1749,21 @@ export class PdfWriter {
       headers.push(await perPage(this.headerBlocks, this.headerBoxes, i + 1, g));
       footers.push(await perPage(this.footerBlocks, this.footerBoxes, i + 1, g));
     }
-    const drawStack = (boxes: Box[], top: number, page: PDFPage, no: number): void => {
+    const drawStack = (boxes: Box[], top: number, page: PDFPage, no: number, g: Geom): void => {
       let y = top;
       boxes.forEach((b, i) => {
         if (i) y += b.spaceBefore;
+        if (b.float) {
+          // a picture of the header or footer at its place on the page (letterheads, logos, backgrounds)
+          const { spec, w, h } = b.float;
+          const fx = Math.max(0, Math.min(g.w - w, this.floatX(spec, w, g.margins.left, g.w - g.margins.left - g.margins.right, g.w, g.margins)));
+          const fy = Math.max(0, Math.min(g.h - h, this.floatY(spec, h, y, g.h, g.margins)));
+          const op = { ...b.float.op, x: fx } as Op;
+          const paint = (): void => this.draw([op], fy, 0, h, page, no, total);
+          if (spec.behind) this.drawBehind(page, paint);
+          else paint();
+          return;
+        }
         this.draw(b.ops, y, 0, b.height, page, no, total);
         y += b.height + b.spaceAfter;
       });
@@ -1492,8 +1773,8 @@ export class PdfWriter {
       const g = this.pageGeoms[i] ?? this.docGeom;
       // draw() measures from the top of the page it is given; it uses this.pageH
       this.pageH = g.h;
-      if (headers[i].length) drawStack(headers[i], this.headerDist, p, i + 1);
-      if (footers[i].length) drawStack(footers[i], g.h - this.footerDist - stackH(footers[i]), p, i + 1);
+      if (headers[i].length) drawStack(headers[i], this.headerDist, p, i + 1, g);
+      if (footers[i].length) drawStack(footers[i], g.h - this.footerDist - stackH(footers[i]), p, i + 1, g);
       else if (total > 1) {
         const key = this.keyFor({ text: '' }, this.base);
         const label = String(i + 1);

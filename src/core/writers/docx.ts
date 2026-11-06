@@ -1,6 +1,6 @@
 /** Doc → DOCX (Office Open XML). Element order follows the ECMA-376 schema so Word opens files without repair. */
 import { zipSync, type Zippable } from 'fflate';
-import type { Block, ChartSource, Doc, FontFamily, PageSetup, ParaFormat, TableCell, TextRun } from '../model';
+import type { Block, ChartSource, Doc, FontFamily, ImageFloat, PageSetup, ParaFormat, TableCell, TextRun } from '../model';
 import { escapeXml, maxOf, utf8 } from '../util';
 import { parseSvg } from '../svg-render';
 import { metafileToEmf } from './emf';
@@ -281,15 +281,29 @@ class DocxWriter {
       const svgRid = this.part.add('image', `media/image${n}.svg`);
       ext2 = `<a:extLst><a:ext uri="{96DAC541-7B7A-43D3-8B79-37D633B846F1}"><asvg:svgBlip xmlns:asvg="http://schemas.microsoft.com/office/drawing/2016/SVG/main" r:embed="${svgRid}"/></a:ext></a:extLst>`;
     }
-    return (
-      `<w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0"><wp:extent cx="${cx}" cy="${cy}"/>` +
-      `<wp:effectExtent l="0" t="0" r="0" b="0"/><wp:docPr id="${n}" name="Picture ${n}"${descr}/>` +
+    const graphic =
+      `<wp:docPr id="${n}" name="Picture ${n}"${descr}/>` +
       '<wp:cNvGraphicFramePr><a:graphicFrameLocks noChangeAspect="1"/></wp:cNvGraphicFramePr>' +
       '<a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic>' +
       `<pic:nvPicPr><pic:cNvPr id="${n}" name="${name}"/><pic:cNvPicPr/></pic:nvPicPr>` +
       `<pic:blipFill><a:blip r:embed="${rid}"${ext2 ? `>${ext2}</a:blip>` : '/>'}<a:stretch><a:fillRect/></a:stretch></pic:blipFill>` +
       `<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>` +
-      '</pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>'
+      '</pic:pic></a:graphicData></a:graphic>';
+    if (b.float) return `<w:r><w:drawing>${this.anchor(b.float, cx, cy, n, graphic)}</w:drawing></w:r>`;
+    return `<w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0"><wp:extent cx="${cx}" cy="${cy}"/><wp:effectExtent l="0" t="0" r="0" b="0"/>${graphic}</wp:inline></w:drawing></w:r>`;
+  }
+
+  /** A floating picture: wp:anchor with its position, wrapping and distance from the text. */
+  private anchor(f: ImageFloat, cx: number, cy: number, n: number, graphic: string): string {
+    const emu = (v: number): number => Math.round(v * 12700);
+    const [t, r, b, l] = (f.dist ?? [0, 9, 0, 9]).map(emu);
+    const axis = (name: string, x: { from: string; align?: string; offset?: number }): string =>
+      `<wp:${name} relativeFrom="${x.from}">${x.align ? `<wp:align>${x.align}</wp:align>` : `<wp:posOffset>${emu(x.offset ?? 0)}</wp:posOffset>`}</wp:${name}>`;
+    const side = f.side === 'both' || !f.side ? 'bothSides' : f.side;
+    const wrap = f.wrap === 'square' ? `<wp:wrapSquare wrapText="${side}"/>` : f.wrap === 'topBottom' ? '<wp:wrapTopAndBottom/>' : '<wp:wrapNone/>';
+    return (
+      `<wp:anchor distT="${t}" distB="${b}" distL="${l}" distR="${r}" simplePos="0" relativeHeight="${251658240 + n}" behindDoc="${f.behind ? 1 : 0}" locked="0" layoutInCell="1" allowOverlap="1">` +
+      `<wp:simplePos x="0" y="0"/>${axis('positionH', f.h)}${axis('positionV', f.v)}<wp:extent cx="${cx}" cy="${cy}"/><wp:effectExtent l="0" t="0" r="0" b="0"/>${wrap}${graphic}</wp:anchor>`
     );
   }
 
@@ -340,14 +354,26 @@ class DocxWriter {
 
   blocks(blocks: Block[], indent: number, widthTw: number, list?: { id: number; level: number }): string {
     let s = '';
+    // floating pictures are anchored in the paragraph that follows them
+    let floats = '';
     for (const b of blocks) {
+      if (b.type === 'image' && b.float) {
+        floats += this.image(b, widthTw);
+        continue;
+      }
+      if (floats && b.type !== 'paragraph' && b.type !== 'heading') {
+        s += `<w:p>${floats}</w:p>`;
+        floats = '';
+      }
       switch (b.type) {
         case 'paragraph':
-          s += `<w:p>${this.pPr({ num: list, indent: list ? undefined : indent || undefined }, b)}${this.runs(b.runs)}</w:p>`;
+          s += `<w:p>${this.pPr({ num: list, indent: list ? undefined : indent || undefined }, b)}${floats}${this.runs(b.runs)}</w:p>`;
+          floats = '';
           list = undefined; // only the first paragraph of a list item carries the number
           break;
         case 'heading':
-          s += `<w:p>${this.pPr({ style: `Heading${b.level}`, indent: indent || undefined }, b)}${this.runs(b.runs)}</w:p>`;
+          s += `<w:p>${this.pPr({ style: `Heading${b.level}`, indent: indent || undefined }, b)}${floats}${this.runs(b.runs)}</w:p>`;
+          floats = '';
           break;
         case 'list': {
           const level = Math.min(8, Math.round(indent / 720));

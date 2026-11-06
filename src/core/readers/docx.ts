@@ -1,6 +1,6 @@
 /** DOCX (WordprocessingML) → Doc. */
 import { unzipSync } from 'fflate';
-import type { Align, Block, Doc, FontFamily, ListItem, PageSetup, ParaFormat, TableCell, TableRow, TextRun } from '../model';
+import type { Align, Block, Doc, FontFamily, ImageFloat, ListItem, PageSetup, ParaFormat, TableCell, TableRow, TextRun } from '../model';
 import { familyOf, normalizeRuns, normalizeSections, trimRuns } from '../model';
 import { child, childrenNamed, elements, find, findAll, findBy, parseXml, rootElement, textContent, type XNode } from '../xml';
 import { ConvertError, imageSize, sniffImageMime, unzipOffice } from '../util';
@@ -362,7 +362,37 @@ class DocxReader {
       }
     }
     const alt = find(el, 'wp:docPr')?.attrs.descr || undefined;
-    return { type: 'image', data, mime, width: Math.round(width), height: Math.round(height), alt };
+    const anchor = find(el, 'wp:anchor');
+    const float = anchor ? this.floatOf(anchor) : undefined;
+    return { type: 'image', data, mime, width: Math.round(width), height: Math.round(height), alt, ...(float ? { float } : {}) };
+  }
+
+  /** wp:anchor: wrapping, position (offset or alignment in a frame) and distance from the text. */
+  private floatOf(a: XNode): ImageFloat {
+    const pt = (v: string | undefined): number => Math.round(((+(v ?? 0) || 0) / 12700) * 100) / 100;
+    const wrapEl = elements(a).find((c) => /^wp:wrap/.test(c.name));
+    const wrap: ImageFloat['wrap'] = wrapEl?.name === 'wp:wrapTopAndBottom' ? 'topBottom' : !wrapEl || wrapEl.name === 'wp:wrapNone' ? 'none' : 'square';
+    const sideAttr = wrapEl?.attrs.wrapText;
+    const side = sideAttr === 'left' || sideAttr === 'right' || sideAttr === 'largest' ? sideAttr : sideAttr === 'bothSides' ? 'both' : undefined;
+    const axis = (name: string, froms: readonly string[], def: string): { from: string; align?: string; offset?: number } => {
+      const p = child(a, name);
+      const from = froms.includes(p?.attrs.relativeFrom ?? '') ? p!.attrs.relativeFrom : def;
+      const align = textContent(child(p, 'wp:align')).trim();
+      const off = child(p, 'wp:posOffset');
+      return { from, ...(align ? { align } : {}), ...(off ? { offset: pt(textContent(off).trim()) } : {}) };
+    };
+    const h = axis('wp:positionH', ['page', 'margin', 'column', 'character', 'leftMargin', 'rightMargin'], 'column') as ImageFloat['h'];
+    const v = axis('wp:positionV', ['page', 'margin', 'paragraph', 'line', 'topMargin', 'bottomMargin'], 'paragraph') as ImageFloat['v'];
+    if (h.align && !['left', 'center', 'right', 'inside', 'outside'].includes(h.align)) delete h.align;
+    if (v.align && !['top', 'center', 'bottom', 'inside', 'outside'].includes(v.align)) delete v.align;
+    return {
+      wrap,
+      ...(['1', 'true', 'on'].includes(a.attrs.behindDoc ?? '') ? { behind: true } : {}),
+      ...(wrap === 'square' && side ? { side } : {}),
+      h,
+      v,
+      dist: [pt(a.attrs.distT), pt(a.attrs.distR), pt(a.attrs.distB), pt(a.attrs.distL)],
+    };
   }
 
   /** Collect runs of a paragraph-level container. Images and page breaks are emitted as separators. */
@@ -542,13 +572,17 @@ class DocxReader {
       blocks.push(isQuote && hasText ? { type: 'quote', blocks: [b] } : b);
       emittedText = true;
     };
+    const floats: Block[] = [];
     for (const it of items) {
-      if ('type' in it) {
+      if ('type' in it && it.type === 'image' && it.float) floats.push(it);
+      else if ('type' in it) {
         flush(false);
         blocks.push(it);
       } else runs.push(it);
     }
-    flush(!emittedText && !blocks.some((b) => b.type === 'image' || b.type === 'pagebreak'));
+    flush(!emittedText && !floats.length && !blocks.some((b) => b.type === 'image' || b.type === 'pagebreak'));
+    // floating pictures go before the paragraph they are anchored in (its text flows around them)
+    if (floats.length) blocks.splice(blocks[0]?.type === 'pagebreak' ? 1 : 0, 0, ...floats);
     blocks.push(...extra);
     if (num) {
       const fmt = this.numFormats.get(num.numId)?.get(num.ilvl) ?? 'bullet';
