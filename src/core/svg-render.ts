@@ -7,7 +7,7 @@
  * shadings; writers without gradients use the average colour). Filters, masks and clip paths are ignored.
  */
 import { familyOf, gradientAverage, type FontFamily, type Gradient, type GradientStop } from './model';
-import type { Metafile, MetaCmd } from './metafile';
+import type { ClipPath, Metafile, MetaCmd } from './metafile';
 import { parseDataUri } from './util';
 import { elements, parseXml, textContent, type XNode } from './xml';
 
@@ -401,6 +401,10 @@ class SvgRenderer {
   }
 
   private paint(d: string, s: Style, m: M): void {
+    if (this.capture) {
+      if (d) this.capture.push(d);
+      return;
+    }
     if (!d || !s.display) return;
     let fill = s.fill ?? undefined;
     const stroke = s.stroke && s.strokeWidth > 0 ? s.stroke : undefined;
@@ -491,7 +495,37 @@ class SvgRenderer {
     return d.trim();
   }
 
+  /** Current clip (intersection of paths in output space) and, while reading a clipPath, its captured geometry. */
+  private clip: ClipPath[] = [];
+  private capture: string[] | null = null;
+
   walk(n: XNode, parent: Style, m: M, viewW: number, viewH: number): void {
+    const ref = this.capture ? undefined : /url\(\s*#([^)\s]+)\s*\)/.exec(n.attrs['clip-path'] ?? declarations(n.attrs.style ?? '')['clip-path'] ?? '')?.[1];
+    const cp = ref ? this.ids.get(ref) : undefined;
+    if (!cp || local(cp.name) !== 'clipPath' || cp.attrs.clipPathUnits === 'objectBoundingBox') return this.walkInner(n, parent, m, viewW, viewH);
+    // the clipPath's shapes, in the user space of the element (its transform included)
+    const captured: string[] = [];
+    this.capture = captured;
+    const mm = mul(mul(m, parseTransform(n.attrs.transform)), parseTransform(cp.attrs.transform));
+    try {
+      for (const c of elements(cp)) this.walkInner(c, { ...parent, fill: '000000', display: true }, mm, viewW, viewH);
+    } finally {
+      this.capture = null;
+    }
+    if (!captured.length) return; // an empty clip hides the element
+    const prev = this.clip;
+    const rule = declarations(cp.attrs.style ?? '')['clip-rule'] ?? elements(cp)[0]?.attrs['clip-rule'];
+    this.clip = [...prev, { d: captured.join(' '), evenOdd: rule === 'evenodd' }];
+    this.cmds.push({ k: 'clip', paths: this.clip });
+    try {
+      this.walkInner(n, parent, m, viewW, viewH);
+    } finally {
+      this.clip = prev;
+      this.cmds.push({ k: 'clip', paths: prev });
+    }
+  }
+
+  private walkInner(n: XNode, parent: Style, m: M, viewW: number, viewH: number): void {
     if (++this.depth > 200) return;
     try {
       const tag = local(n.name);

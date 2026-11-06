@@ -28,7 +28,17 @@ export type MetaCmd =
       /** Continue right after the previous text command (SVG tspans). */
       flow?: boolean;
     }
-  | { k: 'image'; x: number; y: number; w: number; h: number; png: Uint8Array };
+  | { k: 'image'; x: number; y: number; w: number; h: number; png: Uint8Array }
+  /** Replace the clip: drawing is limited to the intersection of these paths (none: no clipping). */
+  | { k: 'clip'; paths: ClipPath[] };
+
+export interface ClipPath {
+  d: string;
+  evenOdd: boolean;
+}
+
+/** A frame far outside any drawing; with even-odd filling, frame + shape = everything but the shape. */
+const FAR = 'M-100000 -100000 L100000 -100000 L100000 100000 L-100000 100000 Z';
 
 export interface Metafile {
   /** Size of the drawing in output units (the coordinate space of the commands). */
@@ -87,6 +97,7 @@ interface DC {
   textAlign: number;
   polyFill: number;
   cur: [number, number];
+  clip: ClipPath[];
 }
 
 const color = (cr: number): string => [cr & 255, (cr >> 8) & 255, (cr >> 16) & 255].map((v) => v.toString(16).padStart(2, '0')).join('').toUpperCase();
@@ -135,11 +146,43 @@ class Gdi {
       textAlign: 0,
       polyFill: 1,
       cur: [0, 0],
+      clip: [],
     };
   }
 
+  /** Set the clip (output coordinates) and record it. */
+  setClip(paths: ClipPath[]): void {
+    this.dc.clip = paths;
+    this.cmds.push({ k: 'clip', paths: [...paths] });
+  }
+
+  /** Combine a region with the clip: RGN_AND 1, RGN_OR 2, RGN_XOR 3, RGN_DIFF 4, RGN_COPY 5. */
+  combineClip(region: ClipPath | null, mode: number): void {
+    if (!region) {
+      if (mode === 5) this.setClip([]);
+      return;
+    }
+    if (mode === 1) this.setClip([...this.dc.clip, region]);
+    else if (mode === 5) this.setClip([region]);
+    else if (mode === 4) this.setClip([...this.dc.clip, { d: `${FAR} ${region.d}`, evenOdd: true }]);
+    // union/xor would grow the clip: drawing unclipped is the safe approximation
+    else this.setClip([]);
+  }
+
+  /** Rectangle in logical units → output path. */
+  rectPath(l: number, t: number, r: number, b: number): string {
+    const pts = [this.pt(l, t), this.pt(r, t), this.pt(r, b), this.pt(l, b)];
+    return `M${pts.map(([x, y]) => `${this.f(x)} ${this.f(y)}`).join(' L')} Z`;
+  }
+
+  /** Rectangle in device units → output path. */
+  deviceRectPath(l: number, t: number, r: number, b: number): string {
+    const o = (x: number, y: number): string => `${this.f((x - this.origin[0]) * this.scale)} ${this.f((y - this.origin[1]) * this.scale)}`;
+    return `M${o(l, t)} L${o(r, t)} L${o(r, b)} L${o(l, b)} Z`;
+  }
+
   save(): void {
-    this.stack.push({ ...this.dc, winOrg: [...this.dc.winOrg], winExt: [...this.dc.winExt], vpOrg: [...this.dc.vpOrg], vpExt: [...this.dc.vpExt], world: [...this.dc.world] as Xf, cur: [...this.dc.cur] });
+    this.stack.push({ ...this.dc, winOrg: [...this.dc.winOrg], winExt: [...this.dc.winExt], vpOrg: [...this.dc.vpOrg], vpExt: [...this.dc.vpExt], world: [...this.dc.world] as Xf, cur: [...this.dc.cur], clip: [...this.dc.clip] });
   }
 
   restore(n: number): void {
@@ -147,8 +190,10 @@ class Gdi {
     let target = n < 0 ? this.stack.length + n : n - 1;
     target = Math.max(0, Math.min(this.stack.length - 1, target));
     if (!this.stack.length) return;
+    const clip = this.dc.clip;
     this.dc = this.stack[target];
     this.stack.length = target;
+    if (clip.length !== this.dc.clip.length || clip.some((c, i) => c !== this.dc.clip[i])) this.cmds.push({ k: 'clip', paths: [...this.dc.clip] });
   }
 
   /** Logical → page → device → output. */
@@ -754,6 +799,37 @@ export function parseEmf(data: Uint8Array): Metafile {
       case 68:
         g.abortPath();
         break;
+      case 30: // INTERSECTCLIPRECT
+        g.combineClip({ d: g.rectPath(i32(p), i32(p + 4), i32(p + 8), i32(p + 12)), evenOdd: false }, 1);
+        break;
+      case 29: // EXCLUDECLIPRECT
+        g.combineClip({ d: g.rectPath(i32(p), i32(p + 4), i32(p + 8), i32(p + 12)), evenOdd: false }, 4);
+        break;
+      case 67: {
+        // SELECTCLIPPATH: the path just ended
+        const d = g.pending;
+        g.pending = '';
+        g.combineClip(d ? { d, evenOdd: g.dc.polyFill === 1 } : null, u32(p));
+        break;
+      }
+      case 75: {
+        // EXTSELECTCLIPRGN: rectangles in device units
+        const cb = u32(p);
+        const mode = u32(p + 4);
+        if (!cb) {
+          g.combineClip(null, mode);
+          break;
+        }
+        const n = u32(p + 8 + 8);
+        const rects: string[] = [];
+        for (let k = 0; k < n && k < 10_000; k++) {
+          const o = p + 8 + 32 + k * 16;
+          if (o + 16 > pos + size) break;
+          rects.push(g.deviceRectPath(i32(o), i32(o + 4), i32(o + 8), i32(o + 12)));
+        }
+        g.combineClip(rects.length ? { d: rects.join(' '), evenOdd: false } : null, mode);
+        break;
+      }
       case 83:
       case 84: {
         // EXTTEXTOUTA / EXTTEXTOUTW
@@ -908,6 +984,12 @@ export function parseWmf(data: Uint8Array): Metafile {
       case 0x001e:
         g.save();
         break;
+      case 0x0416: // INTERSECTCLIPRECT: bottom, right, top, left
+        g.combineClip({ d: g.rectPath(i16(p + 6), i16(p + 4), i16(p + 2), i16(p)), evenOdd: false }, 1);
+        break;
+      case 0x0415: // EXCLUDECLIPRECT
+        g.combineClip({ d: g.rectPath(i16(p + 6), i16(p + 4), i16(p + 2), i16(p)), evenOdd: false }, 4);
+        break;
       case 0x0127:
         g.restore(i16(p));
         break;
@@ -1054,8 +1136,21 @@ const SVG_FAMILY: Record<FontFamily, string> = { sans: 'Arial, Liberation Sans, 
 export function metafileToSvg(m: Metafile): string {
   const f = (n: number): string => (Math.round(n * 100) / 100).toString();
   let body = '';
+  let defs = '';
+  let open = 0;
+  let ids = 0;
   for (const c of m.cmds) {
-    if (c.k === 'path') {
+    if (c.k === 'clip') {
+      // intersection of clip paths: nested groups
+      body += '</g>'.repeat(open);
+      open = 0;
+      for (const cp of c.paths) {
+        const id = `c${++ids}`;
+        defs += `<clipPath id="${id}"><path d="${cp.d}"${cp.evenOdd ? ' clip-rule="evenodd"' : ''}/></clipPath>`;
+        body += `<g clip-path="url(#${id})">`;
+        open++;
+      }
+    } else if (c.k === 'path') {
       body += `<path d="${c.d}" fill="${c.fill ? '#' + c.fill : 'none'}"${c.opacity !== undefined && c.opacity < 1 ? ` fill-opacity="${f(c.opacity)}"` : ''}${c.strokeOpacity !== undefined && c.strokeOpacity < 1 ? ` stroke-opacity="${f(c.strokeOpacity)}"` : ''}${c.evenOdd ? ' fill-rule="evenodd"' : ''}${c.stroke ? ` stroke="#${c.stroke}" stroke-width="${f(c.width)}"${c.dash ? ` stroke-dasharray="${c.dash.map(f).join(' ')}"` : ''}` : ''}/>`;
     } else if (c.k === 'text' && c.flow && body.endsWith('</text>')) {
       body = body.slice(0, -7) + `<tspan font-family="${SVG_FAMILY[c.family]}" font-size="${f(c.size)}"${c.bold ? ' font-weight="bold"' : ' font-weight="normal"'}${c.italic ? ' font-style="italic"' : ''} fill="#${c.color}">${escapeXml(c.text)}</tspan></text>`;
@@ -1063,11 +1158,12 @@ export function metafileToSvg(m: Metafile): string {
       const rot = c.angle ? ` transform="rotate(${f(-c.angle)} ${f(c.x)} ${f(c.y)})"` : '';
       const base = c.baseline === 'top' ? ' dominant-baseline="text-before-edge"' : c.baseline === 'bottom' ? ' dominant-baseline="text-after-edge"' : '';
       body += `<text x="${f(c.x)}" y="${f(c.y)}" font-family="${SVG_FAMILY[c.family]}" font-size="${f(c.size)}"${c.bold ? ' font-weight="bold"' : ''}${c.italic ? ' font-style="italic"' : ''}${c.underline ? ' text-decoration="underline"' : ''} fill="#${c.color}"${c.anchor !== 'start' ? ` text-anchor="${c.anchor}"` : ''}${base}${rot} xml:space="preserve">${escapeXml(c.text)}</text>`;
-    } else {
+    } else if (c.k === 'image') {
       body += `<image x="${f(c.x)}" y="${f(c.y)}" width="${f(c.w)}" height="${f(c.h)}" preserveAspectRatio="none" href="data:image/png;base64,${bytesToBase64(c.png)}"/>`;
     }
   }
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${f(m.width)} ${f(m.height)}" width="${f(m.widthPt)}pt" height="${f(m.heightPt)}pt">${body}</svg>`;
+  body += '</g>'.repeat(open);
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${f(m.width)} ${f(m.height)}" width="${f(m.widthPt)}pt" height="${f(m.heightPt)}pt">${defs ? `<defs>${defs}</defs>` : ''}${body}</svg>`;
 }
 
 /** EMF/WMF bytes → SVG bytes (null when the data is not a readable metafile). */

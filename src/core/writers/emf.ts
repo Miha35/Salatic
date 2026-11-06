@@ -191,6 +191,20 @@ export function metafileToEmf(mf: Metafile): Uint8Array {
   const cmds = mf.cmds;
   for (let i = 0; i < cmds.length; i++) {
     const c = cmds[i];
+    if (c.k === 'clip') {
+      // no paths: EXTSELECTCLIPRGN with RGN_COPY and no region removes the clip; else copy, then intersect
+      if (!c.paths.length) w.ints(75, 0, 5);
+      c.paths.forEach((cp, k) => {
+        const mode = cp.evenOdd ? 1 : 2;
+        if (mode !== polyFill) {
+          w.ints(19, mode);
+          polyFill = mode;
+        }
+        geometry(cp.d);
+        w.ints(67, k ? 1 : 5); // SELECTCLIPPATH: copy, then intersect
+      });
+      continue;
+    }
     if (c.k === 'path') {
       const fill = c.fill !== undefined && c.fill !== 'none' && (c.opacity ?? 1) > 0.02;
       const stroke = c.stroke !== undefined && c.stroke !== 'none' && (c.strokeOpacity ?? 1) > 0.02;

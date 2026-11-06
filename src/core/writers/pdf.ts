@@ -11,7 +11,7 @@
  * per-character fallback (DejaVu Sans → Noto Sans CJK → Noto Emoji), Word-style line
  * spacing from the fonts' Windows metrics, subsetting with HarfBuzz.
  */
-import { clip, concatTransformationMatrix, degrees, drawSvgPath, endPath, PDFDict, PDFDocument, PDFName, PDFNumber, PDFOperator, PDFOperatorNames, PDFString, popGraphicsState, pushGraphicsState, rectangle, rgb, setGraphicsState, type PDFContext, type PDFImage, type PDFObject, type PDFPage, type PDFRef } from 'pdf-lib';
+import { clip, clipEvenOdd, concatTransformationMatrix, degrees, drawSvgPath, endPath, PDFDict, PDFDocument, PDFName, PDFNumber, PDFOperator, PDFOperatorNames, PDFString, popGraphicsState, pushGraphicsState, rectangle, rgb, setGraphicsState, type PDFContext, type PDFImage, type PDFObject, type PDFPage, type PDFRef } from 'pdf-lib';
 import { parseMetafile, type Metafile } from '../metafile';
 import { parseSvg } from '../svg-render';
 import type { Align, Block, Doc, FontFamily, Gradient, ParaFormat, TextRun } from '../model';
@@ -544,7 +544,20 @@ export class PdfWriter {
     const sy = o.h / m.height;
     page.pushOperators(pushGraphicsState(), rectangle(x, top - o.h, o.w, o.h), clip(), endPath(), concatTransformationMatrix(sx, 0, 0, sy, x, top));
     let flowX = 0;
+    let clipped = false;
     m.cmds.forEach((c, i) => {
+      if (c.k === 'clip') {
+        if (clipped) page.pushOperators(popGraphicsState());
+        clipped = c.paths.length > 0;
+        if (!clipped) return;
+        page.pushOperators(pushGraphicsState());
+        for (const cp of c.paths) {
+          // drawSvgPath's transforms (y flip) and path, then clip, then undo the flip
+          const ops = drawSvgPath(cp.d, { x: 0, y: 0, scale: undefined, color: undefined, borderColor: undefined, borderWidth: 0 }).slice(1, -2);
+          page.pushOperators(...ops, cp.evenOdd ? clipEvenOdd() : clip(), endPath(), concatTransformationMatrix(1, 0, 0, -1, 0, 0));
+        }
+        return;
+      }
       if (c.k === 'path') {
         if (c.grad && c.fill) {
           this.fillGradient(page, c.d, c.grad, 0, 0, c.opacity ?? 1);
@@ -582,6 +595,7 @@ export class PdfWriter {
         flowX = startX + width;
       }
     });
+    if (clipped) page.pushOperators(popGraphicsState());
     page.pushOperators(popGraphicsState());
   }
 
