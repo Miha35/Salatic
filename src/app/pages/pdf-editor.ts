@@ -511,6 +511,21 @@ export function mount(root: HTMLElement): () => void {
   let fontSize = 14;
   let strokeWidth = 2;
   let zoom = 1.4;
+  /** Until the user zooms, the page is fitted to the available width (phones, narrow windows). */
+  let zoomManual = false;
+  const fitZoom = (view: number[], rot: Rot): number => {
+    const avail = (pageView.clientWidth || document.documentElement.clientWidth) - 2 * 16 - 4;
+    const pageW = rot % 180 ? view[3] - view[1] : view[2] - view[0];
+    return Math.min(1.4, Math.max(0.4, avail / Math.max(1, pageW)));
+  };
+  let resizeTimer = 0;
+  window.addEventListener('resize', () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = window.setTimeout(() => {
+      if (!pageView.isConnected || pageView.hidden || !editing || zoomManual || textEditor) return;
+      void renderEditor();
+    }, 200);
+  });
   let undoStack: { annotations: Annotation[]; replaced: string[] }[] = [];
   let selectedIdx = -1;
   let viewport: Viewport | null = null;
@@ -625,10 +640,12 @@ export function mount(root: HTMLElement): () => void {
       image: '',
     }[tool];
 
-    stage = h('div', { class: 'page-stage' });
+    // touch: swiping scrolls the page with the selection and text tools; drawing tools capture the finger
+    stage = h('div', { class: 'page-stage', 'data-pan': tool === 'select' || tool === 'edittext' || tool === 'text' ? '1' : '0' });
     const canvas = document.createElement('canvas');
     pageCanvas = canvas;
     segments = [];
+    if (!zoomManual) zoom = fitZoom(p.view, rot);
     viewport = new Viewport(p.view, zoom, rot);
     stage.style.width = `${viewport.width}px`;
     stage.style.height = `${viewport.height}px`;
@@ -745,6 +762,7 @@ export function mount(root: HTMLElement): () => void {
 
   function setZoom(z: number): void {
     commitText();
+    zoomManual = true;
     zoom = Math.min(4, Math.max(0.4, z));
     void renderEditor();
   }

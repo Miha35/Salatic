@@ -1025,10 +1025,27 @@ export class PdfWriter {
     let guard = 0;
     while (state.i < boxes.length && guard++ < 10_000) {
       const top = this.cursor;
-      const avail = this.limit - top;
-      if (avail < 24 && top > this.contentTop + 0.01) {
+      if (this.limit - top < 24 && top > this.contentTop + 0.01) {
         this.newPage();
         continue;
+      }
+      // Footnotes referenced by what goes on this page take room at its bottom. More height brings more
+      // notes, so search the tallest columns that still leave room for their own notes.
+      const full = this.limit - top;
+      const extra = (h: number): number => {
+        const notes = this.fillColumns(boxes, state, n, colW, sec.gap, top, h, true).notes;
+        return notes.length ? this.notesHeight([...this.pageNotes, ...notes]) - this.notesHeight(this.pageNotes) : 0;
+      };
+      let avail = full;
+      if (extra(full) > 0) {
+        let lo = 0;
+        let hi = full;
+        for (let k = 0; k < 24 && hi - lo > 0.25; k++) {
+          const mid = (lo + hi) / 2;
+          if (mid + extra(mid) <= full) lo = mid;
+          else hi = mid;
+        }
+        avail = lo;
       }
       let h = avail;
       if (balance && this.fillColumns(boxes, state, n, colW, sec.gap, top, avail, true).done) {
@@ -1059,12 +1076,14 @@ export class PdfWriter {
   }
 
   /**
-   * Fill up to n columns of height h starting at y = top. In a dry run nothing is drawn and content
-   * that cannot be split to fit counts as not fitting.
+   * Fill up to n columns of height h starting at y = top. In a dry run nothing is drawn, content that
+   * cannot be split to fit counts as not fitting, and the footnotes the placed content refers to are collected.
    */
-  private fillColumns(boxes: Box[], start: { i: number; from: number }, n: number, colW: number, gap: number, top: number, h: number, dry: boolean): { state: { i: number; from: number }; done: boolean; heights: number[] } {
+  private fillColumns(boxes: Box[], start: { i: number; from: number }, n: number, colW: number, gap: number, top: number, h: number, dry: boolean): { state: { i: number; from: number }; done: boolean; heights: number[]; notes: Note[] } {
     let { i, from } = start;
     const heights: number[] = [];
+    const notes: Note[] = [];
+    const result = (done: boolean) => ({ state: { i, from }, done, heights, notes });
     for (let col = 0; col < n; col++) {
       const dx = col * (colW + gap);
       let y = 0;
@@ -1075,18 +1094,26 @@ export class PdfWriter {
           i++;
           from = 0;
           heights.push(y);
-          return { state: { i, from }, done: i >= boxes.length, heights };
+          return result(i >= boxes.length);
         }
         const sb = from === 0 && y > 0.01 ? box.spaceBefore : 0;
         const rest = box.height - from;
         const put = (to: number): void => {
-          if (!dry) {
+          const refs = this.notesIn(box, from, to);
+          if (dry) notes.push(...refs.filter((r) => !notes.includes(r)));
+          else {
             this.draw(dx ? this.shift(box, dx, 0) : box.ops, top + y + sb, from, to);
-            this.addNotes(this.notesIn(box, from, to));
+            this.addNotes(refs);
           }
           y += sb + (to - from);
         };
         if (y + sb + rest <= h + 0.01) {
+          // a heading kept with the next paragraph goes to the next column when that one does not start here
+          const next = boxes[i + 1];
+          if (box.keepWithNext && next && !next.pageBreak && y > 0.01 && from === 0) {
+            const firstLine = next.ops.filter((o) => o.k !== 'rect').reduce((m, o) => Math.min(m, o.bottom), next.height);
+            if (y + sb + rest + box.spaceAfter + next.spaceBefore + firstLine > h + 0.01) break;
+          }
           put(box.height);
           y += box.spaceAfter;
           i++;
@@ -1099,7 +1126,7 @@ export class PdfWriter {
           from = cut;
         } else if (y <= 0.01) {
           // nothing fits even at the top of a column: an atomic piece taller than the column
-          if (dry) return { state: { i, from }, done: false, heights };
+          if (dry) return result(false);
           const to = Math.min(box.height, from + Math.max(h - y, 1));
           put(to > from + 0.01 ? to : box.height);
           from = to > from + 0.01 ? to : box.height;
@@ -1110,10 +1137,10 @@ export class PdfWriter {
         }
         break;
       }
-      heights.push(Math.min(y, Math.max(h, y)));
-      if (i >= boxes.length) return { state: { i, from }, done: true, heights };
+      heights.push(y);
+      if (i >= boxes.length) return result(true);
     }
-    return { state: { i, from }, done: false, heights };
+    return result(false);
   }
 
   /** Single-column flow from the cursor on. */

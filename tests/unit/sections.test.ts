@@ -115,6 +115,31 @@ describe.skipIf(!hasCmd('pdftotext'))('sections in PDF', () => {
     expect(columnsOf(words.filter((w) => w.page === 2 && /\p{L}/u.test(w.text))).length).toBe(3); // body text, not the page number
   });
 
+  it('footnotes referenced in columns get their room; headings stay with their paragraph', async () => {
+    const blocks: Block[] = [{ type: 'section', columns: 2, gap: 20, start: 'continuous' }];
+    for (let k = 0; k < 14; k++) {
+      blocks.push({ type: 'paragraph', runs: [{ text: `Абзац${k + 1} ` + text(k, 40) }, { text: '', note: [para(`Сноска${k + 1} ` + text(k + 3, 25))] }, { text: ' конец.' }] });
+      if (k % 4 === 3) blocks.push({ type: 'heading', level: 2, runs: [{ text: `Заголовок${k}` }] });
+    }
+    const words = lines((await docToPdf({ blocks }, { fonts: loadFonts })).data).filter((w) => /\p{L}/u.test(w.text));
+    for (const page of new Set(words.map((w) => w.page))) {
+      const pw = words.filter((w) => w.page === page);
+      // footnote text is smaller than body text
+      const body = pw.filter((w) => w.y1 - w.y0 > 11);
+      const notes = pw.filter((w) => w.y1 - w.y0 < 10);
+      if (notes.length) expect(Math.max(...body.map((w) => w.y1)), `page ${page}: body runs into the footnotes`).toBeLessThan(Math.min(...notes.map((w) => w.y0)));
+      // every note sits on the page of its reference
+      for (const n of notes.filter((w) => /^Сноска\d+$/.test(w.text))) {
+        const k = n.text.slice(6);
+        expect(pw.some((w) => w.text === `Абзац${k}`) || words.find((w) => w.text === `Абзац${k}`)!.page < page, `note ${k} on page ${page}`).toBe(true);
+      }
+      for (const h of pw.filter((w) => /^Заголовок/.test(w.text))) {
+        const after = pw.filter((w) => Math.abs(w.x0 - h.x0) < 40 && w.y0 > h.y1 && w.y0 < h.y1 + 40);
+        expect(after.length, `${h.text} is followed by text in its column`).toBeGreaterThan(0);
+      }
+    }
+  });
+
   it.skipIf(!hasCmd('soffice'))('LibreOffice lays out our DOCX, ODT and RTF in the same columns', async () => {
     for (const [name, data, ext] of [
       ['docx', docToDocx(DOC).data, 'docx'],

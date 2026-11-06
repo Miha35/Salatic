@@ -310,6 +310,8 @@ function blocksHtml(blocks: Block[], notes: Notes, ctx: HtmlCtx = HTML): string 
   for (const b of blocks) {
     switch (b.type) {
       case 'section': {
+        // e-book readers paginate with CSS columns themselves: sections flow as one column there
+        if (ctx.xhtml) break;
         // a section with columns (or starting a page) wraps the blocks up to the next section
         if (sectionOpen) s += '</div>\n';
         sectionOpen = false;

@@ -459,6 +459,8 @@ class Redactor {
     let pathPts: [number, number][] = [];
     let clipped = false;
     let cur: [number, number] = [0, 0];
+    // Marked content: a span that loses glyphs loses its properties too (ActualText/Alt repeat the text)
+    const marked: { start: number; end: number; tag: string; props: boolean; removed: boolean }[] = [];
 
     const show = (op: Op, items: Operand[], prefix: string): void => {
       const font = g.fontDict ? this.fonts.get(g.fontDict) : undefined;
@@ -498,6 +500,7 @@ class Redactor {
       }
       if (font.vertical && items.some((x) => x.t === 'str')) this.warn('Вертикальный текст (CJK) не удаляется — область только закрашена.');
       if (!removed) return;
+      for (const m of marked) m.removed = true;
       this.result.glyphs += removed;
       // merge adjacent numbers
       const merged: (number | Uint8Array)[] = [];
@@ -524,6 +527,15 @@ class Redactor {
         case 'cm':
           g.ctm = mul([n(0), n(1), n(2), n(3), n(4), n(5)], g.ctm);
           break;
+        case 'BDC':
+        case 'BMC':
+          marked.push({ start: o.start, end: o.end, tag: a[0]?.t === 'name' ? a[0].v : 'Span', props: o.op === 'BDC', removed: false });
+          break;
+        case 'EMC': {
+          const m = marked.pop();
+          if (m?.removed && m.props) edits.push({ start: m.start, end: m.end, text: `/${m.tag.replace(/[^\w.-]/g, '')} BMC` });
+          break;
+        }
         case 'BT':
           tm = IDENT;
           tlm = IDENT;

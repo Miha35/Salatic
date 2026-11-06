@@ -918,6 +918,9 @@ input[type='range'] {
   background: #fff;
   touch-action: none;
 }
+.page-stage[data-pan='1'] {
+  touch-action: pan-x pan-y pinch-zoom;
+}
 
 .page-stage canvas {
   display: block;

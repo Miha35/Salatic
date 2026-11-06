@@ -2,7 +2,7 @@
 import { describe, expect, it } from 'vitest';
 import fontkit from '@pdf-lib/fontkit';
 import { unzlibSync } from 'fflate';
-import { PDFDocument, PDFName, PDFRawStream, rgb, setTextRenderingMode, StandardFonts, TextRenderingMode, type PDFPage } from 'pdf-lib';
+import { PDFDocument, PDFHexString, PDFName, PDFOperator, PDFOperatorNames, PDFRawStream, rgb, setTextRenderingMode, StandardFonts, TextRenderingMode, type PDFPage } from 'pdf-lib';
 import { redactPage, type Rect } from '../../src/core/pdf-redact';
 import { composePdf } from '../../src/core/pdf-tools';
 import { encodePng } from '../../src/core/png';
@@ -90,6 +90,30 @@ describe.skipIf(!hasCmd('pdftotext'))('redaction of text', () => {
     expect(glyphs).toBe(6);
     expect(pdfToText(out)).not.toContain('SECRET');
     expect(pdfToText(out)).toContain('visible-to-search');
+  });
+
+  it('marked content around removed text loses its ActualText (it repeats the text)', async () => {
+    const doc = await PDFDocument.create();
+    const font = await doc.embedFont(StandardFonts.Helvetica);
+    const page = doc.addPage([300, 100]);
+    page.pushOperators(PDFOperator.of(PDFOperatorNames.BeginMarkedContentSequence, [PDFName.of('Span'), doc.context.obj({ ActualText: PDFHexString.fromText('PIN 4711') }) as unknown as PDFName]));
+    page.drawText('PIN 4711', { x: 20, y: 50, size: 12, font });
+    page.pushOperators(PDFOperator.of(PDFOperatorNames.EndMarkedContent));
+    page.drawText('public', { x: 20, y: 20, size: 12, font });
+    const pdf = await doc.save();
+    expect(pdfToText(pdf)).toContain('4711');
+    // poppler reports the span's ActualText as one word: place the area by the font metrics
+    const d2 = await PDFDocument.load(pdf);
+    const x0 = 20 + font.widthOfTextAtSize('PIN ', 12);
+    const r = await redactPage(d2, d2.getPage(0), [{ x0, y0: 46, x1: x0 + font.widthOfTextAtSize('4711', 12), y1: 62 }]);
+    expect(r.glyphs).toBe(4);
+    const out = await d2.save();
+    expect(pdfToText(out)).not.toContain('4711');
+    expect(pdfToText(out)).toContain('PIN');
+    const content = (await PDFDocument.load(out)).getPage(0).node.Contents() as PDFRawStream;
+    const raw = new TextDecoder('latin1').decode(unzlibSync(content.getContents()));
+    expect(raw).not.toMatch(/ActualText/);
+    expect(raw).toMatch(/\/Span BMC/);
   });
 
   it('text inside a form XObject is removed on a private copy (other pages keep it)', async () => {
