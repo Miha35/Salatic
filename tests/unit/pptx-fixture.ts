@@ -14,7 +14,7 @@ const ph = (type: string, idx?: number): string => `<p:nvPr><p:ph type="${type}"
 const sp = (id: number, nvPr: string, spPr: string, body = ''): string => `<p:sp><p:nvSpPr><p:cNvPr id="${id}" name="s${id}"/><p:cNvSpPr/>${nvPr}</p:nvSpPr><p:spPr>${spPr}</p:spPr>${body}</p:sp>`;
 const txBody = (paras: string, bodyPr = '<a:bodyPr/>'): string => `<p:txBody>${bodyPr}<a:lstStyle/>${paras}</p:txBody>`;
 const para = (text: string, pPr = '', rPr = '<a:rPr lang="ru-RU"/>'): string => `<a:p>${pPr}<a:r>${rPr}<a:t>${text}</a:t></a:r></a:p>`;
-const tree = (shapes: string): string => `<p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/>${shapes}</p:spTree></p:cSld>`;
+const tree = (shapes: string, bg = ''): string => `<p:cSld>${bg}<p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/>${shapes}</p:spTree></p:cSld>`;
 
 /** 1 pt = 12700 EMU; the slide is 10 in × 7.5 in (720 × 540 pt). */
 const E = (pt: number): number => Math.round(pt * 12700);
@@ -58,7 +58,28 @@ export function samplePng(w = 40, h = 20): Uint8Array {
   return Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, ...chunk('IHDR', [...u32(w), ...u32(h), 8, 2, 0, 0, 0]), ...chunk('IDAT', z), ...chunk('IEND', [])]);
 }
 
-export function makePptx(chartXml?: string): Uint8Array {
+/** Extra content of slide 5: a background (`<p:bg>` children) and shapes. */
+export interface ExtraSlide {
+  title?: string;
+  bg?: string;
+  shapes?: string;
+}
+
+/** Gradient fills: a linear background, a scaled 45° rectangle, a radial (path) ellipse and a theme gradient via fillRef. */
+export const GRADIENT_SLIDE: ExtraSlide = {
+  title: 'Градиенты',
+  bg: '<p:bg><p:bgPr><a:gradFill rotWithShape="1"><a:gsLst><a:gs pos="0"><a:srgbClr val="FFFFFF"/></a:gs><a:gs pos="100000"><a:srgbClr val="BDD7EE"/></a:gs></a:gsLst><a:lin ang="5400000" scaled="0"/></a:gradFill><a:effectLst/></p:bgPr></p:bg>',
+  shapes:
+    `<p:sp><p:nvSpPr><p:cNvPr id="10" name="lin"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="${E(40)}" y="${E(150)}"/><a:ext cx="${E(300)}" cy="${E(150)}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom>` +
+    '<a:gradFill><a:gsLst><a:gs pos="0"><a:srgbClr val="C00000"/></a:gs><a:gs pos="50000"><a:srgbClr val="FFC000"/></a:gs><a:gs pos="100000"><a:srgbClr val="0070C0"/></a:gs></a:gsLst><a:lin ang="2700000" scaled="1"/></a:gradFill><a:ln><a:noFill/></a:ln></p:spPr></p:sp>' +
+    `<p:sp><p:nvSpPr><p:cNvPr id="11" name="rad"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="${E(380)}" y="${E(150)}"/><a:ext cx="${E(300)}" cy="${E(150)}"/></a:xfrm><a:prstGeom prst="ellipse"><a:avLst/></a:prstGeom>` +
+    '<a:gradFill><a:gsLst><a:gs pos="0"><a:srgbClr val="FFFFFF"/></a:gs><a:gs pos="100000"><a:srgbClr val="00B050"/></a:gs></a:gsLst><a:path path="circle"><a:fillToRect l="50000" t="50000" r="50000" b="50000"/></a:path></a:gradFill><a:ln><a:noFill/></a:ln></p:spPr></p:sp>' +
+    `<p:sp><p:nvSpPr><p:cNvPr id="12" name="themed"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="${E(40)}" y="${E(340)}"/><a:ext cx="${E(640)}" cy="${E(100)}"/></a:xfrm><a:prstGeom prst="roundRect"><a:avLst/></a:prstGeom></p:spPr>` +
+    '<p:style><a:lnRef idx="0"><a:schemeClr val="accent1"/></a:lnRef><a:fillRef idx="2"><a:schemeClr val="accent2"/></a:fillRef><a:effectRef idx="0"><a:schemeClr val="accent1"/></a:effectRef><a:fontRef idx="minor"><a:schemeClr val="lt1"/></a:fontRef></p:style></p:sp>',
+};
+
+export function makePptx(chartXml?: string, extra?: ExtraSlide): Uint8Array {
+  const slide5 = !!chartXml || !!extra;
   const theme =
     `<?xml version="1.0" encoding="UTF-8"?><a:theme ${NS} name="Office"><a:themeElements><a:clrScheme name="Office">` +
     '<a:dk1><a:sysClr val="windowText" lastClr="000000"/></a:dk1><a:lt1><a:sysClr val="window" lastClr="FFFFFF"/></a:lt1>' +
@@ -66,7 +87,7 @@ export function makePptx(chartXml?: string): Uint8Array {
     '<a:accent2><a:srgbClr val="ED7D31"/></a:accent2><a:accent3><a:srgbClr val="A5A5A5"/></a:accent3><a:accent4><a:srgbClr val="FFC000"/></a:accent4>' +
     '<a:accent5><a:srgbClr val="5B9BD5"/></a:accent5><a:accent6><a:srgbClr val="70AD47"/></a:accent6><a:hlink><a:srgbClr val="0563C1"/></a:hlink><a:folHlink><a:srgbClr val="954F72"/></a:folHlink></a:clrScheme>' +
     '<a:fontScheme name="Office"><a:majorFont><a:latin typeface="Calibri Light"/><a:ea typeface=""/><a:cs typeface=""/></a:majorFont><a:minorFont><a:latin typeface="Calibri"/><a:ea typeface=""/><a:cs typeface=""/></a:minorFont></a:fontScheme>' +
-    '<a:fmtScheme name="Office"><a:fillStyleLst><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:fillStyleLst>' +
+    '<a:fmtScheme name="Office"><a:fillStyleLst><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:gradFill rotWithShape="1"><a:gsLst><a:gs pos="0"><a:schemeClr val="phClr"><a:lumMod val="110000"/><a:satMod val="105000"/><a:tint val="67000"/></a:schemeClr></a:gs><a:gs pos="50000"><a:schemeClr val="phClr"><a:lumMod val="105000"/><a:satMod val="103000"/><a:tint val="73000"/></a:schemeClr></a:gs><a:gs pos="100000"><a:schemeClr val="phClr"><a:lumMod val="105000"/><a:satMod val="109000"/><a:tint val="81000"/></a:schemeClr></a:gs></a:gsLst><a:lin ang="5400000" scaled="0"/></a:gradFill><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:fillStyleLst>' +
     '<a:lnStyleLst><a:ln w="6350"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln><a:ln w="12700"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln><a:ln w="19050"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln></a:lnStyleLst>' +
     '<a:effectStyleLst><a:effectStyle><a:effectLst/></a:effectStyle><a:effectStyle><a:effectLst/></a:effectStyle><a:effectStyle><a:effectLst/></a:effectStyle></a:effectStyleLst>' +
     '<a:bgFillStyleLst><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:bgFillStyleLst></a:fmtScheme></a:themeElements></a:theme>';
@@ -144,14 +165,14 @@ export function makePptx(chartXml?: string): Uint8Array {
     `<?xml version="1.0" encoding="UTF-8"?><p:notes ${NS}>` + tree(sp(2, ph('body', 1), '', txBody(para('Не забыть про сроки')))) + '</p:notes>';
   const pres =
     `<?xml version="1.0" encoding="UTF-8"?><p:presentation ${NS}><p:sldMasterIdLst><p:sldMasterId id="2147483648" r:id="rId1"/></p:sldMasterIdLst>` +
-    `<p:sldIdLst><p:sldId id="256" r:id="rId2"/><p:sldId id="257" r:id="rId3"/><p:sldId id="258" r:id="rId4"/><p:sldId id="259" r:id="rId5"/>${chartXml ? '<p:sldId id="260" r:id="rId7"/>' : ''}</p:sldIdLst>` +
+    `<p:sldIdLst><p:sldId id="256" r:id="rId2"/><p:sldId id="257" r:id="rId3"/><p:sldId id="258" r:id="rId4"/><p:sldId id="259" r:id="rId5"/>${slide5 ? '<p:sldId id="260" r:id="rId7"/>' : ''}</p:sldIdLst>` +
     `<p:sldSz cx="${E(720)}" cy="${E(540)}"/><p:notesSz cx="6858000" cy="9144000"/></p:presentation>`;
   const ct =
     '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="png" ContentType="image/png"/>' +
     '<Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>' +
     '<Override PartName="/ppt/slideMasters/slideMaster1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideMaster+xml"/>' +
     [1, 2].map((i) => `<Override PartName="/ppt/slideLayouts/slideLayout${i}.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml"/>`).join('') +
-    (chartXml ? [1, 2, 3, 4, 5] : [1, 2, 3, 4]).map((i) => `<Override PartName="/ppt/slides/slide${i}.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>`).join('') +
+    (slide5 ? [1, 2, 3, 4, 5] : [1, 2, 3, 4]).map((i) => `<Override PartName="/ppt/slides/slide${i}.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>`).join('') +
     (chartXml ? '<Override PartName="/ppt/charts/chart1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/>' : '') +
     '<Override PartName="/ppt/notesSlides/notesSlide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.notesSlide+xml"/>' +
     '<Override PartName="/ppt/theme/theme1.xml" ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/></Types>';
@@ -167,7 +188,7 @@ export function makePptx(chartXml?: string): Uint8Array {
         ['rId4', 'slide', 'slides/slide3.xml'],
         ['rId5', 'slide', 'slides/slide4.xml'],
         ['rId6', 'theme', 'theme/theme1.xml'],
-        ...(chartXml ? [['rId7', 'slide', 'slides/slide5.xml'] as [string, string, string]] : []),
+        ...(slide5 ? [['rId7', 'slide', 'slides/slide5.xml'] as [string, string, string]] : []),
       ]),
     ),
     'ppt/theme/theme1.xml': strToU8(theme),
@@ -197,24 +218,23 @@ export function makePptx(chartXml?: string): Uint8Array {
     'ppt/slides/slide3.xml': strToU8(slide3),
     'ppt/slides/_rels/slide3.xml.rels': strToU8(rels([['rId1', 'slideLayout', '../slideLayouts/slideLayout2.xml']])),
     'ppt/slides/slide4.xml': strToU8(slide4),
-    ...(chartXml
+    ...(slide5
       ? {
           'ppt/slides/slide5.xml': strToU8(
             `<?xml version="1.0" encoding="UTF-8"?><p:sld ${NS}>` +
               tree(
-                sp(2, ph('title'), '', txBody(para('Слайд с диаграммой'))) +
-                  `<p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id="5" name="Chart"/><p:cNvGraphicFramePr/><p:nvPr/></p:nvGraphicFramePr><p:xfrm><a:off x="${E(60)}" y="${E(140)}"/><a:ext cx="${E(600)}" cy="${E(350)}"/></p:xfrm>` +
-                  '<a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" r:id="rId2"/></a:graphicData></a:graphic></p:graphicFrame>',
+                sp(2, ph('title'), '', txBody(para(extra?.title ?? 'Слайд с диаграммой'))) +
+                  (extra?.shapes ?? '') +
+                  (chartXml
+                    ? `<p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id="5" name="Chart"/><p:cNvGraphicFramePr/><p:nvPr/></p:nvGraphicFramePr><p:xfrm><a:off x="${E(60)}" y="${E(140)}"/><a:ext cx="${E(600)}" cy="${E(350)}"/></p:xfrm>` +
+                      '<a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" r:id="rId2"/></a:graphicData></a:graphic></p:graphicFrame>'
+                    : ''),
+                extra?.bg,
               ) +
               '<p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sld>',
           ),
-          'ppt/slides/_rels/slide5.xml.rels': strToU8(
-            rels([
-              ['rId1', 'slideLayout', '../slideLayouts/slideLayout2.xml'],
-              ['rId2', 'chart', '../charts/chart1.xml'],
-            ]),
-          ),
-          'ppt/charts/chart1.xml': strToU8(chartXml),
+          'ppt/slides/_rels/slide5.xml.rels': strToU8(rels([['rId1', 'slideLayout', '../slideLayouts/slideLayout2.xml'], ...(chartXml ? [['rId2', 'chart', '../charts/chart1.xml'] as [string, string, string]] : [])])),
+          ...(chartXml ? { 'ppt/charts/chart1.xml': strToU8(chartXml) } : {}),
         }
       : {}),
     'ppt/slides/_rels/slide4.xml.rels': strToU8(rels([['rId1', 'slideLayout', '../slideLayouts/slideLayout2.xml']])),

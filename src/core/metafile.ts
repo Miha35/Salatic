@@ -6,11 +6,11 @@
  * Clipping regions and raster operations other than copy are not applied.
  */
 import { zlibSync } from 'fflate';
-import { familyOf, type FontFamily } from './model';
+import { familyOf, type FontFamily, type Gradient } from './model';
 import { bytesToBase64, escapeXml } from './util';
 
 export type MetaCmd =
-  | { k: 'path'; d: string; fill?: string; evenOdd: boolean; stroke?: string; width: number; dash?: number[]; opacity?: number; strokeOpacity?: number }
+  | { k: 'path'; d: string; fill?: string; evenOdd: boolean; stroke?: string; width: number; dash?: number[]; opacity?: number; strokeOpacity?: number; /** Gradient fill (drawing space); `fill` is its average colour. */ grad?: Gradient }
   | {
       k: 'text';
       x: number;

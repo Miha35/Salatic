@@ -11,7 +11,8 @@ import type { Deck, Slide, SlideBullet, SlideElement, SlideLine, SlidePara, Slid
 import { child, childrenNamed, elements, find, parseXml, textContent, type XNode } from '../xml';
 import { ConvertError, sniffImageMime, unzipOffice } from '../util';
 import { chartToSvg } from '../chart';
-import { colorOf, hexToRgb, rgbToHex, type Theme } from '../drawingml';
+import { colorOf, gradientOf, hexToRgb, rgbToHex, type Theme } from '../drawingml';
+import { gradientAverage, type Gradient } from '../model';
 
 const decoder = new TextDecoder('utf-8');
 const EMU = 12700; // EMU per point
@@ -75,6 +76,9 @@ class PptxReader {
   warnings = new Set<string>();
   private theme: Theme = { colors: {}, major: 'Calibri Light', minor: 'Calibri', fills: [] };
   private defaultTextStyle?: XNode;
+  /** Slide size (pt). */
+  private width = 720;
+  private height = 540;
   private parts = new Map<string, Part>();
 
   constructor(private files: Record<string, Uint8Array>) {}
@@ -111,6 +115,8 @@ class PptxReader {
     const sz = find(pres.xml, 'p:sldSz');
     const width = pt(sz?.attrs.cx, 720);
     const height = pt(sz?.attrs.cy, 540);
+    this.width = width;
+    this.height = height;
     this.defaultTextStyle = find(pres.xml, 'p:defaultTextStyle');
     const slides: Slide[] = [];
     const ids = childrenNamed(find(pres.xml, 'p:sldIdLst'), 'p:sldId');
@@ -145,6 +151,7 @@ class PptxReader {
     if (major) this.theme.major = major;
     if (minor) this.theme.minor = minor;
     this.theme.fills = elements(find(p.xml, 'a:fillStyleLst'));
+    this.theme.bgFills = elements(find(p.xml, 'a:bgFillStyleLst'));
   }
 
   private masterLike(p: Part | undefined, parentMap?: Record<string, string>): MasterLike | undefined {
@@ -202,9 +209,8 @@ class PptxReader {
       if (solid) return { color: colorOf(solid, this.theme, map)?.hex };
       const grad = child(pr, 'a:gradFill');
       if (grad) {
-        const stops = childrenNamed(find(grad, 'a:gsLst'), 'a:gs');
-        const mid = stops[Math.floor(stops.length / 2)] ?? stops[0];
-        return { color: colorOf(mid, this.theme, map)?.hex };
+        const g = gradientOf(grad, this.width, this.height, this.theme, map);
+        return g ? { color: gradientAverage(g), gradient: g } : undefined;
       }
       const blip = child(pr, 'a:blipFill');
       if (blip) {
@@ -218,11 +224,11 @@ class PptxReader {
       const color = colorOf(ref, this.theme, map)?.hex;
       const idx = +(ref.attrs.idx ?? 0);
       // 1001+ refer to the background fill style list; a solid style takes the reference colour
-      const style = this.theme.fills[idx - 1001] ?? this.theme.fills[idx - 1];
-      if (style?.name === 'a:solidFill' || !style) return { color };
+      const style = idx >= 1001 ? (this.theme.bgFills?.[idx - 1001] ?? this.theme.fills[idx - 1001]) : this.theme.fills[idx - 1];
+      if (style?.name === 'a:solidFill' || !style) return { color: style ? (colorOf(style, this.theme, map, color)?.hex ?? color) : color };
       if (style.name === 'a:gradFill') {
-        const stops = childrenNamed(find(style, 'a:gsLst'), 'a:gs');
-        return { color: colorOf(stops[0], this.theme, map, color)?.hex ?? color };
+        const g = gradientOf(style, this.width, this.height, this.theme, map, color);
+        return g ? { color: gradientAverage(g), gradient: g } : { color };
       }
       return { color };
     }
@@ -351,7 +357,7 @@ class PptxReader {
     const spPr = child(n, 'p:spPr');
     const style = child(n, 'p:style');
     const geom = find(spPr, 'a:prstGeom')?.attrs.prst ?? (find(spPr, 'a:custGeom') ? 'rect' : 'rect');
-    const fill = this.fill(spPr, style, ctx);
+    const fill = this.fill(spPr, style, ctx, geo.w, geo.h);
     const line = this.line(spPr, style, ctx);
     const type = ph?.type;
     const role: SlideRole = type === 'title' || type === 'ctrTitle' ? 'title' : type === 'subTitle' ? 'subtitle' : type === 'dt' || type === 'ftr' || type === 'sldNum' ? 'footer' : ph ? 'body' : 'other';
@@ -368,21 +374,33 @@ class PptxReader {
       return;
     }
     if (!fill && !line && !text) return;
-    out.push({ kind: 'shape', ...geo, geom, rot: xf.rot || undefined, fill: fill?.hex, fillOpacity: fill && fill.alpha < 1 ? fill.alpha : undefined, line, text, role });
+    out.push({ kind: 'shape', ...geo, geom, rot: xf.rot || undefined, fill: fill?.hex, fillOpacity: fill && fill.alpha < 1 ? fill.alpha : undefined, ...(fill?.grad ? { gradient: fill.grad } : {}), line, text, role });
   }
 
-  private fill(spPr: XNode | undefined, style: XNode | undefined, ctx: ShapeCtx): { hex: string; alpha: number } | undefined {
+  private fill(spPr: XNode | undefined, style: XNode | undefined, ctx: ShapeCtx, w = 0, h = 0): { hex: string; alpha: number; grad?: Gradient } | undefined {
     if (child(spPr, 'a:noFill')) return undefined;
     const solid = child(spPr, 'a:solidFill');
     if (solid) return colorOf(solid, this.theme, ctx.map);
+    const fromGrad = (g: XNode, ph?: string): { hex: string; alpha: number; grad?: Gradient } | undefined => {
+      const grad = gradientOf(g, w || 100, h || 100, this.theme, ctx.map, ph);
+      if (!grad) return undefined;
+      const alphas = grad.stops.map((s) => s.alpha ?? 1);
+      // the shading carries the stop alpha; `alpha` here is only for writers that use the average colour
+      return { hex: gradientAverage(grad), alpha: alphas.reduce((a, b) => a + b, 0) / alphas.length, grad: w && h ? grad : undefined };
+    };
     const grad = child(spPr, 'a:gradFill');
-    if (grad) {
-      const stops = childrenNamed(find(grad, 'a:gsLst'), 'a:gs');
-      return colorOf(stops[Math.floor(stops.length / 2)] ?? stops[0], this.theme, ctx.map);
-    }
+    if (grad) return fromGrad(grad);
     if (child(spPr, 'a:blipFill') || child(spPr, 'a:pattFill') || child(spPr, 'a:grpFill')) return undefined;
     const ref = find(style, 'a:fillRef');
-    if (ref && +(ref.attrs.idx ?? 0) > 0) return colorOf(ref, this.theme, ctx.map);
+    const idx = +(ref?.attrs.idx ?? 0);
+    if (ref && idx > 0) {
+      const base = colorOf(ref, this.theme, ctx.map);
+      // fillRef points into the theme's fill styles; gradients there are tinted from the reference colour
+      const themed = this.theme.fills[idx - 1];
+      if (themed?.name === 'a:gradFill') return fromGrad(themed, base?.hex) ?? base;
+      if (themed?.name === 'a:solidFill' && base) return colorOf(themed, this.theme, ctx.map, base.hex) ?? base;
+      return base;
+    }
     return undefined;
   }
 

@@ -11,10 +11,10 @@
  * per-character fallback (DejaVu Sans → Noto Sans CJK → Noto Emoji), Word-style line
  * spacing from the fonts' Windows metrics, subsetting with HarfBuzz.
  */
-import { clip, concatTransformationMatrix, degrees, endPath, PDFDocument, PDFName, PDFString, popGraphicsState, pushGraphicsState, rectangle, rgb, type PDFImage, type PDFPage } from 'pdf-lib';
+import { clip, concatTransformationMatrix, degrees, drawSvgPath, endPath, PDFDict, PDFDocument, PDFName, PDFNumber, PDFOperator, PDFOperatorNames, PDFString, popGraphicsState, pushGraphicsState, rectangle, rgb, setGraphicsState, type PDFContext, type PDFImage, type PDFObject, type PDFPage, type PDFRef } from 'pdf-lib';
 import { parseMetafile, type Metafile } from '../metafile';
 import { parseSvg } from '../svg-render';
-import type { Align, Block, Doc, FontFamily, ParaFormat, TextRun } from '../model';
+import type { Align, Block, Doc, FontFamily, Gradient, ParaFormat, TextRun } from '../model';
 import { FontManager, styleOf, type FontKey, type FontLoader } from '../pdf-fonts';
 import type { Subsetter } from '../hb-subset';
 import { cleanText, maxOf } from '../util';
@@ -94,8 +94,90 @@ const FALLBACK_CHARS: Record<string, string> = { '\u2028': ' ', '\u2029': ' ' };
 
 export const hexColor = (hex: string): Color => [parseInt(hex.slice(0, 2), 16) / 255, parseInt(hex.slice(2, 4), 16) / 255, parseInt(hex.slice(4, 6), 16) / 255];
 
+/** A PDF function mapping 0…1 to the gradient colours: one exponential segment per stop pair, stitched. */
+function gradientFunction(ctx: PDFContext, g: Gradient, channel: 'rgb' | 'alpha' = 'rgb'): PDFObject {
+  const rgb = (c: string): number[] => [0, 2, 4].map((o) => Math.round(((parseInt(c.slice(o, o + 2), 16) || 0) / 255) * 1000) / 1000);
+  const value = (st: { color: string; alpha?: number }): number[] => (channel === 'rgb' ? rgb(st.color) : [Math.round((st.alpha ?? 1) * 1000) / 1000]);
+  const stops = g.stops.map((s) => ({ pos: Math.min(1, Math.max(0, s.pos)), color: s.color, alpha: s.alpha })).sort((a, b) => a.pos - b.pos);
+  if (!stops.length) stops.push({ pos: 0, color: '000000', alpha: 1 });
+  if (stops[0].pos > 0) stops.unshift({ ...stops[0], pos: 0 });
+  if (stops[stops.length - 1].pos < 1) stops.push({ ...stops[stops.length - 1], pos: 1 });
+  // bounds must increase strictly: nudge hard stops apart
+  for (let i = 1; i < stops.length; i++) if (stops[i].pos <= stops[i - 1].pos) stops[i].pos = Math.min(1, stops[i - 1].pos + 1e-4);
+  const seg = (a: { color: string; alpha?: number }, b: { color: string; alpha?: number }): PDFObject => ctx.obj({ FunctionType: 2, Domain: [0, 1], C0: value(a), C1: value(b), N: 1 });
+  if (stops.length === 2) return seg(stops[0], stops[1]);
+  const fns = stops.slice(1).map((s, i) => seg(stops[i], s));
+  return ctx.obj({ FunctionType: 3, Domain: [0, 1], Functions: fns, Bounds: stops.slice(1, -1).map((s) => Math.round(s.pos * 10000) / 10000), Encode: fns.flatMap(() => [0, 1]) });
+}
+
 export class PdfWriter {
   protected pdf!: PDFDocument;
+  private shadings = new Map<Gradient, PDFRef>();
+  private pageShadings = new WeakMap<PDFPage, number>();
+
+  /**
+   * Fill SVG path `d` (drawn at x, y like drawSvgPath, y down) with a gradient: the path becomes the
+   * clip and an axial/radial shading paints it, so colours blend smoothly in any viewer and printer.
+   */
+  protected fillGradient(page: PDFPage, d: string, g: Gradient, x: number, y: number, opacity = 1): void {
+    const ctx = this.pdf.context;
+    let ref = this.shadings.get(g);
+    if (!ref) {
+      const c = g.coords.map((v) => Math.round(v * 1000) / 1000);
+      ref = ctx.register(ctx.obj({ ShadingType: g.kind === 'linear' ? 2 : 3, ColorSpace: 'DeviceRGB', Coords: c, Function: gradientFunction(ctx, g), Extend: [true, true] }));
+      this.shadings.set(g, ref);
+    }
+    const res = page.node.normalizedEntries().Resources;
+    let dict = res.lookupMaybe(PDFName.of('Shading'), PDFDict);
+    if (!dict) {
+      dict = ctx.obj({});
+      res.set(PDFName.of('Shading'), dict);
+    }
+    const n = (this.pageShadings.get(page) ?? 0) + 1;
+    this.pageShadings.set(page, n);
+    const name = PDFName.of(`Sh${n}`);
+    dict.set(name, ref);
+    const alphas = g.stops.map((s) => s.alpha ?? 1);
+    const varying = Math.max(...alphas) - Math.min(...alphas) > 0.005;
+    const alpha = opacity * (varying ? 1 : alphas[0]);
+    const gsDict = ctx.obj({ Type: 'ExtGState' });
+    let gsUsed = false;
+    if (alpha < 0.999) {
+      gsDict.set(PDFName.of('ca'), PDFNumber.of(Math.round(alpha * 1000) / 1000));
+      gsUsed = true;
+    }
+    if (varying) {
+      // Stop opacity varies: a luminosity soft mask painted with the same geometry, alpha as gray
+      const c = g.coords.map((v) => Math.round(v * 1000) / 1000);
+      const alphaSh = ctx.register(ctx.obj({ ShadingType: g.kind === 'linear' ? 2 : 3, ColorSpace: 'DeviceGray', Coords: c, Function: gradientFunction(ctx, g, 'alpha'), Extend: [true, true] }));
+      const m = g.matrix ? `${g.matrix.map((v) => Math.round(v * 10000) / 10000).join(' ')} cm ` : '';
+      const form = ctx.register(
+        ctx.stream(`${m}/Sa sh`, {
+          Type: 'XObject',
+          Subtype: 'Form',
+          BBox: [-100000, -100000, 100000, 100000],
+          Group: { S: 'Transparency', CS: 'DeviceGray' },
+          Resources: { Shading: { Sa: alphaSh } },
+        }),
+      );
+      gsDict.set(PDFName.of('SMask'), ctx.obj({ Type: 'Mask', S: 'Luminosity', G: form }));
+      gsUsed = true;
+    }
+    // The mask is defined in the user space current when the state is set: after the path transforms
+    const gs = gsUsed ? page.node.newExtGState('GS', gsDict) : undefined;
+    // drawSvgPath gives: q, transforms, path…, h, Q — keep the transforms and the path
+    const body = drawSvgPath(d, { x, y, scale: undefined, color: undefined, borderColor: undefined, borderWidth: 0 }).slice(1, -2);
+    page.pushOperators(
+      pushGraphicsState(),
+      ...body,
+      clip(),
+      endPath(),
+      ...(gs ? [setGraphicsState(gs)] : []),
+      ...(g.matrix ? [concatTransformationMatrix(...g.matrix)] : []),
+      PDFOperator.of(PDFOperatorNames.ShadingFill, [name]),
+      popGraphicsState(),
+    );
+  }
   protected fm: FontManager;
   protected images = new Map<Uint8Array, PDFImage | null>();
   warnings = new Set<string>();
@@ -460,6 +542,11 @@ export class PdfWriter {
     let flowX = 0;
     m.cmds.forEach((c, i) => {
       if (c.k === 'path') {
+        if (c.grad && c.fill) {
+          this.fillGradient(page, c.d, c.grad, 0, 0, c.opacity ?? 1);
+          if (c.stroke) page.drawSvgPath(c.d, { x: 0, y: 0, borderColor: rgb(...hexColor(c.stroke)), borderWidth: c.width, borderDashArray: c.dash, borderOpacity: c.strokeOpacity !== undefined && c.strokeOpacity < 1 ? c.strokeOpacity : undefined });
+          return;
+        }
         page.drawSvgPath(c.d, {
           x: 0,
           y: 0,

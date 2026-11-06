@@ -12,6 +12,39 @@ export type Align = 'left' | 'center' | 'right' | 'justify';
  */
 export type FontFamily = 'sans' | 'serif' | 'mono' | 'calibri';
 
+export interface GradientStop {
+  /** 0…1 along the gradient */
+  pos: number;
+  color: string;
+  alpha?: number;
+}
+
+/** A colour gradient. Coordinates are in gradient space; `matrix` maps it to the drawing space (y down). */
+export interface Gradient {
+  kind: 'linear' | 'radial';
+  stops: GradientStop[];
+  /** linear: [x1, y1, x2, y2]; radial: [fx, fy, fr, cx, cy, r] (focal circle → outer circle) */
+  coords: number[];
+  matrix?: [number, number, number, number, number, number];
+}
+
+/** One colour standing in for a gradient where it cannot be drawn (stops weighted by the span they cover). */
+export function gradientAverage(g: Gradient): string {
+  const s = g.stops;
+  if (!s.length) return '000000';
+  const rgb = (c: string): number[] => [0, 2, 4].map((o) => parseInt(c.slice(o, o + 2), 16) || 0);
+  const acc = [0, 0, 0];
+  let total = 0;
+  s.forEach((st, i) => {
+    const lo = i ? (s[i - 1].pos + st.pos) / 2 : 0;
+    const hi = i < s.length - 1 ? (st.pos + s[i + 1].pos) / 2 : 1;
+    const w = Math.max(hi - lo, 1e-3);
+    rgb(st.color).forEach((v, k) => (acc[k] += v * w));
+    total += w;
+  });
+  return acc.map((v) => Math.round(v / total).toString(16).padStart(2, '0')).join('').toUpperCase();
+}
+
 export interface ChartSource {
   xml: string;
   /** Theme colour scheme the chart resolves scheme colours against (dk1, lt1, accent1…). */

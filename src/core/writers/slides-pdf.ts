@@ -16,6 +16,15 @@ interface TextLayout {
   height: number;
 }
 
+/** An ellipse inscribed in a w × h box, as four cubic Béziers (y down). */
+function ellipsePath(w: number, h: number): string {
+  const k = 0.5523;
+  const rx = w / 2;
+  const ry = h / 2;
+  const f = (n: number): string => n.toFixed(2);
+  return `M${f(w)} ${f(ry)} C${f(w)} ${f(ry + k * ry)} ${f(rx + k * rx)} ${f(h)} ${f(rx)} ${f(h)} C${f(rx - k * rx)} ${f(h)} 0 ${f(ry + k * ry)} 0 ${f(ry)} C0 ${f(ry - k * ry)} ${f(rx - k * rx)} 0 ${f(rx)} 0 C${f(rx + k * rx)} 0 ${f(w)} ${f(ry - k * ry)} ${f(w)} ${f(ry)} Z`;
+}
+
 export class SlidePdfWriter extends PdfWriter {
   private cmds: Cmd[][] = [];
 
@@ -40,7 +49,9 @@ export class SlidePdfWriter extends PdfWriter {
       const W = deck.width;
       const H = deck.height;
       cmds.push((page) => page.drawRectangle({ x: 0, y: 0, width: W, height: H, color: rgb(1, 1, 1) }));
-      if (slide.background?.color) {
+      const bgGrad = slide.background?.gradient;
+      if (bgGrad) cmds.push((page) => this.fillGradient(page, `M0 0 H${W} V${H} H0 Z`, bgGrad, 0, H));
+      else if (slide.background?.color) {
         const c = hexColor(slide.background.color);
         cmds.push((page) => page.drawRectangle({ x: 0, y: 0, width: W, height: H, color: rgb(...c) }));
       }
@@ -198,8 +209,17 @@ export class SlidePdfWriter extends PdfWriter {
         const border = this.stroke(e.line);
         if (fill || e.line) {
           const path = this.path(e.geom, e.w, e.h);
+          const grad = e.gradient;
           cmds.push((page) =>
             this.rotated(page, e, e.rot, () => {
+              if (grad) {
+                // the shading fills the outline; the border is stroked on top
+                const round = e.geom === 'ellipse' || e.geom === 'flowChartConnector' || e.geom === 'donut';
+                const d = round ? ellipsePath(e.w, e.h) : (path ?? `M0 0 H${e.w} V${e.h} H0 Z`);
+                this.fillGradient(page, d, grad, e.x, H - e.y);
+                if (e.line) page.drawSvgPath(d, { x: e.x, y: H - e.y, ...border });
+                return;
+              }
               const common = { color: fill ? rgb(...fill) : undefined, opacity: e.fillOpacity, ...border };
               if (e.geom === 'ellipse' || e.geom === 'flowChartConnector' || e.geom === 'donut') page.drawEllipse({ x: e.x + e.w / 2, y: H - e.y - e.h / 2, xScale: e.w / 2, yScale: e.h / 2, ...common });
               else if (path) page.drawSvgPath(path, { x: e.x, y: H - e.y, ...common });

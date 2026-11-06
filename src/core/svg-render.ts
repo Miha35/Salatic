@@ -3,10 +3,10 @@
  * generated charts are drawn as real vectors with real text in PDFs. Supports the
  * static subset documents use: shapes, paths (incl. arcs), transforms, groups,
  * <use>, presentation attributes, inline styles and simple class/type CSS rules,
- * text with tspans, embedded PNG/JPEG images. Gradients are approximated by their
- * average colour; filters, masks and clip paths are ignored.
+ * text with tspans, embedded PNG/JPEG images, linear and radial gradient fills (drawn as PDF
+ * shadings; writers without gradients use the average colour). Filters, masks and clip paths are ignored.
  */
-import { familyOf, type FontFamily } from './model';
+import { familyOf, gradientAverage, type FontFamily, type Gradient, type GradientStop } from './model';
 import type { Metafile, MetaCmd } from './metafile';
 import { parseDataUri } from './util';
 import { elements, parseXml, textContent, type XNode } from './xml';
@@ -275,6 +275,8 @@ interface Style {
   fontStyle: string;
   anchor: 'start' | 'middle' | 'end';
   display: boolean;
+  /** id of the gradient painting the fill (url(#id)) */
+  fillGrad?: string;
 }
 
 const len = (v: string | undefined, ref = 0): number | undefined => {
@@ -307,6 +309,9 @@ class SvgRenderer {
   private ids = new Map<string, XNode>();
   private rules: { sel: string; decl: Record<string, string> }[] = [];
   private depth = 0;
+  /** viewBox size: the reference for percentages in userSpaceOnUse gradients */
+  rootW = 300;
+  rootH = 150;
 
   constructor(private root: XNode) {
     const index = (n: XNode): void => {
@@ -358,7 +363,10 @@ class SvgRenderer {
       return cssColor(v);
     };
     const f = paint(props.fill, parent.fill);
-    if (f !== undefined) s.fill = f;
+    if (f !== undefined) {
+      s.fill = f;
+      s.fillGrad = /url\(\s*#([^)\s]+)\s*\)/.exec(props.fill ?? '')?.[1];
+    }
     const st = paint(props.stroke, parent.stroke);
     if (st !== undefined) s.stroke = st;
     if (props['fill-opacity'] !== undefined) s.fillOpacity = Number(props['fill-opacity']);
@@ -394,16 +402,80 @@ class SvgRenderer {
 
   private paint(d: string, s: Style, m: M): void {
     if (!d || !s.display) return;
-    const fill = s.fill ?? undefined;
+    let fill = s.fill ?? undefined;
     const stroke = s.stroke && s.strokeWidth > 0 ? s.stroke : undefined;
     if (!fill && !stroke) return;
     const k = scaleOf(m);
-    this.cmds.push({ k: 'path', d, fill, evenOdd: s.evenOdd, stroke, width: s.strokeWidth * k, dash: s.dash?.map((x) => x * k), opacity: s.opacity * s.fillOpacity, strokeOpacity: s.opacity * s.strokeOpacity });
+    const grad = fill && s.fillGrad ? this.gradient(s.fillGrad, this.lastBox, m) : undefined;
+    if (grad) fill = gradientAverage(grad);
+    this.cmds.push({ k: 'path', d, fill, evenOdd: s.evenOdd, stroke, width: s.strokeWidth * k, dash: s.dash?.map((x) => x * k), opacity: s.opacity * s.fillOpacity, strokeOpacity: s.opacity * s.strokeOpacity, ...(grad ? { grad } : {}) });
+  }
+
+  /** Bounding box (user space) of the last path passed through pathD — the objectBoundingBox of gradients. */
+  private lastBox: [number, number, number, number] = [0, 0, 0, 0];
+
+  /** linearGradient / radialGradient → gradient in output space (follows href templates). */
+  private gradient(id: string, box: [number, number, number, number], m: M): Gradient | undefined {
+    const chain: XNode[] = [];
+    for (let g = this.ids.get(id); g && chain.length < 8 && !chain.includes(g); ) {
+      chain.push(g);
+      const href = (g.attrs.href ?? g.attrs['xlink:href'] ?? '').replace(/^#/, '');
+      g = href ? this.ids.get(href) : undefined;
+    }
+    const tag = chain[0] ? local(chain[0].name) : '';
+    if (tag !== 'linearGradient' && tag !== 'radialGradient') return undefined;
+    const attr = (k: string): string | undefined => chain.find((n) => n.attrs[k] !== undefined)?.attrs[k];
+    const holder = chain.find((n) => elements(n).some((c) => local(c.name) === 'stop'));
+    const stops: GradientStop[] = [];
+    for (const st of holder ? elements(holder).filter((c) => local(c.name) === 'stop') : []) {
+      const css = { ...st.attrs, ...declarations(st.attrs.style ?? '') };
+      const off = css.offset ?? '0';
+      const pos = Math.min(1, Math.max(stops.length ? stops[stops.length - 1].pos : 0, off.trim().endsWith('%') ? parseFloat(off) / 100 : parseFloat(off) || 0));
+      const color = cssColor(css['stop-color'] ?? '#000') ?? '000000';
+      const a = css['stop-opacity'] !== undefined ? Math.min(1, Math.max(0, Number(css['stop-opacity']))) : 1;
+      stops.push({ pos, color, ...(a < 1 ? { alpha: a } : {}) });
+    }
+    if (!stops.length) return undefined;
+    const bbox = attr('gradientUnits') !== 'userSpaceOnUse';
+    const num = (k: string, def: number, ref: number): number => {
+      const v = attr(k);
+      if (v === undefined) return def;
+      if (bbox) return v.trim().endsWith('%') ? parseFloat(v) / 100 : parseFloat(v) || 0;
+      return len(v, ref) ?? def;
+    };
+    let g: M = parseTransform(attr('gradientTransform'));
+    if (bbox) {
+      const [x0, y0, x1, y1] = box;
+      if (!(x1 - x0 > 0) || !(y1 - y0 > 0)) return undefined;
+      g = mul([x1 - x0, 0, 0, y1 - y0, x0, y0], g);
+    }
+    const W = bbox ? 1 : this.rootW;
+    const H = bbox ? 1 : this.rootH;
+    const D = bbox ? 1 : Math.hypot(this.rootW, this.rootH) / Math.SQRT2;
+    let coords: number[];
+    if (tag === 'linearGradient') coords = [num('x1', 0, W), num('y1', 0, H), num('x2', W, W), num('y2', 0, H)];
+    else {
+      const cx = num('cx', W / 2, W);
+      const cy = num('cy', H / 2, H);
+      coords = [num('fx', cx, W), num('fy', cy, H), num('fr', 0, D), cx, cy, num('r', D / 2, D)];
+    }
+    return { kind: tag === 'linearGradient' ? 'linear' : 'radial', stops, coords, matrix: mul(m, g) };
   }
 
   private pathD(segs: ReturnType<typeof parsePath>, m: M): string {
     const f = (n: number): string => (Math.round(n * 100) / 100).toString();
     let d = '';
+    const box: [number, number, number, number] = [Infinity, Infinity, -Infinity, -Infinity];
+    for (const s of segs)
+      for (let i = 1; i + 1 < s.length; i += 2) {
+        const x = s[i] as number;
+        const y = s[i + 1] as number;
+        box[0] = Math.min(box[0], x);
+        box[1] = Math.min(box[1], y);
+        box[2] = Math.max(box[2], x);
+        box[3] = Math.max(box[3], y);
+      }
+    this.lastBox = box;
     for (const s of segs) {
       if (s[0] === 'Z') d += 'Z ';
       else if (s[0] === 'C') {
@@ -594,6 +666,8 @@ export function parseSvg(data: Uint8Array | string): Metafile | null {
   const outW = wAttr && !/%/.test(root.attrs.width ?? '') ? wAttr : vw;
   const outH = hAttr && !/%/.test(root.attrs.height ?? '') ? hAttr : vh;
   const r = new SvgRenderer(root);
+  r.rootW = vw;
+  r.rootH = vh;
   const base: Style = { fill: '000000', fillOpacity: 1, stroke: null, strokeOpacity: 1, strokeWidth: 1, opacity: 1, evenOdd: false, fontSize: 16, fontFamily: 'sans-serif', fontWeight: '400', fontStyle: 'normal', anchor: 'start', display: true };
   // viewBox → output units (uniform scale, centred: preserveAspectRatio xMidYMid meet)
   const k = Math.min(outW / vw, outH / vh);
