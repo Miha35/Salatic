@@ -11,7 +11,7 @@
  * per-character fallback (DejaVu Sans → Noto Sans CJK → Noto Emoji), Word-style line
  * spacing from the fonts' Windows metrics, subsetting with HarfBuzz.
  */
-import { clip, clipEvenOdd, concatTransformationMatrix, degrees, drawSvgPath, endPath, PDFDict, PDFDocument, PDFName, PDFNumber, PDFOperator, PDFOperatorNames, PDFString, popGraphicsState, pushGraphicsState, rectangle, rgb, setGraphicsState, type PDFContext, type PDFImage, type PDFObject, type PDFPage, type PDFRef } from 'pdf-lib';
+import { clip, clipEvenOdd, closePath, concatTransformationMatrix, lineTo, moveTo, degrees, drawSvgPath, endPath, PDFDict, PDFDocument, PDFName, PDFNumber, PDFOperator, PDFOperatorNames, PDFString, popGraphicsState, pushGraphicsState, rectangle, rgb, setGraphicsState, type PDFContext, type PDFImage, type PDFObject, type PDFPage, type PDFRef } from 'pdf-lib';
 import { parseMetafile, type Metafile } from '../metafile';
 import { parseSvg } from '../svg-render';
 import type { Align, Block, Doc, FontFamily, Gradient, ParaFormat, TextRun } from '../model';
@@ -116,7 +116,7 @@ function gradientFunction(ctx: PDFContext, g: Gradient, channel: 'rgb' | 'alpha'
 
 export class PdfWriter {
   protected pdf!: PDFDocument;
-  private shadings = new Map<Gradient, PDFRef>();
+  private shadings = new Map<Gradient, { clip?: [number, number][]; ref: PDFRef }[]>();
   private pageShadings = new WeakMap<PDFPage, number>();
 
   /**
@@ -125,11 +125,31 @@ export class PdfWriter {
    */
   protected fillGradient(page: PDFPage, d: string, g: Gradient, x: number, y: number, opacity = 1): void {
     const ctx = this.pdf.context;
-    let ref = this.shadings.get(g);
-    if (!ref) {
-      const c = g.coords.map((v) => Math.round(v * 1000) / 1000);
-      ref = ctx.register(ctx.obj({ ShadingType: g.kind === 'linear' ? 2 : 3, ColorSpace: 'DeviceRGB', Coords: c, Function: gradientFunction(ctx, g), Extend: [true, true] }));
-      this.shadings.set(g, ref);
+    const r3 = (v: number): number => Math.round(v * 1000) / 1000;
+    /**
+     * The shadings that paint a gradient, each limited to a polygon in gradient space (none: everywhere).
+     * A rectangular gradient is four trapezoids around the focus, each an axial shading towards its edge.
+     */
+    const pieces = (channel: 'rgb' | 'alpha'): { clip?: [number, number][]; ref: PDFRef }[] => {
+      const space = channel === 'rgb' ? 'DeviceRGB' : 'DeviceGray';
+      const fn = gradientFunction(ctx, g, channel);
+      const shading = (type: 2 | 3, coords: number[]): PDFRef => ctx.register(ctx.obj({ ShadingType: type, ColorSpace: space, Coords: coords.map(r3), Function: fn, Extend: [true, true] }));
+      if (g.kind !== 'rect') return [{ ref: shading(g.kind === 'linear' ? 2 : 3, g.coords) }];
+      const [x0, y0, x1, y1, fx0, fy0, fx1, fy1] = g.coords;
+      const out: { clip?: [number, number][]; ref: PDFRef }[] = [];
+      const top = shading(2, [0, fy0, 0, y0]);
+      if (fy0 > y0) out.push({ clip: [[x0, y0], [x1, y0], [fx1, fy0], [fx0, fy0]], ref: top });
+      if (y1 > fy1) out.push({ clip: [[x0, y1], [x1, y1], [fx1, fy1], [fx0, fy1]], ref: shading(2, [0, fy1, 0, y1]) });
+      if (fx0 > x0) out.push({ clip: [[x0, y0], [fx0, fy0], [fx0, fy1], [x0, y1]], ref: shading(2, [fx0, 0, x0, 0]) });
+      if (x1 > fx1) out.push({ clip: [[x1, y0], [fx1, fy0], [fx1, fy1], [x1, y1]], ref: shading(2, [fx1, 0, x1, 0]) });
+      // the focus itself has the first stop's colour: the top shading extended
+      if (fx1 > fx0 && fy1 > fy0) out.push({ clip: [[fx0, fy0], [fx1, fy0], [fx1, fy1], [fx0, fy1]], ref: top });
+      return out;
+    };
+    let rgb = this.shadings.get(g);
+    if (!rgb) {
+      rgb = pieces('rgb');
+      this.shadings.set(g, rgb);
     }
     const res = page.node.normalizedEntries().Resources;
     let dict = res.lookupMaybe(PDFName.of('Shading'), PDFDict);
@@ -137,31 +157,35 @@ export class PdfWriter {
       dict = ctx.obj({});
       res.set(PDFName.of('Shading'), dict);
     }
-    const n = (this.pageShadings.get(page) ?? 0) + 1;
-    this.pageShadings.set(page, n);
-    const name = PDFName.of(`Sh${n}`);
-    dict.set(name, ref);
-    const alphas = g.stops.map((s) => s.alpha ?? 1);
+    const names = rgb.map((pc) => {
+      const n = (this.pageShadings.get(page) ?? 0) + 1;
+      this.pageShadings.set(page, n);
+      const name = PDFName.of(`Sh${n}`);
+      dict!.set(name, pc.ref);
+      return name;
+    });
+    const clipOps = (pts: [number, number][]): PDFOperator[] => [moveTo(pts[0][0], pts[0][1]), ...pts.slice(1).map(([px, py]) => lineTo(px, py)), closePath(), clip(), endPath()];
+    const alphas = g.stops.map((st) => st.alpha ?? 1);
     const varying = Math.max(...alphas) - Math.min(...alphas) > 0.005;
     const alpha = opacity * (varying ? 1 : alphas[0]);
     const gsDict = ctx.obj({ Type: 'ExtGState' });
     let gsUsed = false;
     if (alpha < 0.999) {
-      gsDict.set(PDFName.of('ca'), PDFNumber.of(Math.round(alpha * 1000) / 1000));
+      gsDict.set(PDFName.of('ca'), PDFNumber.of(r3(alpha)));
       gsUsed = true;
     }
     if (varying) {
       // Stop opacity varies: a luminosity soft mask painted with the same geometry, alpha as gray
-      const c = g.coords.map((v) => Math.round(v * 1000) / 1000);
-      const alphaSh = ctx.register(ctx.obj({ ShadingType: g.kind === 'linear' ? 2 : 3, ColorSpace: 'DeviceGray', Coords: c, Function: gradientFunction(ctx, g, 'alpha'), Extend: [true, true] }));
+      const al = pieces('alpha');
       const m = g.matrix ? `${g.matrix.map((v) => Math.round(v * 10000) / 10000).join(' ')} cm ` : '';
+      const body = al.map((pc, k) => (pc.clip ? `q ${pc.clip.map(([px, py], i) => `${r3(px)} ${r3(py)} ${i ? 'l' : 'm'}`).join(' ')} h W n /Sa${k} sh Q` : `/Sa${k} sh`)).join(' ');
       const form = ctx.register(
-        ctx.stream(`${m}/Sa sh`, {
+        ctx.stream(`${m}${body}`, {
           Type: 'XObject',
           Subtype: 'Form',
           BBox: [-100000, -100000, 100000, 100000],
           Group: { S: 'Transparency', CS: 'DeviceGray' },
-          Resources: { Shading: { Sa: alphaSh } },
+          Resources: { Shading: Object.fromEntries(al.map((pc, k) => [`Sa${k}`, pc.ref])) },
         }),
       );
       gsDict.set(PDFName.of('SMask'), ctx.obj({ Type: 'Mask', S: 'Luminosity', G: form }));
@@ -178,7 +202,7 @@ export class PdfWriter {
       endPath(),
       ...(gs ? [setGraphicsState(gs)] : []),
       ...(g.matrix ? [concatTransformationMatrix(...g.matrix)] : []),
-      PDFOperator.of(PDFOperatorNames.ShadingFill, [name]),
+      ...rgb.flatMap((pc, k) => (pc.clip ? [pushGraphicsState(), ...clipOps(pc.clip), PDFOperator.of(PDFOperatorNames.ShadingFill, [names[k]]), popGraphicsState()] : [PDFOperator.of(PDFOperatorNames.ShadingFill, [names[k]])])),
       popGraphicsState(),
     );
   }

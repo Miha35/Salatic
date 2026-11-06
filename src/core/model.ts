@@ -21,9 +21,12 @@ export interface GradientStop {
 
 /** A colour gradient. Coordinates are in gradient space; `matrix` maps it to the drawing space (y down). */
 export interface Gradient {
-  kind: 'linear' | 'radial';
+  kind: 'linear' | 'radial' | 'rect';
   stops: GradientStop[];
-  /** linear: [x1, y1, x2, y2]; radial: [fx, fy, fr, cx, cy, r] (focal circle → outer circle) */
+  /**
+   * linear: [x1, y1, x2, y2]; radial: [fx, fy, fr, cx, cy, r] (focal circle → outer circle);
+   * rect: [x0, y0, x1, y1, fx0, fy0, fx1, fy1] (outer rectangle, focus rectangle): concentric rectangles
+   */
   coords: number[];
   matrix?: [number, number, number, number, number, number];
 }

@@ -12,7 +12,7 @@ import type { MetaCmd } from '../../src/core/metafile';
 import type { SlideElement } from '../../src/core/slides';
 import { env, hasCmd, loadFonts, soffice, withTemp } from './helpers';
 import { PDFDocument, PDFRawStream } from 'pdf-lib';
-import { GRADIENT_SLIDE, makePptx } from './pptx-fixture';
+import { GRADIENT_SLIDE, makePptx, RECT_GRADIENT_SLIDE } from './pptx-fixture';
 
 /** Rasterise one page at 72 dpi (1 px = 1 pt) and return an RGB sampler. */
 function pixels(pdf: Uint8Array, page: number): (x: number, y: number) => [number, number, number] {
@@ -141,6 +141,25 @@ describe.skipIf(!hasCmd('pdftoppm'))('gradients in PDF', () => {
       [700, 450],
     ];
     for (const [x, y] of points) expect(near(px(x, y), lo(x, y), 10), `(${x},${y}) ours ${px(x, y)} vs LibreOffice ${lo(x, y)}`).toBe(true);
+  });
+
+  it('rectangular path gradients: concentric rectangles from the focus (ECMA-376), drawn as clipped axial shadings', async () => {
+    const pptx = makePptx(undefined, RECT_GRADIENT_SLIDE);
+    const deck = pptxToDeck(pptx).deck;
+    const shapes = deck.slides[4].elements.filter((e): e is Extract<SlideElement, { kind: 'shape' }> => e.kind === 'shape' && !!e.gradient);
+    expect(shapes.map((e) => e.gradient!.kind)).toEqual(['rect', 'rect', 'rect']);
+    expect(shapes[1].gradient!.coords).toEqual([0, 0, 300, 150, 60, 30, 120, 60]);
+    const px = pixels((await convert(pptx, 'pptx', 'pdf', env)).data, 4);
+    const at = (x: number, y: number): number[] => px(x, y);
+    // shape 1 at (40,150) 300×150, focus in the centre: white there, dark at the edges, halfway in between
+    expect(near(at(190, 225), hex('FFFFFF'), 8)).toBe(true);
+    expect(near(at(42, 225), hex('1F4E79'), 14)).toBe(true);
+    expect(near(at(190, 152), hex('1F4E79'), 14)).toBe(true);
+    expect(near(at(115, 225), lerp('FFFFFF', '1F4E79', 0.5), 12)).toBe(true); // half way to the left edge
+    expect(near(at(190, 187.5), lerp('FFFFFF', '1F4E79', 0.5), 12)).toBe(true); // half way to the top edge
+    // shape 2 at (380,150): the focus rectangle 60..120 × 30..60 is white throughout
+    for (const [x, y] of [[445, 185], [495, 205]]) expect(near(at(x, y), hex('FFFFFF'), 8), `${x},${y}`).toBe(true);
+    expect(near(at(678, 295), hex('1F4E79'), 14)).toBe(true);
   });
 
   const SVG =

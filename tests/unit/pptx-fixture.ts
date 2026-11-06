@@ -243,3 +243,19 @@ export function makePptx(chartXml?: string, extra?: ExtraSlide): Uint8Array {
     'docProps/core.xml': strToU8('<?xml version="1.0" encoding="UTF-8"?><cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Тестовая презентация</dc:title></cp:coreProperties>'),
   });
 }
+
+/** Path gradients: a centred rectangular one, an off-centre focus, and path="shape". */
+export const RECT_GRADIENT_SLIDE: ExtraSlide = {
+  title: 'Прямоугольные градиенты',
+  shapes: [
+    [40, 150, 300, 150, 'rect', '50000', '50000', '50000', '50000'],
+    [380, 150, 300, 150, 'rect', '20000', '20000', '60000', '60000'],
+    [40, 330, 640, 150, 'shape', '50000', '50000', '50000', '50000'],
+  ]
+    .map(
+      ([x, y, w, h, path, l, t, r, b], i) =>
+        `<p:sp><p:nvSpPr><p:cNvPr id="${20 + i}" name="g${i}"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="${E(+x)}" y="${E(+y)}"/><a:ext cx="${E(+w)}" cy="${E(+h)}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom>` +
+        `<a:gradFill><a:gsLst><a:gs pos="0"><a:srgbClr val="FFFFFF"/></a:gs><a:gs pos="100000"><a:srgbClr val="1F4E79"/></a:gs></a:gsLst><a:path path="${path}"><a:fillToRect l="${l}" t="${t}" r="${r}" b="${b}"/></a:path></a:gradFill><a:ln><a:noFill/></a:ln></p:spPr></p:sp>`,
+    )
+    .join(''),
+};

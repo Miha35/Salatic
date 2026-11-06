@@ -64,8 +64,14 @@ export function gradientOf(grad: XNode, w: number, h: number, theme: Theme, map:
   if (path) {
     const r = child(path, 'a:fillToRect')?.attrs ?? {};
     const pct = (k: string): number => +(r[k] ?? 0) / 100000;
-    const fx = (pct('l') * w + (w - pct('r') * w)) / 2;
-    const fy = (pct('t') * h + (h - pct('b') * h)) / 2;
+    const fx0 = pct('l') * w;
+    const fy0 = pct('t') * h;
+    const fx1 = Math.max(fx0, w - pct('r') * w);
+    const fy1 = Math.max(fy0, h - pct('b') * h);
+    // rect (and shape, drawn like LibreOffice does): concentric rectangles from the focus to the edges
+    if (path.attrs.path === 'rect' || path.attrs.path === 'shape') return { kind: 'rect', stops, coords: [0, 0, w, h, fx0, fy0, fx1, fy1] };
+    const fx = (fx0 + fx1) / 2;
+    const fy = (fy0 + fy1) / 2;
     // a true circle around the focus, reaching the farthest corner (like PowerPoint and LibreOffice)
     const reach = Math.max(...[0, w].flatMap((cx) => [0, h].map((cy) => Math.hypot(cx - fx, cy - fy))));
     return { kind: 'radial', stops, coords: [fx, fy, 0, fx, fy, reach] };
