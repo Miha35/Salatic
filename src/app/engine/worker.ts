@@ -202,7 +202,10 @@ async function handle(id: number, req: EngineRequest): Promise<{ result: unknown
     case 'composePdf': {
       const { composePdf } = await import('../../core/pdf-tools');
       const needsFonts = req.pages.some((p) => p.annotations?.some((a) => a.type === 'text'));
-      const data = await composePdf(req.sources, req.pages, loadFont, needsFonts ? await loadSubsetter() : undefined, { decodeJpeg });
+      // redaction rewrites image pixels: JPEG, JPEG 2000, JBIG2 and CCITT via pdf.js's decoders (WebAssembly)
+      const redacting = req.pages.some((p) => p.annotations?.some((a) => a.type === 'redact'));
+      const decodeImage = redacting ? (await import('../../core/pdf-image-filters')).pdfjsImageDecoder({ wasmUrl: abs('/pdfjs/wasm/') }) : undefined;
+      const data = await composePdf(req.sources, req.pages, loadFont, needsFonts ? await loadSubsetter() : undefined, { decodeJpeg, decodeImage });
       return { result: data, transfer: [data.buffer] };
     }
   }

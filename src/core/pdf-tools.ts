@@ -155,6 +155,8 @@ function areaOf(a: { x: number; y: number; w: number; h: number; rotate: number 
 export interface ComposeOptions {
   /** JPEG → RGBA decoder for redacting photos (browser: createImageBitmap). */
   decodeJpeg?: RedactOptions['decodeJpeg'];
+  /** DCT/JPX/JBIG2/CCITT decoder for redacting images (pdf-image-filters.ts). */
+  decodeImage?: RedactOptions['decodeImage'];
   /** Collects warnings from redaction. */
   warnings?: string[];
 }
@@ -213,7 +215,9 @@ export async function composePdf(sources: Uint8Array[], pages: PageSpec[], fonts
     }
     loaded.push(doc);
   }
-  if (loaded.length === 1 && !out.getTitle()) {
+  // a redacted file does not carry the title: it often names what was hidden ("Contract with …")
+  const redacting = pages.some((p) => p.annotations?.some((a) => a.type === 'redact'));
+  if (loaded.length === 1 && !out.getTitle() && !redacting) {
     const t = loaded[0].getTitle();
     if (t) out.setTitle(t);
   }
@@ -243,7 +247,7 @@ export async function composePdf(sources: Uint8Array[], pages: PageSpec[], fonts
     const eraseAreas = [...eraseAnns, ...anns.filter((a): a is Extract<Annotation, { type: 'rect' }> => a.type === 'rect' && !!a.erase)].map(areaOf);
     const removedIn = new Map<Extract<Annotation, { type: 'erase' }>, number>();
     if (spec.src >= 0 && redactAreas.length) {
-      const r = await redactPage(out, page, redactAreas, { redact: true, decodeJpeg: opts.decodeJpeg });
+      const r = await redactPage(out, page, redactAreas, { redact: true, decodeJpeg: opts.decodeJpeg, decodeImage: opts.decodeImage });
       opts.warnings?.push(...r.warnings);
     }
     if (spec.src >= 0 && eraseAreas.length) {

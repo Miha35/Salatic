@@ -12,7 +12,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
 import { unzipSync, unzlibSync } from 'fflate';
-import { PDFDocument, PDFName, StandardFonts } from 'pdf-lib';
+import { concatTransformationMatrix, drawObject, PDFDocument, PDFName, popGraphicsState, pushGraphicsState, StandardFonts } from 'pdf-lib';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, '../..');
@@ -431,6 +431,11 @@ test('PDF editor: redaction removes text and photo pixels from the file', async 
     pg.drawText('Secret code 7755331 here', { x: 30, y: 250, size: 16, font });
     pg.drawText('Public line stays', { x: 30, y: 210, size: 16, font });
     pg.drawImage(await doc.embedJpg(jpeg), { x: 30, y: 40, width: 200, height: 100 });
+    // and a JPEG 2000 image (40 × 40, solid 0/90/200): decoded with OpenJPEG (WebAssembly) in the worker
+    const jp2 = new Uint8Array(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../fixtures/blue.jp2')));
+    const jpx = doc.context.stream(jp2, { Type: 'XObject', Subtype: 'Image', Width: 40, Height: 40, ColorSpace: 'DeviceRGB', BitsPerComponent: 8, Filter: 'JPXDecode' });
+    const jpxName = pg.node.newXObject('Jpx', doc.context.register(jpx));
+    pg.pushOperators(pushGraphicsState(), concatTransformationMatrix(100, 0, 0, 100, 260, 40), drawObject(jpxName), popGraphicsState());
     writeFileSync(F('redact.pdf'), await doc.save());
     const codeX = 30 + font.widthOfTextAtSize('Secret code ', 16);
     const codeW = font.widthOfTextAtSize('7755331', 16);
@@ -452,7 +457,8 @@ test('PDF editor: redaction removes text and photo pixels from the file', async 
     };
     await drag(codeX - 2, 244, codeX + codeW + 2, 266);
     await drag(20, 30, 130, 150); // the left half of the photo
-    expect((await page.$$('.page-stage svg g')).length === 2, 'two redaction boxes');
+    await drag(250, 30, 310, 150); // the left half of the JPEG 2000 image
+    expect((await page.$$('.page-stage svg g')).length === 3, 'three redaction boxes');
     await page.getByRole('button', { name: 'К страницам' }).click();
     const saved = await downloadFrom(page, () => page.locator('.toolbar').getByRole('button', { name: 'Сохранить PDF' }).click());
     const t = (await pdfText(saved.bytes))[0];
@@ -460,13 +466,20 @@ test('PDF editor: redaction removes text and photo pixels from the file', async 
     // the photo was decoded, its left half zeroed and stored losslessly
     const out = await PDFDocument.load(saved.bytes);
     const xo = out.getPage(0).node.Resources().lookup(PDFName.of('XObject'));
-    const img = xo.entries().map(([, r]) => out.context.lookup(r)).find((o) => o.dict?.lookup(PDFName.of('Subtype'))?.toString() === '/Image');
+    const images = xo.entries().map(([, r]) => out.context.lookup(r)).filter((o) => o.dict?.lookup(PDFName.of('Subtype'))?.toString() === '/Image');
+    const img = images.find((o) => o.dict.lookup(PDFName.of('Width')).asNumber() === 200);
     expect(img && img.dict.lookup(PDFName.of('Filter'))?.toString() === '/FlateDecode', `image filter ${img?.dict.lookup(PDFName.of('Filter'))}`);
     const px = unzlibSync(img.getContents());
     const at = (x, y) => [...px.subarray((y * 200 + x) * 3, (y * 200 + x) * 3 + 3)];
     expect(at(20, 50).every((v) => v === 0), `redacted pixel ${at(20, 50)}`);
     const keep = at(180, 50);
     expect(Math.abs(keep[0] - 200) < 12 && Math.abs(keep[1] - 60) < 12 && Math.abs(keep[2] - 40) < 12, `kept pixel ${keep}`);
+    const j = images.find((o) => o.dict.lookup(PDFName.of('Width')).asNumber() === 40);
+    expect(j && j.dict.lookup(PDFName.of('Filter'))?.toString() === '/FlateDecode', `JPX image filter ${j?.dict.lookup(PDFName.of('Filter'))}`);
+    const jp = unzlibSync(j.getContents());
+    const jat = (x, y) => [...jp.subarray((y * 40 + x) * 3, (y * 40 + x) * 3 + 3)];
+    expect(jat(5, 20).every((v) => v === 0), `redacted JPX pixel ${jat(5, 20)}`);
+    expect(jat(35, 20).join() === '0,90,200', `kept JPX pixel ${jat(35, 20)}`);
   });
 });
 

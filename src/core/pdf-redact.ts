@@ -4,15 +4,20 @@
  * - text: every glyph whose centre lies in a rectangle is removed from its string and replaced by a
  *   TJ adjustment of exactly its advance, so the remaining glyphs keep their positions. Invisible
  *   text (OCR layers) is removed too. Text inside form XObjects is handled on private copies.
+ *   Vertical writing (Identity-V, WMode 1) follows the column with /W2 + /DW2 metrics.
  * - in `redact` mode also: vector paths lying entirely inside a rectangle, inline images centred in
- *   one, the pixels of image XObjects under a rectangle (samples zeroed), and annotations overlapping.
+ *   one, the pixels of image XObjects under a rectangle (samples zeroed, with their soft and stencil
+ *   masks), and annotations overlapping. Image data is decoded through filter chains (pdf-lib's
+ *   filters, PNG/TIFF predictors) and the codecs (DCT, JPX, JBIG2, CCITT via `decodeImage`), and
+ *   rewritten losslessly; alternates, OPI and XMP of such images, and the page's thumbnail and
+ *   PieceInfo are dropped.
  *
  * Glyph advances come from the font: /Widths (simple), /W + /DW (CID), /Widths × /FontMatrix (Type 3),
  * or the standard-14 metrics for base fonts without widths.
  */
 import { Encodings, Font, FontNames } from '@pdf-lib/standard-fonts';
-import { decodePDFRawStream, PDFArray, PDFDict, PDFName, PDFNumber, PDFRawStream, PDFRef, PDFStream, type PDFContext, type PDFDocument, type PDFObject, type PDFPage } from 'pdf-lib';
-import { unzlibSync, zlibSync } from 'fflate';
+import { decodePDFRawStream, PDFArray, PDFBool, PDFDict, PDFName, PDFNumber, PDFRawStream, PDFRef, PDFStream, type PDFContext, type PDFDocument, type PDFObject, type PDFPage } from 'pdf-lib';
+import { zlibSync } from 'fflate';
 
 export interface Rect {
   x0: number;
@@ -24,9 +29,36 @@ export interface Rect {
 export interface RedactOptions {
   /** Also remove graphics, image pixels and annotations (a redaction), not only text. */
   redact?: boolean;
-  /** Decodes JPEG image data to RGBA (browser hook); without it JPEG images cannot be redacted. */
+  /** Decodes JPEG image data to RGBA (browser hook); a fallback when `decodeImage` is not given. */
   decodeJpeg?: (data: Uint8Array) => Promise<{ width: number; height: number; rgba: Uint8Array } | null>;
+  /** Decodes DCT, JPX, JBIG2 and CCITT fax image data (see pdf-image-filters.ts). */
+  decodeImage?: ImageFilterDecoder;
 }
+
+/** What an image filter decoder is told about the image. */
+export interface ImageFilterInfo {
+  width: number;
+  height: number;
+  /** Colour components the image's colour space has (0: none given, JPX decides) */
+  comps: number;
+  indexed: boolean;
+  colorTransform?: number;
+  smaskInData?: boolean;
+  /** JBIG2 global segments */
+  globals?: Uint8Array;
+  /** CCITTFaxDecode parameters */
+  params?: Record<string, number | boolean>;
+}
+
+/**
+ * Decodes the data of an image filter into samples: `comps` components of `bpc` bits per pixel, rows padded
+ * to whole bytes: the filter's output, in the image's own colour space and before its Decode array.
+ */
+export type ImageFilterDecoder = (
+  filter: 'DCTDecode' | 'JPXDecode' | 'JBIG2Decode' | 'CCITTFaxDecode',
+  data: Uint8Array,
+  info: ImageFilterInfo,
+) => Promise<{ data: Uint8Array; comps: number; bpc: number } | null>;
 
 export interface RedactResult {
   glyphs: number;
@@ -223,6 +255,8 @@ interface FontInfo {
   /** advance in text space units per unit font size */
   width(code: number, len: number): number;
   vertical: boolean;
+  /** vertical writing: displacement w1 (negative: down) and position vector v of a glyph, per unit font size */
+  vmetric(code: number, len: number): { w1: number; vx: number; vy: number };
 }
 
 const WIN_ANSI: string[] = (() => {
@@ -295,6 +329,28 @@ class Fonts {
           }
         }
       }
+      // Vertical metrics: W2 entries (w1y vx vy per CID) and the DW2 default [vy w1y]
+      const dw2 = this.look(desc?.lookup(PDFName.of('DW2')), PDFArray);
+      const dvy = num(dw2?.lookup(0)) ?? 880;
+      const dw1 = num(dw2?.lookup(1)) ?? -1000;
+      const vm = new Map<number, [number, number, number]>();
+      const w2 = this.look(desc?.lookup(PDFName.of('W2')), PDFArray);
+      if (w2) {
+        for (let i = 0; i < w2.size(); ) {
+          const first = num(w2.lookup(i));
+          const next = w2.lookup(i + 1);
+          if (first === undefined) break;
+          if (next instanceof PDFArray) {
+            for (let k = 0; k + 2 < next.size(); k += 3) vm.set(first + k / 3, [num(next.lookup(k)) ?? dw1, num(next.lookup(k + 1)) ?? 0, num(next.lookup(k + 2)) ?? dvy]);
+            i += 2;
+          } else {
+            const last = num(next) ?? first;
+            const t: [number, number, number] = [num(w2.lookup(i + 2)) ?? dw1, num(w2.lookup(i + 3)) ?? 0, num(w2.lookup(i + 4)) ?? dvy];
+            for (let c = first; c <= last && c - first < 65536; c++) vm.set(c, t);
+            i += 5;
+          }
+        }
+      }
       // Code → CID: Identity, or the cidrange/cidchar maps of an embedded CMap
       let ranges: { lo: number; hi: number; len: number }[] = [{ lo: 0, hi: 0xffff, len: 2 }];
       let cidOf: (code: number) => number = (c) => c;
@@ -335,6 +391,12 @@ class Fonts {
           return Math.min(ranges[0]?.len ?? 2, s.length - i) || 1;
         },
         width: (code) => (widths.get(cidOf(code)) ?? dw) / 1000,
+        vmetric: (code) => {
+          const cid = cidOf(code);
+          const m = vm.get(cid);
+          // default position vector: half the horizontal width, DW2's vy
+          return m ? { w1: m[0] / 1000, vx: m[1] / 1000, vy: m[2] / 1000 } : { w1: dw1 / 1000, vx: (widths.get(cid) ?? dw) / 2000, vy: dvy / 1000 };
+        },
       };
     }
     // Simple fonts (Type1, TrueType, Type3, MMType1)
@@ -369,6 +431,7 @@ class Fonts {
     }
     return {
       vertical: false,
+      vmetric: () => ({ w1: -1, vx: 0.5, vy: 0.88 }),
       codeLen: () => 1,
       width: (code) => {
         if (wArr) return (widths[code] ?? missing) * scale;
@@ -470,7 +533,8 @@ class Redactor {
       let removed = 0;
       for (const it of items) {
         if (it.t === 'num') {
-          tm = mul([1, 0, 0, 1, (-it.v / 1000) * fs * g.th, 0], tm);
+          // vertical writing moves down the column, without horizontal scaling
+          tm = font.vertical ? mul([1, 0, 0, 1, 0, (-it.v / 1000) * fs], tm) : mul([1, 0, 0, 1, (-it.v / 1000) * fs * g.th, 0], tm);
           out.push(it.v);
           continue;
         }
@@ -483,11 +547,26 @@ class Redactor {
           for (let k = 0; k < len; k++) code = (code << 8) | s[i + k];
           const w = font.width(code, len);
           const space = len === 1 && code === 32 ? g.tw : 0;
-          // glyph centre in user space
           const trm = mul([fs * g.th, 0, 0, fs, 0, g.rise], mul(tm, g.ctm));
+          if (font.vertical) {
+            // the glyph hangs from the current point: its horizontal origin is at -v; centre of the em box
+            const v = font.vmetric(code, len);
+            const [cx, cy] = apply(trm, w / 2 - v.vx, 0.38 - v.vy);
+            const ty = v.w1 * fs + g.tc + space;
+            if (fs !== 0 && inside(this.rects, cx, cy)) {
+              if (keep.length) out.push(Uint8Array.from(keep));
+              keep = [];
+              out.push(-(ty * 1000) / fs);
+              removed++;
+            } else for (let k = 0; k < len; k++) keep.push(s[i + k]);
+            tm = mul([1, 0, 0, 1, 0, ty], tm);
+            i += len;
+            continue;
+          }
+          // glyph centre in user space
           const [cx, cy] = apply(trm, w / 2, 0.3);
           const advance = (w * fs + g.tc + space) * g.th;
-          if (fs !== 0 && !font.vertical && inside(this.rects, cx, cy)) {
+          if (fs !== 0 && inside(this.rects, cx, cy)) {
             if (keep.length) out.push(Uint8Array.from(keep));
             keep = [];
             out.push(-((w * fs + g.tc + space) * 1000) / fs);
@@ -498,7 +577,6 @@ class Redactor {
         }
         if (keep.length) out.push(Uint8Array.from(keep));
       }
-      if (font.vertical && items.some((x) => x.t === 'str')) this.warn('Вертикальный текст (CJK) не удаляется — область только закрашена.');
       if (!removed) return;
       for (const m of marked) m.removed = true;
       this.result.glyphs += removed;
@@ -671,13 +749,15 @@ class Redactor {
               dict.delete(PDFName.of('Filter'));
               dict.delete(PDFName.of('DecodeParms'));
               dict.delete(PDFName.of('Length'));
+              // application data and XMP of the form may hold the original content
+              for (const k of ['PieceInfo', 'Metadata', 'LastModified']) dict.delete(PDFName.of(k));
               if (r.xobjects.size) dict.set(PDFName.of('Resources'), withXObjects(this.ctx, fres, r.xobjects));
               const copy = this.ctx.flateStream(r.bytes ?? streamBytes(xo), {});
               for (const [key, val] of dict.entries()) copy.dict.set(key, val);
               xobjects.set(name, this.ctx.register(copy));
             }
           } else if (subtype === '/Image' && this.opts.redact && xo instanceof PDFRawStream) {
-            const newRef = await this.image(xo, g.ctm);
+            const newRef = await this.image(xo, g.ctm, false);
             if (newRef) xobjects.set(name, newRef);
           }
           break;
@@ -704,8 +784,11 @@ class Redactor {
     return { bytes: out, xobjects };
   }
 
-  /** Zero the samples of an image under the rectangles; returns the new image or null. */
-  private async image(img: PDFRawStream, ctm: M): Promise<PDFRef | null> {
+  /**
+   * Zero the samples of an image under the rectangles; returns the new image or null.
+   * Its soft mask and stencil mask (the shape of what it shows) are redacted the same way.
+   */
+  private async image(img: PDFRawStream, ctm: M, isMaskOf: boolean): Promise<PDFRef | null> {
     // image space: unit square; pixel (0,0) at the top-left → (0,1) in unit space
     const d = img.dict;
     const w = num(d.lookup(PDFName.of('Width'))) ?? 0;
@@ -725,52 +808,138 @@ class Redactor {
     }
     if (!boxes.length) return null;
     if (this.imageDone.has(img)) return this.imageDone.get(img)!;
-    const filters = filterNames(d.lookup(PDFName.of('Filter')));
-    const isMask = d.lookup(PDFName.of('ImageMask'))?.toString() === 'true';
-    const bpc = isMask ? 1 : (num(d.lookup(PDFName.of('BitsPerComponent'))) ?? 8);
-    const comps = isMask ? 1 : components(this.ctx, d.lookup(PDFName.of('ColorSpace')));
-    let samples: Uint8Array | null = null;
-    let outBpc = bpc;
-    let outComps = comps;
-    let colorSpace: PDFObject | undefined = d.get(PDFName.of('ColorSpace'));
-    if (filters.length === 0 || (filters.length === 1 && filters[0] === 'FlateDecode')) {
-      const raw = filters.length ? safeInflate(img.getContents()) : img.getContents();
-      const parms = this.dict(d.lookup(PDFName.of('DecodeParms')));
-      samples = raw && unpredict(raw, parms, comps, bpc, w);
-    } else if (filters.length === 1 && filters[0] === 'DCTDecode' && this.opts.decodeJpeg) {
-      const dec = await this.opts.decodeJpeg(img.getContents()).catch(() => null);
-      if (dec && dec.width === w && dec.height === h) {
-        samples = new Uint8Array(w * h * 3);
-        for (let p = 0; p < w * h; p++) samples.set(dec.rgba.subarray(p * 4, p * 4 + 3), p * 3);
-        outBpc = 8;
-        outComps = 3;
-        colorSpace = PDFName.of('DeviceRGB');
-      }
-    }
-    if (!samples) {
+    const dec = await this.samplesOf(img, w, h);
+    if (!dec) {
       this.warn('Некоторые изображения под областью скрытия не удалось изменить (формат сжатия): они закрашены, но их данные остались в файле.');
       return null;
     }
-    const stride = Math.ceil((w * outComps * outBpc) / 8);
+    const { comps, bpc } = dec;
+    const samples = dec.samples.constructor === Uint8Array ? dec.samples : new Uint8Array(dec.samples.buffer, dec.samples.byteOffset, dec.samples.byteLength);
+    const stride = Math.ceil((w * comps * bpc) / 8);
     if (samples.length < stride * h) return null;
     // the black box colour: zero samples (black in Gray/RGB; mask/Indexed/CMYK still lose their content)
-    for (const [x0, y0, x1, y1] of boxes)
-      for (let y = Math.max(0, y0); y < Math.min(h, y1); y++)
-        for (let x = Math.max(0, x0); x < Math.min(w, x1); x++) {
-          const bit0 = x * outComps * outBpc;
-          for (let b = bit0; b < bit0 + outComps * outBpc; b++) samples[y * stride + (b >> 3)] &= ~(0x80 >> (b & 7));
-        }
+    const zero = (buf: Uint8Array, n: number, bits: number, rowBytes: number): void => {
+      for (const [x0, y0, x1, y1] of boxes)
+        for (let y = Math.max(0, y0); y < Math.min(h, y1); y++)
+          for (let x = Math.max(0, x0); x < Math.min(w, x1); x++) {
+            const bit0 = x * n * bits;
+            for (let b = bit0; b < bit0 + n * bits; b++) buf[y * rowBytes + (b >> 3)] &= ~(0x80 >> (b & 7));
+          }
+    };
+    zero(samples, comps, bpc, stride);
     const dict = d.clone(this.ctx);
-    for (const k of ['Filter', 'DecodeParms', 'Length']) dict.delete(PDFName.of(k));
-    if (colorSpace) dict.set(PDFName.of('ColorSpace'), colorSpace);
-    dict.set(PDFName.of('BitsPerComponent'), PDFNumber.of(outBpc));
-    if (outComps === 3 && colorSpace instanceof PDFName && colorSpace.asString() === '/DeviceRGB') dict.delete(PDFName.of('Decode'));
+    // filters are undone; alternates, OPI proxies and XMP (thumbnails) would keep the original
+    for (const k of ['Filter', 'DecodeParms', 'Length', 'Alternates', 'OPI', 'Metadata', 'SMaskInData']) dict.delete(PDFName.of(k));
+    if (dec.colorSpace) dict.set(PDFName.of('ColorSpace'), dec.colorSpace);
+    dict.set(PDFName.of('BitsPerComponent'), PDFNumber.of(bpc));
+    if (dec.dropDecode) dict.delete(PDFName.of('Decode'));
     const stream = this.ctx.flateStream(samples, {});
     for (const [k, v] of dict.entries()) stream.dict.set(k, v);
+    // the alpha channel of a JPX image becomes its soft mask
+    if (dec.alpha) {
+      zero(dec.alpha, 1, 8, w);
+      const sm = this.ctx.flateStream(dec.alpha, { Type: 'XObject', Subtype: 'Image', Width: w, Height: h, ColorSpace: 'DeviceGray', BitsPerComponent: 8 });
+      stream.dict.set(PDFName.of('SMask'), this.ctx.register(sm));
+    }
+    for (const key of ['SMask', 'Mask']) {
+      const m = d.lookup(PDFName.of(key));
+      if (m instanceof PDFRawStream) {
+        const ref = await this.image(m, ctm, true);
+        if (ref) stream.dict.set(PDFName.of(key), ref);
+      }
+    }
     const ref = this.ctx.register(stream);
     this.imageDone.set(img, ref);
-    this.result.images++;
+    if (!isMaskOf) this.result.images++;
     return ref;
+  }
+
+  /** The samples of an image: its filters undone (pdf-lib's, PNG/TIFF predictors, then the image codecs). */
+  private async samplesOf(
+    img: PDFRawStream,
+    w: number,
+    h: number,
+  ): Promise<{ samples: Uint8Array; comps: number; bpc: number; colorSpace?: PDFObject; dropDecode?: boolean; alpha?: Uint8Array } | null> {
+    const d = img.dict;
+    const filters = filterNames(d.lookup(PDFName.of('Filter')));
+    const parmsRaw = d.lookup(PDFName.of('DecodeParms'));
+    const parms = filters.map((_, i) => this.dict(parmsRaw instanceof PDFArray ? parmsRaw.lookup(i) : i === 0 ? parmsRaw : undefined));
+    const isMask = d.lookup(PDFName.of('ImageMask'))?.toString() === 'true';
+    const bpc = isMask ? 1 : (num(d.lookup(PDFName.of('BitsPerComponent'))) ?? 8);
+    const csObj = d.get(PDFName.of('ColorSpace'));
+    const cs = csObj instanceof PDFRef ? this.ctx.lookup(csObj) : csObj;
+    const comps = isMask ? 1 : components(this.ctx, csObj);
+    const indexed = cs instanceof PDFArray && cs.lookup(0)?.toString() === '/Indexed';
+    const CODECS = ['DCTDecode', 'JPXDecode', 'JBIG2Decode', 'CCITTFaxDecode'] as const;
+    type Codec = (typeof CODECS)[number];
+    const last = filters[filters.length - 1];
+    const codec = (CODECS as readonly string[]).includes(last) ? (last as Codec) : undefined;
+    const generic = codec ? filters.slice(0, -1) : filters;
+    if (generic.some((f) => (CODECS as readonly string[]).includes(f))) return null;
+    let data: Uint8Array | null = img.getContents();
+    for (let i = 0; i < generic.length && data; i++) {
+      try {
+        data = decodePDFRawStream(PDFRawStream.of(this.ctx.obj({ Filter: generic[i] }), data)).decode();
+      } catch {
+        return null;
+      }
+      // predictors belong to Flate/LZW; for the last filter they describe the image rows
+      if (data && (generic[i] === 'FlateDecode' || generic[i] === 'LZWDecode')) data = unpredict(data, parms[i], comps, bpc, w);
+    }
+    if (!data) return null;
+    if (!codec) return { samples: data, comps, bpc, colorSpace: csObj };
+    const cparms = parms[filters.length - 1];
+    const dec = this.opts.decodeImage;
+    if (codec === 'DCTDecode') {
+      if (dec) {
+        const r = await dec('DCTDecode', data, { width: w, height: h, comps, indexed, colorTransform: num(cparms?.lookup(PDFName.of('ColorTransform'))) }).catch(() => null);
+        if (r && r.comps === comps) return { samples: r.data, comps, bpc: 8, colorSpace: csObj };
+        if (r) return { samples: r.data, comps: r.comps, bpc: 8, colorSpace: PDFName.of(r.comps === 1 ? 'DeviceGray' : r.comps === 4 ? 'DeviceCMYK' : 'DeviceRGB'), dropDecode: true };
+      }
+      if (!this.opts.decodeJpeg) return null;
+      const r = await this.opts.decodeJpeg(data).catch(() => null);
+      if (!r || r.width !== w || r.height !== h) return null;
+      const rgb = new Uint8Array(w * h * 3);
+      for (let p = 0; p < w * h; p++) rgb.set(r.rgba.subarray(p * 4, p * 4 + 3), p * 3);
+      return { samples: rgb, comps: 3, bpc: 8, colorSpace: PDFName.of('DeviceRGB'), dropDecode: true };
+    }
+    if (!dec) return null;
+    if (codec === 'JPXDecode') {
+      // the colour space of the dictionary, or the one inside the JPEG 2000 data (then RGBA)
+      const smaskInData = (num(d.lookup(PDFName.of('SMaskInData'))) ?? 0) >= 1;
+      const r = await dec('JPXDecode', data, { width: w, height: h, comps: csObj && !smaskInData ? comps : 0, indexed, smaskInData }).catch(() => null);
+      if (!r) return null;
+      if (csObj && !smaskInData && r.comps === comps) return { samples: r.data, comps, bpc: 8, colorSpace: csObj, dropDecode: true };
+      if (r.comps === 4 && (!csObj || smaskInData)) {
+        const rgb = new Uint8Array(w * h * 3);
+        const alpha = new Uint8Array(w * h);
+        let opaque = true;
+        for (let p = 0; p < w * h; p++) {
+          rgb[p * 3] = r.data[p * 4];
+          rgb[p * 3 + 1] = r.data[p * 4 + 1];
+          rgb[p * 3 + 2] = r.data[p * 4 + 2];
+          alpha[p] = r.data[p * 4 + 3];
+          if (alpha[p] !== 255) opaque = false;
+        }
+        return { samples: rgb, comps: 3, bpc: 8, colorSpace: PDFName.of('DeviceRGB'), dropDecode: true, ...(opaque ? {} : { alpha }) };
+      }
+      if (r.comps === 1 || r.comps === 3) return { samples: r.data, comps: r.comps, bpc: 8, colorSpace: PDFName.of(r.comps === 1 ? 'DeviceGray' : 'DeviceRGB'), dropDecode: true };
+      return null;
+    }
+    if (codec === 'JBIG2Decode') {
+      const g = cparms?.lookup(PDFName.of('JBIG2Globals'));
+      const globals = g instanceof PDFStream ? streamBytes(g) : undefined;
+      const r = await dec('JBIG2Decode', data, { width: w, height: h, comps: 1, indexed: false, globals }).catch(() => null);
+      return r ? { samples: r.data, comps: 1, bpc: 1, colorSpace: csObj } : null;
+    }
+    const params: Record<string, number | boolean> = {};
+    for (const k of ['K', 'EndOfLine', 'EncodedByteAlign', 'Columns', 'Rows', 'EndOfBlock', 'BlackIs1']) {
+      const v = cparms?.lookup(PDFName.of(k));
+      if (v instanceof PDFNumber) params[k] = v.asNumber();
+      else if (v instanceof PDFBool) params[k] = v.asBoolean();
+    }
+    const r = await dec('CCITTFaxDecode', data, { width: w, height: h, comps: 1, indexed: false, params }).catch(() => null);
+    return r ? { samples: r.data, comps: 1, bpc: 1, colorSpace: csObj } : null;
   }
 }
 
@@ -803,21 +972,21 @@ function components(ctx: PDFContext, cs: PDFObject | undefined): number {
   return 1;
 }
 
-function safeInflate(b: Uint8Array): Uint8Array | null {
-  try {
-    return unzlibSync(b);
-  } catch {
-    return null;
-  }
-}
-
 /** Undo PNG/TIFF predictors of FlateDecode image data. */
 function unpredict(data: Uint8Array, parms: PDFDict | undefined, comps: number, bpc: number, w: number): Uint8Array | null {
   const pred = num(parms?.lookup(PDFName.of('Predictor'))) ?? 1;
-  if (pred < 10) return pred === 1 ? data : null;
   const colors = num(parms?.lookup(PDFName.of('Colors'))) ?? comps;
   const bits = num(parms?.lookup(PDFName.of('BitsPerComponent'))) ?? bpc;
   const cols = num(parms?.lookup(PDFName.of('Columns'))) ?? w;
+  if (pred === 2) {
+    // TIFF: each sample is the difference to the one to its left (8-bit samples only)
+    if (bits !== 8) return null;
+    const stride = cols * colors;
+    const out = data.slice();
+    for (let r = 0; r * stride < out.length; r++) for (let i = r * stride + colors; i < Math.min(out.length, (r + 1) * stride); i++) out[i] = (out[i] + out[i - colors]) & 0xff;
+    return out;
+  }
+  if (pred < 10) return pred === 1 ? data : null;
   const bpp = Math.max(1, Math.ceil((colors * bits) / 8));
   const stride = Math.ceil((cols * colors * bits) / 8);
   const rows = Math.floor(data.length / (stride + 1));
@@ -883,6 +1052,8 @@ export async function redactPage(doc: PDFDocument, page: PDFPage, rects: Rect[],
   const res = page.node.Resources();
   const r = await red.run(all, res, IDENT);
   if (r.bytes) page.node.set(PDFName.of('Contents'), ctx.register(ctx.flateStream(r.bytes)));
+  // a thumbnail, application data (PieceInfo) or XMP of the page would still show what was removed
+  if (r.bytes || r.xobjects.size) for (const k of ['Thumb', 'PieceInfo', 'Metadata']) page.node.delete(PDFName.of(k));
   if (r.xobjects.size) page.node.set(PDFName.of('Resources'), withXObjects(ctx, res, r.xobjects));
   if (opts.redact) {
     // annotations (links, comments, form fields) overlapping the areas
