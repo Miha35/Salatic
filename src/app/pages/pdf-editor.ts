@@ -1065,6 +1065,13 @@ export function mount(root: HTMLElement): () => void {
         const pad = seg.size * 0.08;
         editing.annotations.push({ type: 'rect', x: seg.x - pad, y: seg.y - seg.size * 0.26, w: seg.w + 2 * pad, h: seg.size * 1.2, color: meta.replace.bg, opacity: 1, rotate: viewport.rotation });
         if (text) editing.annotations.push({ type: 'text', x: seg.x, y: seg.y, size: meta.size, color: meta.color, text, rotate: viewport.rotation, bold: meta.bold, italic: meta.italic, font: meta.font });
+        // The page is not reflowed: warn when the new text runs into the text that follows it
+        const ctx = document.createElement('canvas').getContext('2d');
+        if (ctx && text) {
+          ctx.font = `${meta.italic ? 'italic ' : ''}${meta.bold ? 700 : 400} ${meta.size}px ${CSS_FAMILY[meta.font ?? 'sans']}`;
+          const neighbour = segments.some((x) => x !== seg && Math.abs(x.y - seg.y) < seg.size * 0.3 && x.x > seg.x && x.x < seg.x + ctx.measureText(text).width - 0.5);
+          if (neighbour) toast('Новый текст длиннее исходного и заходит на соседний фрагмент строки. Уменьшите размер шрифта (поле «размер») или исправьте и соседний фрагмент.');
+        }
         editing.replaced = [...(editing.replaced ?? []), seg.id];
         segments = segments.filter((x) => x !== seg);
       }

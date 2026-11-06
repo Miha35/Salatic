@@ -46,11 +46,12 @@ describe('existing PDF text', () => {
     const { data } = await docToPdf(doc, { fonts: loadFonts });
     const segs = await segmentsOf(data);
     const by = (t: string) => segs.find((s) => s.text === t)!;
-    expect(segs.map((s) => s.text)).toEqual(['Договор поставки № 15', 'Сумма договора: 120 000 рублей.', 'Срок оплаты — 10 дней', 'Код: ABC-123']);
+    expect(segs.map((s) => s.text)).toEqual(['Договор поставки № 15', 'Сумма договора: 120 000 рублей.', 'Срок оплаты —', '10 дней', 'Код: ABC-123']);
     expect(by('Договор поставки № 15')).toMatchObject({ font: 'serif', bold: true });
     expect(by('Договор поставки № 15').size).toBeCloseTo(24, 0);
     expect(by('Сумма договора: 120 000 рублей.')).toMatchObject({ font: 'serif', bold: false, italic: false, size: 12 });
-    expect(by('Срок оплаты — 10 дней')).toMatchObject({ italic: true });
+    expect(by('Срок оплаты —')).toMatchObject({ italic: true, bold: false });
+    expect(by('10 дней')).toMatchObject({ italic: true, bold: true });
     expect(by('Код: ABC-123')).toMatchObject({ font: 'mono' });
   });
 

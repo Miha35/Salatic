@@ -45,7 +45,8 @@ export function buildSegments(items: { str: string; transform: number[]; width: 
       if (it.hasEOL) flush();
       continue;
     }
-    const sameLine = cur && Math.abs(cur.y - f) < size * 0.25 && Math.abs(cur.size - size) < size * 0.3 && e >= cur.x1 - size * 0.5 && e - cur.x1 < size * 1.2;
+    // A change of font (bold word, italic phrase) starts a new segment so that its style survives editing
+    const sameLine = cur && cur.fontName === it.fontName && Math.abs(cur.y - f) < size * 0.25 && Math.abs(cur.size - size) < size * 0.3 && e >= cur.x1 - size * 0.5 && e - cur.x1 < size * 1.2;
     if (!sameLine) {
       flush();
       const fi = fontInfo(it.fontName);

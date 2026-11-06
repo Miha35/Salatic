@@ -6,7 +6,7 @@
  *   npm run build && npm run test:e2e
  *   BASE_URL=https://salatic.example.workers.dev npm run test:e2e   # test a deployment
  */
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -126,10 +126,28 @@ async function makeFixtures() {
   writeFileSync(join(fx, 'sample.docx'), await conv(SAMPLE_MD, 'docx', 'sample.md'));
   writeFileSync(join(fx, 'sample.xlsx'), await conv(SAMPLE_CSV, 'xlsx', 'sample.csv'));
   writeFileSync(join(fx, 'old.doc'), new Uint8Array([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1, 0, 0, 0, 0]));
+  // Legacy/open formats and protected PDFs come from LibreOffice and pypdf when installed
+  const sofficeConv = (src, target) => {
+    const dir = join(fx, 'lo');
+    mkdirSync(dir, { recursive: true });
+    execFileSync('soffice', [`-env:UserInstallation=file://${dir}/profile`, '--headless', '--convert-to', target, '--outdir', dir, src], { stdio: 'ignore', timeout: 120_000 });
+  };
+  if (has('soffice')) {
+    sofficeConv(join(fx, 'sample.docx'), 'doc:MS Word 97');
+    sofficeConv(join(fx, 'sample.docx'), 'odt');
+    sofficeConv(join(fx, 'sample.xlsx'), 'xls:MS Excel 97');
+  }
+  writeFileSync(join(fx, 'sample.rtf'), await conv(SAMPLE_MD, 'rtf', 'sample.md'));
+  writeFileSync(join(fx, 'sample.epub'), await conv(SAMPLE_MD, 'epub', 'sample.md'));
   const ctx = await browser.newContext({ viewport: { width: 640, height: 400 } });
   const page = await ctx.newPage();
   await page.setContent('<div style="height:400px;background:linear-gradient(90deg,#e11d48,#4f46e5,#10b981)"><h1 style="color:#fff;font:700 48px sans-serif;padding:40px">Salatic</h1></div>');
   writeFileSync(join(fx, 'photo.png'), await page.screenshot());
+  if (has('soffice')) {
+    const tpl = readFileSync(join(root, 'tests/fixtures/deck.fodp.tpl'), 'utf8').replace('@PNG@', readFileSync(join(fx, 'photo.png')).toString('base64'));
+    writeFileSync(join(fx, 'deck.fodp'), tpl);
+    sofficeConv(join(fx, 'deck.fodp'), 'pptx');
+  }
   // A "scanned" page: text rendered as pixels only
   await page.setViewportSize({ width: 1100, height: 900 });
   await page.setContent(`<div style="padding:60px;font:28px/1.5 serif;background:#fff;color:#111;width:980px"><h1 style="font-size:46px">Договор поставки №17</h1><p>Поставщик обязуется передать покупателю товар надлежащего качества в срок до пятнадцатого декабря.</p><p>The quick brown fox jumps over the lazy dog.</p></div>`);
@@ -137,6 +155,15 @@ async function makeFixtures() {
   await ctx.close();
 }
 const F = (n) => join(fx, n);
+const LO = (n) => join(fx, 'lo', n);
+function has(cmd) {
+  try {
+    execFileSync('which', [cmd], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 // ---------------------------------------------------------------------------- API & server
 test('API: health and formats', async () => {
@@ -271,13 +298,111 @@ test('Converter: batch, ZIP download, merge images, unsupported file message', a
     await page.goto(`${BASE}/`);
     await page.setInputFiles('.dropzone input[type=file]', [F('sample.md'), F('photo.png'), F('photo.png'), F('old.doc')]);
     await page.waitForFunction(() => document.querySelectorAll('.file').length === 4 && document.querySelectorAll('.file .select').length === 3);
-    expect((await page.textContent('.file:nth-child(4) .note--error')).includes('.docx'), 'old .doc explains');
+    expect(/повреждён/.test(await page.textContent('.file:nth-child(4) .note--error')), 'broken .doc explains');
     await page.click('.bulk .btn--primary');
     await page.waitForFunction(() => document.querySelectorAll('.file .note--ok').length === 3, null, { timeout: 90_000 });
     const all = await downloadFrom(page, () => page.getByRole('button', { name: /Скачать все/ }).click());
     expect(Object.keys(unzipSync(all.bytes)).length === 3, 'zip of 3 results');
     const merged = await downloadFrom(page, () => page.getByRole('button', { name: /Объединить 2 изобр/ }).click());
     expect((await PDFDocument.load(merged.bytes)).getPageCount() === 2, 'merged pdf has 2 pages');
+  });
+});
+
+// ---------------------------------------------------------------------------- more formats
+test('Converter: DOC → DOCX, XLS → XLSX, ODT → PDF, RTF → DOCX, EPUB → PDF', async () => {
+  if (!has('soffice')) return console.log('    (skipped: LibreOffice not installed)');
+  await withPage(async (page) => {
+    const doc = await convertOne(page, LO('sample.doc'));
+    expect(doc.name === 'sample.docx' && docxText(doc.bytes).includes('Отчёт о продажах'), `doc → docx ${doc.name}`);
+    const xls = await convertOne(page, LO('sample.xls'));
+    expect(xls.name === 'sample.xlsx', xls.name);
+    const sheet = text(unzipSync(xls.bytes)['xl/worksheets/sheet1.xml']);
+    expect(sheet.includes('Яблоки') && /99[.,]5/.test(sheet) && sheet.includes('Груши, лесные'), `xls cells: ${sheet.slice(0, 300)}`);
+    const odt = await convertOne(page, LO('sample.odt'), 'pdf');
+    expect((await pdfText(odt.bytes)).join('\n').includes('Отчёт о продажах'), 'odt → pdf');
+    const rtf = await convertOne(page, F('sample.rtf'));
+    expect(rtf.name === 'sample.docx' && docxText(rtf.bytes).includes('Лесные'), `rtf → docx ${rtf.name}`);
+    const epub = await convertOne(page, F('sample.epub'));
+    expect(epub.name === 'sample.pdf' && (await pdfText(epub.bytes)).join('\n').includes('Отчёт о продажах'), `epub → pdf ${epub.name}`);
+  });
+});
+
+test('Converter: PowerPoint → PDF keeps the slide size and every slide', async () => {
+  if (!has('soffice')) return console.log('    (skipped: LibreOffice not installed)');
+  await withPage(async (page) => {
+    const { name, bytes } = await convertOne(page, LO('deck.pptx'));
+    expect(name === 'deck.pdf', name);
+    const pdf = await PDFDocument.load(bytes);
+    expect(pdf.getPageCount() === 3, `slides ${pdf.getPageCount()}`);
+    const p0 = pdf.getPage(0);
+    expect(p0.getWidth() > p0.getHeight(), 'landscape slide');
+    const t = (await pdfText(bytes)).join('\n');
+    for (const s of ['Годовой отчёт 2024', 'Выручка выросла', 'Показатели', 'Москва']) expect(t.includes(s), `slide text ${s}`);
+  });
+});
+
+test('Converter: multi-page TIFF → PDF, HEIC photo → JPG', async () => {
+  await withPage(async (page) => {
+    const tiff = await convertOne(page, join(root, 'tests/fixtures/pages.tif'), 'pdf');
+    expect((await PDFDocument.load(tiff.bytes)).getPageCount() === 3, 'three TIFF pages → three PDF pages');
+    const heic = await convertOne(page, join(root, 'tests/fixtures/photo.heic'), 'jpg');
+    const dims = imageDims(heic.bytes);
+    expect(heic.name === 'photo.jpg' && dims.w === 320 && dims.h === 240, `heic → jpg ${heic.name} ${JSON.stringify(dims)}`);
+  });
+});
+
+test('Converter: password-protected PDF asks for the password, then converts', async () => {
+  if (!has('python3')) return console.log('    (skipped: python3 not installed)');
+  const enc = F('secret.pdf');
+  const script = [
+    'import sys',
+    'from pypdf import PdfReader, PdfWriter',
+    'r = PdfReader(sys.argv[1]); w = PdfWriter()',
+    'for p in r.pages: w.add_page(p)',
+    'w.encrypt(user_password="тайна", owner_password="owner", algorithm="AES-256")',
+    'w.write(sys.argv[2])',
+  ].join('\n');
+  execFileSync('python3', ['-I', '-c', script, F('sample.pdf'), enc]);
+  await withPage(async (page) => {
+    await page.goto(`${BASE}/`);
+    await page.setInputFiles('.dropzone input[type=file]', enc);
+    await page.waitForSelector('input[type=password]');
+    await page.fill('input[type=password]', 'неверно');
+    await page.keyboard.press('Enter');
+    await page.waitForSelector('h2:text("Неверный пароль")');
+    await page.fill('input[type=password]', 'тайна');
+    await page.keyboard.press('Enter');
+    await page.waitForSelector('.file .select');
+    await page.click('.file .file__actions .btn--primary');
+    await page.waitForSelector('.file .note--ok', { timeout: 90_000 });
+    expect((await page.textContent('.file')).includes('без пароля'), 'tells that the result has no password');
+    const res = await downloadFrom(page, () => page.click('.file .file__actions .btn--primary'));
+    expect(res.name === 'secret.docx' && docxText(res.bytes).includes('Отчёт о продажах'), `decrypted conversion ${res.name}`);
+  });
+});
+
+test('PDF editor: edit a line of the page text in place', async () => {
+  await withPage(async (page) => {
+    await page.goto(`${BASE}/pdf-editor`);
+    await page.setInputFiles('.dropzone input[type=file]', F('sample.pdf'));
+    await page.waitForSelector('.page-card canvas');
+    await page.locator('.page-card').first().locator('button[aria-label="Редактировать страницу"]').click();
+    await page.waitForSelector('.page-stage canvas');
+    await page.click('button[aria-label="Править текст страницы"]');
+    const seg = page.locator('rect.text-seg', { has: page.locator('title', { hasText: 'Отчёт о продажах' }) }).first();
+    await seg.waitFor();
+    await seg.click();
+    const ta = page.locator('textarea.text-edit');
+    expect((await ta.inputValue()) === 'Отчёт о продажах', `prefilled: ${await ta.inputValue()}`);
+    const weight = await ta.evaluate((el) => getComputedStyle(el).fontWeight);
+    expect(Number(weight) >= 600, `bold heading detected (${weight})`);
+    await ta.fill('Отчёт о продажах за 2025 год');
+    await page.keyboard.press('Control+Enter');
+    expect((await page.$$('.page-stage svg g')).length === 2, 'cover + new text');
+    await page.getByRole('button', { name: 'К страницам' }).click();
+    const saved = await downloadFrom(page, () => page.locator('.toolbar').getByRole('button', { name: 'Сохранить PDF' }).click());
+    const t = (await pdfText(saved.bytes))[0];
+    expect(t.includes('Отчёт о продажах за 2025 год'), `new text in PDF: ${t.slice(0, 200)}`);
   });
 });
 
@@ -437,7 +562,7 @@ test('PDF editor: merge PDF + image, rotate, delete, annotate, save', async () =
     for (let i = last; i > 0; i--) await card(i).locator('button[aria-label="Переместить влево"]').click();
     await card(1).locator('button[aria-label="Редактировать страницу"]').click();
     await page.waitForSelector('.page-stage canvas');
-    await page.click('button[aria-label="Текст"]');
+    await page.click('button[aria-label="Добавить текст"]');
     const stage = await page.locator('.page-stage').boundingBox();
     await page.mouse.click(stage.x + 80, stage.y + 120);
     await page.keyboard.type('Подпись E2E');
