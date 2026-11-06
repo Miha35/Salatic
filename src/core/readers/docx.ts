@@ -651,16 +651,42 @@ class DocxReader {
     }
     groups.push({ nodes: cur, sect: finalSect });
     const blocks: Block[] = [];
+    const pageOf = (sect: XNode | undefined): PageSetup | undefined => {
+      const pg = child(sect, 'w:pgSz');
+      const mar = child(sect, 'w:pgMar');
+      const w = twip(pg?.attrs['w:w']);
+      const h = twip(pg?.attrs['w:h']);
+      if (!w || !h) return undefined;
+      const m = (k: string, d: number): number => Math.abs(twip(mar?.attrs[`w:${k}`]) ?? d);
+      return { width: w, height: h, margins: { top: m('top', 72), right: m('right', 72), bottom: m('bottom', 72), left: m('left', 72) } };
+    };
+    const samePage = (a?: PageSetup, b?: PageSetup): boolean => !a || !b || JSON.stringify(a) === JSON.stringify(b);
+    const firstPage = pageOf(groups[0]?.sect) ?? pageOf(finalSect);
+    let prevPage = firstPage;
     groups.forEach((g, i) => {
       const cols = child(g.sect, 'w:cols');
       const listed = childrenNamed(cols, 'w:col');
+      // unequal columns (w:equalWidth="0"): their widths and the space after each
+      const unequal = listed.length > 1 && ['0', 'false', 'off'].includes(cols?.attrs['w:equalWidth'] ?? '0') && listed.some((c) => c.attrs['w:w'] !== listed[0].attrs['w:w']);
+      const page = pageOf(g.sect) ?? prevPage;
+      const newPage = !samePage(page, prevPage);
+      prevPage = page;
       const columns = Math.max(1, Math.min(12, listed.length || +(cols?.attrs['w:num'] ?? 1) || 1));
       const gapTw = listed.length > 1 ? listed.slice(0, -1).reduce((sum, c) => sum + (+(c.attrs['w:space'] ?? 0) || 0), 0) / (listed.length - 1) : +(cols?.attrs['w:space'] ?? 720);
       const type = child(g.sect, 'w:type')?.attrs['w:val'] ?? 'nextPage';
       const inner = this.body(g.nodes);
       if (!inner.length && !g.sect) return;
       if (i > 0 || columns > 1)
-        blocks.push({ type: 'section', columns, gap: (Number.isFinite(gapTw) ? gapTw : 720) / 20, ...(['1', 'true', 'on'].includes(cols?.attrs['w:sep'] ?? '') ? { separator: true } : {}), start: i > 0 && type !== 'continuous' && type !== 'nextColumn' ? 'page' : 'continuous' });
+        blocks.push({
+          type: 'section',
+          columns,
+          gap: (Number.isFinite(gapTw) ? gapTw : 720) / 20,
+          ...(['1', 'true', 'on'].includes(cols?.attrs['w:sep'] ?? '') ? { separator: true } : {}),
+          // a different page size always starts a page
+          start: i > 0 && (newPage || (type !== 'continuous' && type !== 'nextColumn')) ? 'page' : 'continuous',
+          ...(unequal ? { widths: listed.map((c) => Math.max(1, +(c.attrs['w:w'] ?? 0) / 20)), gaps: listed.slice(0, -1).map((c) => (+(c.attrs['w:space'] ?? 0) || 0) / 20) } : {}),
+          ...(i > 0 && newPage && page ? { page } : {}),
+        });
       blocks.push(...inner);
     });
     let title: string | undefined;
@@ -668,15 +694,9 @@ class DocxReader {
     if (core) title = textContent(find(core, 'dc:title')).trim() || undefined;
     const result: Doc = { title, blocks: normalizeSections(blocks), font: this.defFont, size: this.defSize, defaults: this.defPara };
     const sect = childrenNamed(body, 'w:sectPr').pop() ?? findAll(body, 'w:sectPr').pop();
+    // the document's page is the first section's; later sections carry their own when it differs
+    if (firstPage) result.page = firstPage;
     if (sect) {
-      const pg = child(sect, 'w:pgSz');
-      const mar = child(sect, 'w:pgMar');
-      const w = twip(pg?.attrs['w:w']);
-      const h = twip(pg?.attrs['w:h']);
-      if (w && h) {
-        const m = (k: string, d: number): number => Math.abs(twip(mar?.attrs[`w:${k}`]) ?? d);
-        result.page = { width: w, height: h, margins: { top: m('top', 72), right: m('right', 72), bottom: m('bottom', 72), left: m('left', 72) } } satisfies PageSetup;
-      }
       const part = (tag: 'w:headerReference' | 'w:footerReference'): Block[] | undefined => {
         const refs = childrenNamed(sect, tag);
         const ref = refs.find((r) => r.attrs['w:type'] === 'default') ?? refs[0];

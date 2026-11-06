@@ -66,7 +66,7 @@ interface OdfStyle {
   pageLayout?: string;
   masterPage?: string;
   /** Section columns (style:section-properties) */
-  columns?: { count: number; gap: number; sep: boolean };
+  columns?: { count: number; gap: number; sep: boolean; rel?: number[]; starts?: number[]; ends?: number[] };
 }
 
 interface ListLevel {
@@ -158,6 +158,11 @@ class OdfStyles {
           const listed = elements(cols).filter((c) => c.name === 'style:column');
           const gap = odfLength(cols?.attrs['fo:column-gap']) ?? (listed.length > 1 ? (odfLength(listed[0].attrs['fo:end-indent']) ?? 0) + (odfLength(listed[1].attrs['fo:start-indent']) ?? 0) : 0);
           st.columns = { count: Math.min(12, count), gap: gap || 18, sep: !!find(cols, 'style:column-sep') };
+          if (listed.length === count) {
+            st.columns.rel = listed.map((c) => parseFloat(c.attrs['style:rel-width'] ?? '1') || 1);
+            st.columns.starts = listed.map((c) => odfLength(c.attrs['fo:start-indent']) ?? 0);
+            st.columns.ends = listed.map((c) => odfLength(c.attrs['fo:end-indent']) ?? 0);
+          }
         }
         this.paraProps(find(el, 'style:paragraph-properties'), st);
         if (el.name === 'style:default-style') this.defaults.set(st.family, st);
@@ -244,6 +249,15 @@ class OdtReader {
 
   constructor(private files: Record<string, Uint8Array>) {}
 
+  /** Page of each master page (by name), the document's master, the one in use, and the content width. */
+  private masterPages = new Map<string, PageSetup>();
+  private docMaster = 'Standard';
+  private currentMaster = 'Standard';
+  private contentW = 481.9;
+  /** Parsing the body (not headers, footers or notes), and whether a body block was seen yet. */
+  private inBody = false;
+  private bodyStarted = false;
+
   private xml(path: string): XNode | undefined {
     const f = this.files[path];
     return f ? parseXml(decoder.decode(f)) : undefined;
@@ -258,6 +272,24 @@ class OdtReader {
     this.styles.add(find(stylesXml, 'office:styles'));
     this.styles.add(find(stylesXml, 'office:automatic-styles'));
     this.styles.add(find(content, 'office:automatic-styles'));
+    // master pages: a paragraph switching to another one starts a section with that page
+    const masterEls = childrenNamed(find(stylesXml, 'office:master-styles'), 'style:master-page');
+    for (const mp of masterEls) {
+      const layout = this.styles.pageLayouts.get(mp.attrs['style:page-layout-name']);
+      if (!layout) continue;
+      const hdr = !!find(mp, 'style:header');
+      const ftr = !!find(mp, 'style:footer');
+      const r = (v: number): number => Math.round(v * 100) / 100;
+      this.masterPages.set(mp.attrs['style:name'] ?? '', {
+        width: layout.width,
+        height: layout.height,
+        margins: { ...layout.margins, top: r(layout.margins.top + (hdr ? layout.headerExtent : 0)), bottom: r(layout.margins.bottom + (ftr ? layout.footerExtent : 0)) },
+      });
+    }
+    const std0 = masterEls.find((m) => m.attrs['style:name'] === 'Standard' || m.attrs['style:name'] === 'Default') ?? masterEls[0];
+    this.docMaster = this.currentMaster = std0?.attrs['style:name'] ?? 'Standard';
+    const docPage = this.masterPages.get(this.docMaster);
+    if (docPage) this.contentW = docPage.width - docPage.margins.left - docPage.margins.right;
     const base = this.styles.text('Standard', 'paragraph');
     this.docFont = base.font;
     this.docSize = base.size;
@@ -267,7 +299,9 @@ class OdtReader {
       if (find(content, 'office:spreadsheet')) throw new ConvertError('Это таблица OpenDocument (.ods), а не текстовый документ.');
       throw new ConvertError('В документе OpenDocument нет текста (office:text).');
     }
+    this.inBody = true;
     const blocks = normalizeSections(this.blocks(body.children));
+    this.inBody = false;
     const doc: Doc = { blocks };
     if (this.docFont) doc.font = this.docFont;
     if (this.docSize) doc.size = this.docSize;
@@ -279,7 +313,8 @@ class OdtReader {
     if (Object.keys(defaults).length) doc.defaults = defaults;
     // Master page: header, footer and page geometry
     const masters = childrenNamed(find(stylesXml, 'office:master-styles'), 'style:master-page');
-    const master = masters.find((m) => m.attrs['style:name'] === 'Standard' || m.attrs['style:name'] === 'Default') ?? masters[0];
+    // the master of the first body paragraph (Standard unless it names another)
+    const master = masters.find((m) => m.attrs['style:name'] === this.docMaster) ?? masters.find((m) => m.attrs['style:name'] === 'Standard' || m.attrs['style:name'] === 'Default') ?? masters[0];
     if (master) {
       const layout = this.styles.pageLayouts.get(master.attrs['style:page-layout-name']);
       const header = find(master, 'style:header');
@@ -344,6 +379,7 @@ class OdtReader {
           }
           break;
         case 'table:table':
+          this.switchMaster(n.attrs['table:style-name'], out);
           out.push(this.table(n));
           break;
         case 'text:section': {
@@ -351,9 +387,28 @@ class OdtReader {
           if (cols) {
             // a page break before the section is written on its first paragraph
             const firstP = elements(n).find((c) => c.name === 'text:p' || c.name === 'text:h');
-            const pageStart = !!firstP && !!this.styles.para(firstP.attrs['text:style-name'] ?? '').breakBefore;
-            out.push({ type: 'section', columns: cols.count, gap: cols.gap, ...(cols.sep ? { separator: true } : {}), start: pageStart && out.length ? 'page' : 'continuous' });
-            out.push(...this.blocks(n.children, listDepth, listStyle));
+            let pageStart = !!firstP && !!this.styles.para(firstP.attrs['text:style-name'] ?? '').breakBefore;
+            // a master page switched to by the first paragraph belongs to this section's marker
+            const inner = this.blocks(n.children, listDepth, listStyle);
+            const lead = inner[0];
+            let page: PageSetup | undefined;
+            if (lead?.type === 'section' && lead.columns <= 1 && lead.page) {
+              page = lead.page;
+              pageStart = true;
+              inner.shift();
+            }
+            // unequal columns (in the content width of the section's page): relative widths (indents included) minus the indents, in a content width
+            let widths: number[] | undefined;
+            let gaps: number[] | undefined;
+            if (cols.rel && cols.starts && cols.ends) {
+              const perRel = this.contentW / cols.rel.reduce((a, b) => a + b, 0);
+              widths = cols.rel.map((r, i) => Math.max(1, r * perRel - cols.starts![i] - cols.ends![i]));
+              gaps = cols.rel.slice(0, -1).map((_, i) => cols.ends![i] + cols.starts![i + 1]);
+              // equal columns are written with rel-widths that differ by rounding (32767*, 32768*)
+              if (Math.max(...widths) - Math.min(...widths) < 1 && gaps.every((g) => Math.abs(g - gaps![0]) < 0.5)) widths = gaps = undefined;
+            }
+            out.push({ type: 'section', columns: cols.count, gap: cols.gap, ...(cols.sep ? { separator: true } : {}), start: pageStart && out.length ? 'page' : 'continuous', ...(widths ? { widths, gaps } : {}), ...(page ? { page } : {}) });
+            out.push(...inner);
             out.push({ type: 'section', columns: 1, gap: 36, start: 'continuous' });
           } else out.push(...this.blocks(n.children, listDepth, listStyle));
           break;
@@ -393,9 +448,27 @@ class OdtReader {
     return out;
   }
 
+  /**
+   * A body paragraph or table whose style names a master page: the first one sets the document's
+   * page; a later change starts a new page of that kind (a section with its own page).
+   */
+  private switchMaster(styleName: string | undefined, out: Block[]): void {
+    if (!this.inBody) return;
+    const master = styleName ? this.styles.styles.get(styleName)?.masterPage : undefined;
+    const started = this.bodyStarted;
+    this.bodyStarted = true;
+    if (!master || master === this.currentMaster || !this.masterPages.has(master)) return;
+    this.currentMaster = master;
+    const pg = this.masterPages.get(master)!;
+    this.contentW = pg.width - pg.margins.left - pg.margins.right;
+    if (!started) this.docMaster = master;
+    else out.push({ type: 'section', columns: 1, gap: 36, start: 'page', page: pg });
+  }
+
   private paragraph(el: XNode, out: Block[]): void {
     const styleName = el.attrs['text:style-name'];
     const p = this.styles.para(styleName);
+    this.switchMaster(styleName, out);
     const display = p.display ?? '';
     const isHeading = el.name === 'text:h' || /^(Title|Heading)/i.test(display);
     const isNote = /^(Footnote|Endnote)/i.test(display);

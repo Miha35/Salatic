@@ -481,7 +481,21 @@ function blockFrom(node: HNode, style: InlineStyle, ctx: Ctx, out: Block[], inhe
       if (/\bdoc-section\b/.test(cls) || columns > 1) {
         const gap = +(node.attrs['data-gap'] ?? '') || lengthPt(css['column-gap']) || 36;
         const separator = 'data-separator' in node.attrs || /solid|dashed|dotted|double/.test(css['column-rule'] ?? '');
-        out.push({ type: 'section', columns: Math.max(1, columns), gap, ...(separator ? { separator: true } : {}), start: node.attrs['data-start'] === 'page' ? 'page' : 'continuous' });
+        const nums = (v: string | undefined): number[] => (v ?? '').split(',').filter((x) => x.trim() !== '').map(Number);
+        const widths = nums(node.attrs['data-widths']);
+        const gaps = nums(node.attrs['data-gaps']);
+        const pg = nums(node.attrs['data-page']);
+        const unequal = columns > 1 && widths.length === columns && widths.every((v) => v > 0) && gaps.every((v) => Number.isFinite(v) && v >= 0);
+        const page = pg.length === 6 && pg.every((v) => Number.isFinite(v) && v >= 0) && pg[0] > 0 && pg[1] > 0 ? { width: pg[0], height: pg[1], margins: { top: pg[2], right: pg[3], bottom: pg[4], left: pg[5] } } : undefined;
+        out.push({
+          type: 'section',
+          columns: Math.max(1, columns),
+          gap,
+          ...(separator ? { separator: true } : {}),
+          start: node.attrs['data-start'] === 'page' || page ? 'page' : 'continuous',
+          ...(unequal ? { widths, gaps } : {}),
+          ...(page ? { page } : {}),
+        });
         out.push(...collectBlocks(node.children, st, ctx, align));
         out.push({ type: 'section', columns: 1, gap: 36, start: 'continuous' });
         break;

@@ -39,12 +39,16 @@ export function normalizeSections(blocks: Block[]): Block[] {
   const out: Block[] = [];
   for (const b of blocks) {
     const prev = out[out.length - 1];
-    if (b.type === 'section' && prev?.type === 'section') out[out.length - 1] = { ...b, start: prev.start === 'page' || b.start === 'page' ? 'page' : 'continuous' };
+    if (b.type === 'section' && prev?.type === 'section') {
+      // the later marker's columns; a page size set by either one is kept
+      const page = b.page ?? prev.page;
+      out[out.length - 1] = { ...b, ...(page ? { page } : {}), start: prev.start === 'page' || b.start === 'page' ? 'page' : 'continuous' };
+    }
     else out.push(b);
   }
   while (out.length && out[out.length - 1].type === 'section') out.pop();
   const first = out[0];
-  if (first?.type === 'section' && first.columns <= 1) out.shift();
+  if (first?.type === 'section' && first.columns <= 1 && !first.page) out.shift();
   return out;
 }
 
@@ -154,7 +158,18 @@ export type Block =
    * `gap` points apart. `start: 'page'` begins it on a new page; 'continuous' on the same page
    * (the columns of the section before are then balanced).
    */
-  | { type: 'section'; columns: number; gap: number; separator?: boolean; start: 'continuous' | 'page' };
+  | {
+      type: 'section';
+      columns: number;
+      gap: number;
+      separator?: boolean;
+      start: 'continuous' | 'page';
+      /** Unequal columns: relative widths, and the space after each column but the last (pt). */
+      widths?: number[];
+      gaps?: number[];
+      /** Page size and margins of the section when they differ from the document's. */
+      page?: PageSetup;
+    };
 
 export interface Doc {
   title?: string;

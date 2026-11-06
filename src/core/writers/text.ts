@@ -318,7 +318,10 @@ function blocksHtml(blocks: Block[], notes: Notes, ctx: HtmlCtx = HTML): string 
         const n = Math.max(1, Math.round(b.columns));
         if (n > 1 || b.start === 'page') {
           const css = n > 1 ? ` style="column-count:${n};column-gap:${num(b.gap)}pt${b.separator ? ';column-rule:0.5pt solid currentColor' : ''}"` : '';
-          s += `<div class="doc-section" data-columns="${n}" data-gap="${num(b.gap)}" data-start="${b.start}"${b.separator ? ' data-separator="1"' : ''}${css}>\n`;
+          // unequal widths and an own page travel in data attributes (CSS columns are always equal)
+          const widths = n > 1 && b.widths?.length === n ? ` data-widths="${b.widths.map(num).join(',')}" data-gaps="${(b.gaps ?? []).map(num).join(',')}"` : '';
+          const pg = b.page ? ` data-page="${[b.page.width, b.page.height, b.page.margins.top, b.page.margins.right, b.page.margins.bottom, b.page.margins.left].map(num).join(',')}"` : '';
+          s += `<div class="doc-section" data-columns="${n}" data-gap="${num(b.gap)}" data-start="${b.start}"${b.separator ? ' data-separator="1"' : ''}${widths}${pg}${css}>\n`;
           sectionOpen = true;
         }
         break;

@@ -310,9 +310,26 @@ class RtfWriter {
     return s;
   }
 
+  /** The page of the current section (twips): set by sections that carry their own. */
+  private sectPage?: { w: number; h: number; m: { top: number; right: number; bottom: number; left: number } };
+
   private sectionProps(b: Extract<Block, { type: 'section' }>): string {
     const n = Math.max(1, Math.round(b.columns));
-    return `${b.start === 'page' ? '\\sbkpage' : '\\sbknone'}\\pgwsxn${this.pageW}\\pghsxn${this.pageH}${n > 1 ? `\\cols${n}\\colsx${Math.round(b.gap * 20)}${b.separator ? '\\linebetcol' : ''}` : ''}`;
+    if (b.page) this.sectPage = { w: tw(b.page.width), h: tw(b.page.height), m: { top: tw(b.page.margins.top), right: tw(b.page.margins.right), bottom: tw(b.page.margins.bottom), left: tw(b.page.margins.left) } };
+    const pg = this.sectPage ?? { w: this.pageW, h: this.pageH, m: this.margins };
+    let cols = '';
+    if (n > 1) {
+      cols = `\\cols${n}\\colsx${Math.round(b.gap * 20)}${b.separator ? '\\linebetcol' : ''}`;
+      if (b.widths && b.widths.length === n) {
+        // unequal columns: each one's width and the space to its right
+        const gaps = Array.from({ length: n - 1 }, (_, k) => Math.round((b.gaps?.[k] ?? b.gap) * 20));
+        const free = pg.w - pg.m.left - pg.m.right - gaps.reduce((a, c) => a + c, 0);
+        const sum = b.widths.reduce((a, c) => a + c, 0);
+        cols += b.widths.map((v, k) => `\\colno${k + 1}\\colw${Math.round((free * v) / sum)}${k < n - 1 ? `\\colsr${gaps[k]}` : ''}`).join('');
+      }
+    }
+    const page = `\\pgwsxn${pg.w}\\pghsxn${pg.h}\\marglsxn${pg.m.left}\\margrsxn${pg.m.right}\\margtsxn${pg.m.top}\\margbsxn${pg.m.bottom}${pg.w > pg.h ? '\\lndscpsxn' : ''}`;
+    return `${b.start === 'page' ? '\\sbkpage' : '\\sbknone'}${page}${cols}`;
   }
 
   build(): Uint8Array {

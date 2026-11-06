@@ -14,7 +14,7 @@
 import { beginText, clip, clipEvenOdd, closePath, concatTransformationMatrix, endText, lineTo, moveTo, rotateAndSkewTextRadiansAndTranslate, setFontAndSize, setTextRenderingMode, showText, TextRenderingMode, degrees, drawSvgPath, endPath, PDFDict, PDFDocument, PDFName, PDFNumber, PDFOperator, PDFOperatorNames, PDFString, popGraphicsState, pushGraphicsState, rectangle, rgb, setGraphicsState, type PDFContext, type PDFImage, type PDFObject, type PDFPage, type PDFRef } from 'pdf-lib';
 import { parseMetafile, type Metafile } from '../metafile';
 import { parseSvg } from '../svg-render';
-import type { Align, Block, Doc, FontFamily, Gradient, ParaFormat, PatternFill, TextRun } from '../model';
+import type { Align, Block, Doc, FontFamily, Gradient, PageSetup, ParaFormat, PatternFill, TextRun } from '../model';
 import { PATTERNS } from '../drawingml';
 import { FontManager, styleOf, type FontKey, type FontLoader } from '../pdf-fonts';
 import type { Subsetter } from '../hb-subset';
@@ -57,6 +57,37 @@ export interface Box {
   pageBreak?: boolean;
   /** A zero-height marker starting a section (columns) */
   section?: Section;
+  /** A paragraph's lines, to lay its rest out again at another width (columns of unequal width) */
+  src?: { tokens: Token[]; lines: Token[][]; tops: number[]; x: number; width: number; ctx: Ctx; p: ParaFmt; keepIndent: boolean };
+}
+
+type ParaFmt = Required<Omit<ParaFormat, 'align'>> & { align?: Align };
+
+/** Page size and margins of a page. */
+interface Geom {
+  w: number;
+  h: number;
+  margins: { top: number; right: number; bottom: number; left: number };
+}
+
+/** Where column filling stands: box index, offset into it, and the box when it was laid out again. */
+interface ColState {
+  i: number;
+  from: number;
+  cur?: Box;
+}
+
+/** Column widths and offsets (from the left of the first column) of a section in a content width. */
+function columnGeometry(sec: { columns: number; gap: number; widths?: number[]; gaps?: number[] }, contentW: number): { ws: number[]; xs: number[]; gaps: number[] } {
+  const n = Math.max(1, sec.columns);
+  const gaps = Array.from({ length: n - 1 }, (_, k) => Math.max(0, sec.gaps?.[k] ?? sec.gap));
+  const free = Math.max(n * 36, contentW - gaps.reduce((a, b) => a + b, 0));
+  const rel = sec.widths && sec.widths.length === n && sec.widths.every((v) => v > 0) ? sec.widths : Array.from({ length: n }, () => 1);
+  const sum = rel.reduce((a, b) => a + b, 0);
+  const ws = rel.map((v) => (free * v) / sum);
+  const xs: number[] = [0];
+  for (let k = 1; k < n; k++) xs.push(xs[k - 1] + ws[k - 1] + gaps[k - 1]);
+  return { ws, xs, gaps };
 }
 
 type Section = Omit<Extract<Block, { type: 'section' }>, 'type'>;
@@ -261,6 +292,54 @@ export class PdfWriter {
   }
 
   protected fm: FontManager;
+  /** Footnote numbers by reference run: laying a paragraph out again keeps them */
+  private noteNums = new Map<TextRun, number>();
+  private relaid = new Map<Box, Map<string, Promise<Box>>>();
+
+  /** The rest of a paragraph box from y = `from` on, laid out again at `width` (cached). */
+  private relayout(box: Box, from: number, width: number): Promise<Box> {
+    let m = this.relaid.get(box);
+    if (!m) this.relaid.set(box, (m = new Map()));
+    const key = `${Math.round(from * 100)}|${Math.round(width * 100)}`;
+    let r = m.get(key);
+    if (!r) {
+      r = (async (): Promise<Box> => {
+        const src = box.src!;
+        let L = src.tops.findIndex((t) => t >= from - 0.01);
+        if (L < 0) L = src.lines.length;
+        const runs: TextRun[] = [];
+        const origin: TextRun[] = [];
+        // the rest of the paragraph from the original token stream: line breaks dropped the spaces and
+        // newlines they were taken at; only pieces of a word broken by force are not in that stream
+        const rest = src.lines.slice(L).flat();
+        const known = new Set(src.tokens);
+        const at = rest.findIndex((t) => known.has(t));
+        const seq = at < 0 ? rest : [...rest.slice(0, at), ...src.tokens.slice(src.tokens.indexOf(rest[at]))];
+        let leading = L > 0 && !src.keepIndent;
+        for (const t of seq) {
+          if (leading && t.space) continue; // a wrapped line does not start with its space
+          leading = false;
+          if (t.noteRef || t.run.field) {
+            runs.push(t.run);
+            origin.push(t.run);
+            continue;
+          }
+          const text = t.newline ? '\n' : t.text;
+          if (origin[origin.length - 1] === t.run && !t.run.note && !t.run.field) runs[runs.length - 1] = { ...runs[runs.length - 1], text: runs[runs.length - 1].text + text };
+          else {
+            runs.push({ ...t.run, text });
+            origin.push(t.run);
+          }
+        }
+        const p = L > 0 ? { ...src.p, firstLine: 0, spaceBefore: 0 } : src.p;
+        const nb = await this.textBox(runs, src.x, width, src.ctx, p, src.keepIndent);
+        nb.keepWithNext = box.keepWithNext;
+        return nb;
+      })();
+      m.set(key, r);
+    }
+    return r;
+  }
   protected images = new Map<Uint8Array, PDFImage | null>();
   warnings = new Set<string>();
   protected pageW = 595.28;
@@ -294,6 +373,31 @@ export class PdfWriter {
     return this.pageW - this.margins.left - this.margins.right;
   }
 
+  /** The document's page and that of every page placed so far (sections may change it). */
+  private docGeom!: Geom;
+  private pageGeoms: Geom[] = [];
+  private headerH = 0;
+  private footerH = 0;
+
+  /** A section's page, unless the user chose a fixed paper size. */
+  private geomOf(page: PageSetup | undefined): Geom {
+    if (!page || (this.opts.pageSize ?? 'auto') !== 'auto') return this.docGeom;
+    return { w: page.width, h: page.height, margins: { ...page.margins } };
+  }
+
+  /** Make `g` the current page geometry: size, margins and the content area between header and footer. */
+  private applyGeom(g: Geom): void {
+    this.pageW = g.w;
+    this.pageH = g.h;
+    this.margins = { ...g.margins };
+    this.contentTop = Math.max(this.margins.top, this.headerBoxes.length ? this.headerDist + this.headerH + 6 : 0);
+    this.contentBottom = Math.min(this.pageH - this.margins.bottom, this.footerBoxes.length ? this.pageH - this.footerDist - this.footerH - 6 : Infinity);
+  }
+
+  private sameGeom(g: Geom): boolean {
+    return g.w === this.pageW && g.h === this.pageH && JSON.stringify(g.margins) === JSON.stringify(this.margins);
+  }
+
   async init(doc: Doc): Promise<void> {
     this.pdf = await PDFDocument.create();
     this.pdf.registerFontkit((await import('@pdf-lib/fontkit')).default);
@@ -309,6 +413,7 @@ export class PdfWriter {
     if (doc.page) this.margins = { ...doc.page.margins };
     this.contentTop = this.margins.top;
     this.contentBottom = this.pageH - this.margins.bottom;
+    this.docGeom = { w: this.pageW, h: this.pageH, margins: { ...this.margins } };
     this.base = { family: doc.font ?? 'sans', size: doc.size ?? 11 };
     this.defaults = doc.defaults ?? {};
     if (doc.title) this.pdf.setTitle(doc.title);
@@ -338,8 +443,12 @@ export class PdfWriter {
       await this.fm.load([primary]);
       if (!this.fm.loaded(primary)) throw new Error(`Шрифт ${primary} недоступен`);
       if (r.note) {
-        const num = this.notes.length + 1;
-        this.notes.push({ num, blocks: r.note, boxes: [], height: 0 });
+        let num = this.noteNums.get(r);
+        if (!num) {
+          num = this.notes.length + 1;
+          this.notes.push({ num, blocks: r.note, boxes: [], height: 0 });
+          this.noteNums.set(r, num);
+        }
         const text = String(num);
         this.fm.markUsed(primary, text);
         out.push({ text, font: primary, size, width: this.fm.width(primary, text, size), space: false, newline: false, join: true, run: r, noteRef: num });
@@ -501,10 +610,12 @@ export class PdfWriter {
     const firstX = left + p.firstLine;
     const lines = this.breakLines(tokens, width - p.indent - p.firstLine, width - p.indent, keepIndent);
     const ops: Op[] = [];
+    const tops: number[] = [];
     let y = 0;
     const baseKey = this.keyFor({ text: '' }, ctx);
     await this.fm.load([baseKey]);
     lines.forEach((line, li) => {
+      tops.push(y);
       const lx = li === 0 ? firstX : left;
       const lw = li === 0 ? width - p.indent - p.firstLine : width - p.indent;
       // Line box from the tallest font on the line
@@ -567,7 +678,7 @@ export class PdfWriter {
       flush();
       y += lh;
     });
-    return { height: y, ops, spaceBefore: p.spaceBefore, spaceAfter: p.spaceAfter };
+    return { height: y, ops, spaceBefore: p.spaceBefore, spaceAfter: p.spaceAfter, src: { tokens, lines, tops, x, width, ctx, p, keepIndent } };
   }
 
   // ------------------------------------------------------------------ blocks
@@ -930,8 +1041,8 @@ export class PdfWriter {
 
   async prepare(doc: Doc): Promise<Box[]> {
     const ctx = { ...this.base };
-    const w = this.contentW;
-    const x = this.margins.left;
+    let w = this.contentW;
+    let x = this.margins.left;
     const strip = (boxes: Box[]): Box[] => {
       if (boxes.length) {
         boxes[0].spaceBefore = 0;
@@ -945,15 +1056,15 @@ export class PdfWriter {
     if (this.headerBlocks.length) this.headerBoxes = strip(await this.layout(this.headerBlocks, x, w, small));
     if (this.footerBlocks.length) this.footerBoxes = strip(await this.layout(this.footerBlocks, x, w, small));
     const stack = (boxes: Box[]): number => boxes.reduce((s, b, i) => s + b.height + (i ? b.spaceBefore : 0) + (i < boxes.length - 1 ? b.spaceAfter : 0), 0);
-    this.contentTop = Math.max(this.margins.top, this.headerBoxes.length ? this.headerDist + stack(this.headerBoxes) + 6 : 0);
-    this.contentBottom = Math.min(this.pageH - this.margins.bottom, this.footerBoxes.length ? this.pageH - this.footerDist - stack(this.footerBoxes) - 6 : Infinity);
+    this.headerH = stack(this.headerBoxes);
+    this.footerH = stack(this.footerBoxes);
+    this.applyGeom(this.docGeom);
     // Main flow (footnotes are numbered while laying it out); sections are laid out at their column width
     const main: Box[] = [];
-    let cols = 1;
-    let gap = 36;
+    let sectionW = w;
     let pending: Block[] = [];
     const flush = async (): Promise<void> => {
-      if (pending.length) main.push(...(await this.layout(pending, x, (w - (cols - 1) * gap) / cols, ctx)));
+      if (pending.length) main.push(...(await this.layout(pending, x, sectionW, ctx)));
       pending = [];
     };
     for (const b of doc.blocks.length ? doc.blocks : [{ type: 'paragraph', runs: [] } as Block]) {
@@ -962,12 +1073,22 @@ export class PdfWriter {
         continue;
       }
       await flush();
-      gap = Math.max(0, Math.min(b.gap, w / 4));
+      // a section with its own page: laid out at that page's width and margin
+      if (b.page) {
+        this.applyGeom(this.geomOf(b.page));
+        w = this.contentW;
+        x = this.margins.left;
+      }
+      const gap = Math.max(0, Math.min(b.gap, w / 4));
       // columns narrower than an inch are not useful
-      cols = Math.max(1, Math.min(Math.round(b.columns) || 1, Math.floor((w + gap) / (72 + gap))));
-      main.push({ height: 0, ops: [], spaceBefore: 0, spaceAfter: 0, section: { columns: cols, gap, separator: b.separator, start: b.start } });
+      const cols = Math.max(1, Math.min(Math.round(b.columns) || 1, Math.floor((w + gap) / (72 + gap))));
+      const sec: Section = { columns: cols, gap, separator: b.separator, start: b.start, ...(cols === b.columns && b.widths ? { widths: b.widths, gaps: b.gaps } : {}) };
+      // unequal columns: laid out at the narrowest, paragraphs are laid out again for wider ones
+      sectionW = Math.min(...columnGeometry(sec, w).ws);
+      main.push({ height: 0, ops: [], spaceBefore: 0, spaceAfter: 0, section: { ...sec, ...(b.page ? { page: b.page } : {}) } });
     }
     await flush();
+    this.applyGeom(this.docGeom);
     // Footnote bodies
     const noteCtx = { ...ctx, size: Math.max(7, ctx.size * 0.8) };
     for (let i = 0; i < this.notes.length; i++) {
@@ -990,10 +1111,12 @@ export class PdfWriter {
 
   // ------------------------------------------------------------------ placement
 
-  private newPage(): void {
+  private newPage(next?: Geom): void {
     if (this.page) this.flushNotes();
+    if (next) this.applyGeom(next);
     this.page = this.pdf.addPage([this.pageW, this.pageH]);
     this.pages.push(this.page);
+    this.pageGeoms.push({ w: this.pageW, h: this.pageH, margins: { ...this.margins } });
     this.cursor = this.contentTop;
     this.pageNotes = [];
   }
@@ -1095,7 +1218,7 @@ export class PdfWriter {
 
   private pendingBreak = false;
 
-  place(boxes: Box[]): void {
+  async place(boxes: Box[]): Promise<void> {
     this.newPage();
     for (let i = 0; i < boxes.length; ) {
       const sec = boxes[i].section;
@@ -1103,21 +1226,30 @@ export class PdfWriter {
       while (j < boxes.length && !boxes[j].section) j++;
       const run = boxes.slice(sec ? i + 1 : i, j);
       if (sec) {
-        if ((sec.start === 'page' || this.pendingBreak) && this.cursor > this.contentTop + 0.01) this.newPage();
+        const g = sec.page ? this.geomOf(sec.page) : null;
+        if (g && !this.sameGeom(g)) {
+          // another page size: a new page, or the current one resized while still empty
+          if (this.cursor > this.contentTop + 0.01 || this.pageNotes.length) this.newPage(g);
+          else {
+            this.applyGeom(g);
+            this.page.setSize(this.pageW, this.pageH);
+            this.pageGeoms[this.pageGeoms.length - 1] = { w: this.pageW, h: this.pageH, margins: { ...this.margins } };
+            this.cursor = this.contentTop;
+          }
+        } else if ((sec.start === 'page' || this.pendingBreak) && this.cursor > this.contentTop + 0.01) this.newPage();
         this.pendingBreak = false;
       }
       // Word balances the columns of a section only when a continuous section follows it
-      if (sec && sec.columns > 1) this.placeColumns(run, sec, boxes[j]?.section?.start === 'continuous');
+      if (sec && sec.columns > 1) await this.placeColumns(run, sec, boxes[j]?.section?.start === 'continuous');
       else this.placeFlow(run);
       i = j;
     }
   }
 
   /** Lay `boxes` out in the section's columns from the cursor on, page after page. */
-  private placeColumns(boxes: Box[], sec: Section, balance: boolean): void {
-    const n = sec.columns;
-    const colW = (this.contentW - (n - 1) * sec.gap) / n;
-    let state = { i: 0, from: 0 };
+  private async placeColumns(boxes: Box[], sec: Section, balance: boolean): Promise<void> {
+    const geo = columnGeometry(sec, this.contentW);
+    let state: ColState = { i: 0, from: 0 };
     let guard = 0;
     while (state.i < boxes.length && guard++ < 10_000) {
       const top = this.cursor;
@@ -1128,38 +1260,38 @@ export class PdfWriter {
       // Footnotes referenced by what goes on this page take room at its bottom. More height brings more
       // notes, so search the tallest columns that still leave room for their own notes.
       const full = this.limit - top;
-      const extra = (h: number): number => {
-        const notes = this.fillColumns(boxes, state, n, colW, sec.gap, top, h, true).notes;
+      const extra = async (h: number): Promise<number> => {
+        const notes = (await this.fillColumns(boxes, state, geo, top, h, true)).notes;
         return notes.length ? this.notesHeight([...this.pageNotes, ...notes]) - this.notesHeight(this.pageNotes) : 0;
       };
       let avail = full;
-      if (extra(full) > 0) {
+      if ((await extra(full)) > 0) {
         let lo = 0;
         let hi = full;
         for (let k = 0; k < 24 && hi - lo > 0.25; k++) {
           const mid = (lo + hi) / 2;
-          if (mid + extra(mid) <= full) lo = mid;
+          if (mid + (await extra(mid)) <= full) lo = mid;
           else hi = mid;
         }
         avail = lo;
       }
       let h = avail;
-      if (balance && this.fillColumns(boxes, state, n, colW, sec.gap, top, avail, true).done) {
+      if (balance && (await this.fillColumns(boxes, state, geo, top, avail, true)).done) {
         // the rest fits on this page: the smallest column height that still holds it
         let lo = 0;
         let hi = avail;
         for (let k = 0; k < 20 && hi - lo > 0.5; k++) {
           const mid = (lo + hi) / 2;
-          if (this.fillColumns(boxes, state, n, colW, sec.gap, top, mid, true).done) hi = mid;
+          if ((await this.fillColumns(boxes, state, geo, top, mid, true)).done) hi = mid;
           else lo = mid;
         }
         h = hi + 0.01;
       }
-      const r = this.fillColumns(boxes, state, n, colW, sec.gap, top, h, false);
+      const r = await this.fillColumns(boxes, state, geo, top, h, false);
       const used = Math.max(0, ...r.heights);
       if (sec.separator && r.heights.length > 1)
         for (let k = 1; k < r.heights.length; k++) {
-          const lx = this.margins.left + k * (colW + sec.gap) - sec.gap / 2;
+          const lx = this.margins.left + geo.xs[k] - geo.gaps[k - 1] / 2;
           this.page.drawLine({ start: { x: lx, y: this.pageH - top }, end: { x: lx, y: this.pageH - (top + used) }, thickness: 0.5, color: rgb(0, 0, 0) });
         }
       state = r.state;
@@ -1172,25 +1304,32 @@ export class PdfWriter {
   }
 
   /**
-   * Fill up to n columns of height h starting at y = top. In a dry run nothing is drawn, content that
-   * cannot be split to fit counts as not fitting, and the footnotes the placed content refers to are collected.
+   * Fill the columns of height h starting at y = top. In a dry run nothing is drawn, content that cannot
+   * be split to fit counts as not fitting, and the footnotes the placed content refers to are collected.
+   * A paragraph laid out at another width than the column's is laid out again for it from where it stands.
    */
-  private fillColumns(boxes: Box[], start: { i: number; from: number }, n: number, colW: number, gap: number, top: number, h: number, dry: boolean): { state: { i: number; from: number }; done: boolean; heights: number[]; notes: Note[] } {
-    let { i, from } = start;
+  private async fillColumns(boxes: Box[], start: ColState, geo: { ws: number[]; xs: number[] }, top: number, h: number, dry: boolean): Promise<{ state: ColState; done: boolean; heights: number[]; notes: Note[] }> {
+    let { i, from, cur } = start;
     const heights: number[] = [];
     const notes: Note[] = [];
-    const result = (done: boolean) => ({ state: { i, from }, done, heights, notes });
-    for (let col = 0; col < n; col++) {
-      const dx = col * (colW + gap);
+    const result = (done: boolean) => ({ state: { i, from, cur }, done, heights, notes });
+    for (let col = 0; col < geo.ws.length; col++) {
+      const dx = geo.xs[col];
       let y = 0;
       while (i < boxes.length) {
-        const box = boxes[i];
+        let box = cur ?? boxes[i];
         if (box.pageBreak) {
           // a page break inside columns continues on the next page
           i++;
           from = 0;
+          cur = undefined;
           heights.push(y);
           return result(i >= boxes.length);
+        }
+        if (box.src && Math.abs(box.src.width - geo.ws[col]) > 0.5) {
+          box = await this.relayout(box, from, geo.ws[col]);
+          cur = box;
+          from = 0;
         }
         const sb = from === 0 && y > 0.01 ? box.spaceBefore : 0;
         const rest = box.height - from;
@@ -1214,6 +1353,7 @@ export class PdfWriter {
           y += box.spaceAfter;
           i++;
           from = 0;
+          cur = undefined;
           continue;
         }
         const cut = this.candidates(box, from, from + (h - y - sb)).find((c) => c > from + 0.01);
@@ -1229,6 +1369,7 @@ export class PdfWriter {
           if (from >= box.height - 0.01) {
             i++;
             from = 0;
+            cur = undefined;
           }
         }
         break;
@@ -1317,14 +1458,26 @@ export class PdfWriter {
       }
       return boxes;
     };
-    // Headers/footers with page fields are laid out per page once the page count is known
-    const perPage = async (blocks: Block[], boxes: Box[], no: number): Promise<Box[]> =>
-      hasFields(blocks) ? strip(await this.layout(fillFields(blocks, no, total), this.margins.left, this.contentW, small)) : boxes;
+    // Headers/footers: laid out per page when they hold page fields or the page has another width
+    const docLeft = this.docGeom.margins.left;
+    const docWidth = this.docGeom.w - this.docGeom.margins.left - this.docGeom.margins.right;
+    const cache = new Map<string, Box[]>();
+    const perPage = async (blocks: Block[], boxes: Box[], no: number, g: Geom): Promise<Box[]> => {
+      const left = g.margins.left;
+      const width = g.w - g.margins.left - g.margins.right;
+      if (!blocks.length) return boxes;
+      if (hasFields(blocks)) return strip(await this.layout(fillFields(blocks, no, total), left, width, small));
+      if (left === docLeft && width === docWidth) return boxes;
+      const key = `${blocks === this.headerBlocks ? 'h' : 'f'}|${left}|${width}`;
+      if (!cache.has(key)) cache.set(key, strip(await this.layout(blocks, left, width, small)));
+      return cache.get(key)!;
+    };
     const headers: Box[][] = [];
     const footers: Box[][] = [];
     for (let i = 0; i < total; i++) {
-      headers.push(await perPage(this.headerBlocks, this.headerBoxes, i + 1));
-      footers.push(await perPage(this.footerBlocks, this.footerBoxes, i + 1));
+      const g = this.pageGeoms[i] ?? this.docGeom;
+      headers.push(await perPage(this.headerBlocks, this.headerBoxes, i + 1, g));
+      footers.push(await perPage(this.footerBlocks, this.footerBoxes, i + 1, g));
     }
     const drawStack = (boxes: Box[], top: number, page: PDFPage, no: number): void => {
       let y = top;
@@ -1336,13 +1489,16 @@ export class PdfWriter {
     };
     const stackH = (boxes: Box[]): number => boxes.reduce((s, b, i) => s + b.height + (i ? b.spaceBefore : 0) + (i < boxes.length - 1 ? b.spaceAfter : 0), 0);
     this.pages.forEach((p, i) => {
+      const g = this.pageGeoms[i] ?? this.docGeom;
+      // draw() measures from the top of the page it is given; it uses this.pageH
+      this.pageH = g.h;
       if (headers[i].length) drawStack(headers[i], this.headerDist, p, i + 1);
-      if (footers[i].length) drawStack(footers[i], this.pageH - this.footerDist - stackH(footers[i]), p, i + 1);
+      if (footers[i].length) drawStack(footers[i], g.h - this.footerDist - stackH(footers[i]), p, i + 1);
       else if (total > 1) {
         const key = this.keyFor({ text: '' }, this.base);
         const label = String(i + 1);
         const w = this.fm.width(key, label, 9);
-        p.drawText(label, { x: (this.pageW - w) / 2, y: Math.min(this.margins.bottom / 2, 28) - 3, size: 9, font: this.fm.pdfFont(key), color: rgb(...GRAY) });
+        p.drawText(label, { x: (g.w - w) / 2, y: Math.min(g.margins.bottom / 2, 28) - 3, size: 9, font: this.fm.pdfFont(key), color: rgb(...GRAY) });
       }
     });
     this.pdf.catalog.set(PDFName.of('PageLayout'), PDFName.of('OneColumn'));
@@ -1382,7 +1538,7 @@ export async function docToPdf(doc: Doc, env: PdfWriteEnv, opts: PdfOptions = {}
   await w.init(doc);
   const boxes = await w.prepare(doc);
   env.onProgress?.(0.6);
-  w.place(boxes);
+  await w.place(boxes);
   const data = await w.finish();
   env.onProgress?.(1);
   return { data, warnings: [...w.warnings] };

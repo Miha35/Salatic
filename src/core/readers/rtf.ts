@@ -6,7 +6,7 @@
  * lists, tables, fields (hyperlinks, page numbers), footnotes, headers/footers,
  * PNG/JPEG pictures and page breaks.
  */
-import { familyOf, normalizeRuns, normalizeSections, trimRuns, type Align, type Block, type Doc, type FontFamily, type ParaFormat, type TableCell, type TableRow, type TextRun } from '../model';
+import { familyOf, normalizeRuns, normalizeSections, trimRuns, type Align, type Block, type Doc, type FontFamily, type PageSetup, type ParaFormat, type TableCell, type TableRow, type TextRun } from '../model';
 import { ConvertError, imageSize } from '../util';
 import { ListNester } from './lists';
 
@@ -185,8 +185,36 @@ export class RtfReader {
   private skipChars = 0;
   private highSurrogate = 0;
   private pendingSect = false;
+
+  /** The section block for the properties gathered since \\sectd. */
+  private sectionBlock(start: 'page' | 'continuous'): Block {
+    const s = this.sect;
+    const unequal = s.cols > 1 && s.colw.filter((v) => v > 0).length === s.cols && s.colw.some((v) => v !== s.colw[0]);
+    let page: PageSetup | undefined;
+    if (s.pgw && s.pgh) {
+      const doc: Record<string, number> = { t: this.page.t, r: this.page.r, b: this.page.b, l: this.page.l };
+      const m = (k: string): number => (s.m[k] ?? doc[k] ?? 1440) / 20;
+      page = { width: s.pgw / 20, height: s.pgh / 20, margins: { top: m('t'), right: m('r'), bottom: m('b'), left: m('l') } };
+    }
+    // compared with the page of the section before (at first, the document's)
+    const docPage = JSON.stringify({ width: this.page.w / 20, height: this.page.h / 20, margins: { top: this.page.t / 20, right: this.page.r / 20, bottom: this.page.b / 20, left: this.page.l / 20 } });
+    const key = page ? JSON.stringify(page) : this.sectPageKey || docPage;
+    const changed = !!page && key !== (this.sectPageKey || docPage);
+    if (page) this.sectPageKey = key;
+    return {
+      type: 'section',
+      columns: s.cols,
+      gap: s.gap / 20,
+      ...(s.sep ? { separator: true } : {}),
+      start: changed ? 'page' : start,
+      ...(unequal ? { widths: s.colw.map((v) => v / 20), gaps: s.colsr.slice(0, s.cols - 1).map((v) => (v ?? s.gap) / 20) } : {}),
+      ...(changed && page ? { page } : {}),
+    };
+  }
   /** Properties of the section being defined (\sectd, \cols, \colsx, \linebetcol, \sbk…) */
-  private sect = { cols: 1, gap: 720, sep: false, page: true };
+  private sect: { cols: number; gap: number; sep: boolean; page: boolean; colw: number[]; colsr: number[]; colno: number; pgw?: number; pgh?: number; m: Record<string, number> } = { cols: 1, gap: 720, sep: false, page: true, colw: [], colsr: [], colno: 0, m: {} };
+  /** Page of the previous section (to tell when a section changes it) */
+  private sectPageKey = '';
   private bodyStarted = false;
   private imageCount = 0;
 
@@ -398,9 +426,9 @@ export class RtfReader {
     if (this.pendingSect) {
       this.pendingSect = false;
       this.endParagraph(g.sink, false);
-      this.pushBlock(g.sink, { type: 'section', columns: this.sect.cols, gap: this.sect.gap / 20, ...(this.sect.sep ? { separator: true } : {}), start: this.sect.page ? 'page' : 'continuous' });
+      this.pushBlock(g.sink, this.sectionBlock(this.sect.page ? 'page' : 'continuous'));
     } else if (!this.bodyStarted && g.sink.kind === 'body' && this.sect.cols > 1) {
-      this.pushBlock(g.sink, { type: 'section', columns: this.sect.cols, gap: this.sect.gap / 20, ...(this.sect.sep ? { separator: true } : {}), start: 'continuous' });
+      this.pushBlock(g.sink, this.sectionBlock('continuous'));
     }
     if (g.sink.kind === 'body') this.bodyStarted = true;
     const style = this.runStyle(g.ch);
@@ -648,7 +676,28 @@ export class RtfReader {
         this.sect.page = true;
         return;
       case 'sectd':
-        this.sect = { cols: 1, gap: 720, sep: false, page: true };
+        this.sect = { cols: 1, gap: 720, sep: false, page: true, colw: [], colsr: [], colno: 0, m: {} };
+        return;
+      case 'colno':
+        this.sect.colno = Math.max(1, Math.min(12, param ?? 1));
+        return;
+      case 'colw':
+        if (this.sect.colno) this.sect.colw[this.sect.colno - 1] = Math.max(0, param ?? 0);
+        return;
+      case 'colsr':
+        if (this.sect.colno) this.sect.colsr[this.sect.colno - 1] = Math.max(0, param ?? 0);
+        return;
+      case 'pgwsxn':
+        this.sect.pgw = param ?? undefined;
+        return;
+      case 'pghsxn':
+        this.sect.pgh = param ?? undefined;
+        return;
+      case 'marglsxn':
+      case 'margrsxn':
+      case 'margtsxn':
+      case 'margbsxn':
+        this.sect.m[name.slice(4, 5)] = param ?? 0;
         return;
       case 'cols':
         this.sect.cols = Math.max(1, Math.min(12, param ?? 1));

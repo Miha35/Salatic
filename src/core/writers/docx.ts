@@ -1,6 +1,6 @@
 /** Doc → DOCX (Office Open XML). Element order follows the ECMA-376 schema so Word opens files without repair. */
 import { zipSync, type Zippable } from 'fflate';
-import type { Block, ChartSource, Doc, FontFamily, ParaFormat, TableCell, TextRun } from '../model';
+import type { Block, ChartSource, Doc, FontFamily, PageSetup, ParaFormat, TableCell, TextRun } from '../model';
 import { escapeXml, maxOf, utf8 } from '../util';
 import { parseSvg } from '../svg-render';
 import { metafileToEmf } from './emf';
@@ -401,19 +401,35 @@ class DocxWriter {
     const blocks = [...doc.blocks];
     while (blocks.length && (blocks[blocks.length - 1].type === 'pagebreak' || blocks[blocks.length - 1].type === 'section')) blocks.pop();
     // Sections: content between section markers, laid out at the width of one column
-    type Sect = { columns: number; gap: number; separator?: boolean; start: 'continuous' | 'page'; xml: string };
+    type Sect = { columns: number; gap: number; separator?: boolean; start: 'continuous' | 'page'; widths?: number[]; gaps?: number[]; page?: PageSetup; xml: string };
     const sections: Sect[] = [];
     let curSect: Omit<Sect, 'xml'> = { columns: 1, gap: 36, start: 'continuous' };
     let pending: Block[] = [];
+    /** Page geometry of a section in twips: its own page or the document's. */
+    const geomOf = (x: Omit<Sect, 'xml'>): { w: number; h: number; m: { top: number; right: number; bottom: number; left: number } } =>
+      x.page ? { w: tw(x.page.width), h: tw(x.page.height), m: { top: tw(x.page.margins.top), right: tw(x.page.margins.right), bottom: tw(x.page.margins.bottom), left: tw(x.page.margins.left) } } : { w: this.pageW, h: this.pageH, m: this.margins };
+    /** Column widths in twips (equal, or the relative widths) and the gaps after them. */
+    const colsOf = (x: Omit<Sect, 'xml'>): { ws: number[]; gaps: number[] } => {
+      const g = geomOf(x);
+      const content = g.w - g.m.left - g.m.right;
+      const n = Math.max(1, x.columns);
+      const gaps = Array.from({ length: n - 1 }, (_, k) => tw(x.gaps?.[k] ?? x.gap));
+      const free = Math.max(n * 720, content - gaps.reduce((a, b) => a + b, 0));
+      const rel = x.widths && x.widths.length === n ? x.widths : Array.from({ length: n }, () => 1);
+      const sum = rel.reduce((a, b) => a + b, 0);
+      return { ws: rel.map((v) => Math.round((free * v) / sum)), gaps };
+    };
     const flushSect = (): void => {
-      const colTw = Math.round((this.contentW - (curSect.columns - 1) * tw(curSect.gap)) / curSect.columns);
-      sections.push({ ...curSect, xml: this.blocks(pending, 0, curSect.columns > 1 ? Math.max(720, colTw) : this.contentW) });
+      const { ws } = colsOf(curSect);
+      sections.push({ ...curSect, xml: this.blocks(pending, 0, curSect.columns > 1 ? Math.max(720, Math.min(...ws)) : ws[0]) });
       pending = [];
     };
+    let lastPage: PageSetup | undefined;
     for (const b of blocks) {
       if (b.type === 'section') {
         if (pending.length || sections.length) flushSect();
-        curSect = { columns: Math.max(1, Math.round(b.columns)), gap: b.gap, separator: b.separator, start: b.start };
+        if (b.page) lastPage = b.page;
+        curSect = { columns: Math.max(1, Math.round(b.columns)), gap: b.gap, separator: b.separator, start: b.start, widths: b.widths, gaps: b.gaps, page: b.page ?? lastPage };
       } else pending.push(b);
     }
     flushSect();
@@ -463,14 +479,24 @@ class DocxWriter {
       docRels.push(`<Relationship Id="rId7" Type="${REL}/theme" Target="theme/theme1.xml"/>`);
       overrides.push('<Override PartName="/word/theme/theme1.xml" ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/>');
     }
-    const m = this.margins;
     // Every section repeats page setup and header/footer references (Word does not inherit them backwards)
-    const sectPr = (x: Omit<Sect, 'xml'>): string =>
-      `<w:sectPr>${refs}${x.start === 'continuous' ? '<w:type w:val="continuous"/>' : ''}` +
-      `<w:pgSz w:w="${this.pageW}" w:h="${this.pageH}"${this.pageW > this.pageH ? ' w:orient="landscape"' : ''}/>` +
-      `<w:pgMar w:top="${m.top}" w:right="${m.right}" w:bottom="${m.bottom}" w:left="${m.left}" w:header="709" w:footer="709" w:gutter="0"/>` +
-      (x.columns > 1 ? `<w:cols w:num="${x.columns}" w:space="${tw(x.gap)}"${x.separator ? ' w:sep="1"' : ''}/>` : '<w:cols w:space="708"/>') +
-      '</w:sectPr>';
+    const sectPr = (x: Omit<Sect, 'xml'>): string => {
+      const g = geomOf(x);
+      const c = colsOf(x);
+      const cols =
+        x.columns <= 1
+          ? '<w:cols w:space="708"/>'
+          : x.widths
+            ? `<w:cols w:num="${x.columns}" w:space="${tw(x.gap)}" w:equalWidth="0"${x.separator ? ' w:sep="1"' : ''}>${c.ws.map((w, k) => `<w:col w:w="${w}"${k < c.gaps.length ? ` w:space="${c.gaps[k]}"` : ''}/>`).join('')}</w:cols>`
+            : `<w:cols w:num="${x.columns}" w:space="${tw(x.gap)}"${x.separator ? ' w:sep="1"' : ''}/>`;
+      return (
+        `<w:sectPr>${refs}${x.start === 'continuous' ? '<w:type w:val="continuous"/>' : ''}` +
+        `<w:pgSz w:w="${g.w}" w:h="${g.h}"${g.w > g.h ? ' w:orient="landscape"' : ''}/>` +
+        `<w:pgMar w:top="${g.m.top}" w:right="${g.m.right}" w:bottom="${g.m.bottom}" w:left="${g.m.left}" w:header="709" w:footer="709" w:gutter="0"/>` +
+        cols +
+        '</w:sectPr>'
+      );
+    };
     let body = '';
     sections.forEach((sec, i) => {
       let xml = sec.xml;

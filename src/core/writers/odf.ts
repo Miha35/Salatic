@@ -4,7 +4,7 @@
  * de-duplicated by their properties.
  */
 import { zipSync, type Zippable } from 'fflate';
-import type { Block, CellValue, Doc, FontFamily, ParaFormat, Sheet, TableCell, TextRun, Workbook } from '../model';
+import type { Block, CellValue, Doc, FontFamily, PageSetup, ParaFormat, Sheet, TableCell, TextRun, Workbook } from '../model';
 import { escapeXml, maxOf, utf8 } from '../util';
 
 const XML_HEAD = '<?xml version="1.0" encoding="UTF-8"?>\n';
@@ -34,14 +34,14 @@ class AutoStyles {
   private xml: string[] = [];
   private counters: Record<string, number> = {};
   constructor(private prefix: string) {}
-  get(family: string, letter: string, body: string, parent?: string): string {
-    const key = `${family}|${parent ?? ''}|${body}`;
+  get(family: string, letter: string, body: string, parent?: string, attrs = ''): string {
+    const key = `${family}|${parent ?? ''}|${attrs}|${body}`;
     let name = this.byKey.get(key);
     if (!name) {
       this.counters[letter] = (this.counters[letter] ?? 0) + 1;
       name = `${this.prefix}${letter}${this.counters[letter]}`;
       this.byKey.set(key, name);
-      this.xml.push(`<style:style style:name="${name}" style:family="${family}"${parent ? ` style:parent-style-name="${parent}"` : ''}>${body}</style:style>`);
+      this.xml.push(`<style:style style:name="${name}" style:family="${family}"${parent ? ` style:parent-style-name="${parent}"` : ''}${attrs}>${body}</style:style>`);
     }
     return name;
   }
@@ -89,6 +89,9 @@ class OdtWriter {
   private noteCount = 0;
   private listStyles = new Map<string, string>();
   private pendingBreak = false;
+  /** A section with its own page: the master page its first paragraph switches to */
+  private pendingMaster?: string;
+  private masters: { name: string; page: PageSetup }[] = [];
   private inMaster = false;
   private auto: AutoStyles;
   readonly pageW: number;
@@ -191,7 +194,11 @@ class OdtWriter {
       extra = ' fo:break-before="page"';
       this.pendingBreak = false;
     }
+    // switching the master page starts a new page with that page's size
+    const master = this.pendingMaster ? ` style:master-page-name="${this.pendingMaster}"` : '';
+    this.pendingMaster = undefined;
     const props = paraProps(fmt, extra);
+    if (master) return this.auto.get('paragraph', 'P', props || '<style:paragraph-properties/>', parent, master);
     return props ? this.auto.get('paragraph', 'P', props, parent) : parent;
   }
 
@@ -257,7 +264,9 @@ class OdtWriter {
       extra = ' fo:break-before="page"';
       this.pendingBreak = false;
     }
-    this.auto.add(`<style:style style:name="${name}" style:family="table"><style:table-properties style:width="${cm(width)}" table:align="margins"${extra}/></style:style>`);
+    const master = this.pendingMaster ? ` style:master-page-name="${this.pendingMaster}"` : '';
+    this.pendingMaster = undefined;
+    this.auto.add(`<style:style style:name="${name}" style:family="table"${master}><style:table-properties style:width="${cm(width)}" table:align="margins"${extra}/></style:style>`);
     let s = `<table:table table:name="${name}" table:style-name="${name}">`;
     weights.forEach((w, i) => {
       const col = `${name}.C${i + 1}`;
@@ -355,11 +364,14 @@ class OdtWriter {
     const hasFooter = !!footer;
     // In ODF the header lives inside the page margin area: shrink the margin by the header block
     const hf = 0.8 * 28.3465;
-    const layout =
-      `<style:page-layout style:name="pm1"><style:page-layout-properties fo:page-width="${cm(this.pageW)}" fo:page-height="${cm(this.pageH)}" style:print-orientation="${this.pageW > this.pageH ? 'landscape' : 'portrait'}" ` +
-      `fo:margin-top="${cm(hasHeader ? Math.max(14, m.top - hf - 14) : m.top)}" fo:margin-bottom="${cm(hasFooter ? Math.max(14, m.bottom - hf - 14) : m.bottom)}" fo:margin-left="${cm(m.left)}" fo:margin-right="${cm(m.right)}" style:writing-mode="lr-tb"/>` +
+    const layoutOf = (name: string, w: number, h: number, mg: { top: number; right: number; bottom: number; left: number }): string =>
+      `<style:page-layout style:name="${name}"><style:page-layout-properties fo:page-width="${cm(w)}" fo:page-height="${cm(h)}" style:print-orientation="${w > h ? 'landscape' : 'portrait'}" ` +
+      `fo:margin-top="${cm(hasHeader ? Math.max(14, mg.top - hf - 14) : mg.top)}" fo:margin-bottom="${cm(hasFooter ? Math.max(14, mg.bottom - hf - 14) : mg.bottom)}" fo:margin-left="${cm(mg.left)}" fo:margin-right="${cm(mg.right)}" style:writing-mode="lr-tb"/>` +
       `<style:header-style>${hasHeader ? `<style:header-footer-properties fo:min-height="${cm(hf)}" fo:margin-bottom="${cm(14)}" fo:margin-left="0cm" fo:margin-right="0cm"/>` : ''}</style:header-style>` +
       `<style:footer-style>${hasFooter ? `<style:header-footer-properties fo:min-height="${cm(hf)}" fo:margin-top="${cm(14)}" fo:margin-left="0cm" fo:margin-right="0cm"/>` : ''}</style:footer-style></style:page-layout>`;
+    const layout = layoutOf('pm1', this.pageW, this.pageH, m) + this.masters.map((x, i) => layoutOf(`pm${i + 2}`, x.page.width, x.page.height, x.page.margins)).join('');
+    const hf_ = `${hasHeader ? `<style:header>${header}</style:header>` : ''}${hasFooter ? `<style:footer>${footer}</style:footer>` : ''}`;
+    const extraMasters = this.masters.map((x, i) => `<style:master-page style:name="${x.name}" style:page-layout-name="pm${i + 2}">${hf_}</style:master-page>`).join('');
     return (
       XML_HEAD +
       `<office:document-styles ${NS}>` +
@@ -395,7 +407,7 @@ class OdtWriter {
       '<text:notes-configuration text:note-class="footnote" text:citation-style-name="Footnote_20_Symbol" text:citation-body-style-name="Footnote_20_anchor" style:num-format="1" text:start-value="0" text:footnotes-position="page" text:start-numbering-at="document"/>' +
       '</office:styles>' +
       `<office:automatic-styles>${layout}${autoForMaster}</office:automatic-styles>` +
-      `<office:master-styles><style:master-page style:name="Standard" style:page-layout-name="pm1">${hasHeader ? `<style:header>${header}</style:header>` : ''}${hasFooter ? `<style:footer>${footer}</style:footer>` : ''}</style:master-page></office:master-styles>` +
+      `<office:master-styles><style:master-page style:name="Standard" style:page-layout-name="pm1">${hf_}</style:master-page>${extraMasters}</office:master-styles>` +
       '</office:document-styles>'
     );
   }
@@ -413,25 +425,60 @@ class OdtWriter {
       else groups[groups.length - 1].blocks.push(b);
     }
     let body = '';
+    let contentW = this.contentW;
+    const docKey = JSON.stringify({ width: this.pageW, height: this.pageH, margins: this.margins });
     groups.forEach((g, k) => {
       if (!g.blocks.length) return;
-      if (g.sec?.start === 'page' && body) this.pendingBreak = true;
+      if (g.sec?.page) {
+        // a page of its own: a master page with that page layout (the document's is "Standard")
+        const key = JSON.stringify(g.sec.page);
+        let name = 'Standard';
+        if (key !== docKey) {
+          let found = this.masters.find((x) => JSON.stringify(x.page) === key);
+          if (!found) {
+            found = { name: `Section_${this.masters.length + 1}`, page: g.sec.page };
+            this.masters.push(found);
+          }
+          name = found.name;
+        }
+        this.pendingMaster = name;
+        contentW = g.sec.page.width - g.sec.page.margins.left - g.sec.page.margins.right;
+      } else if (g.sec?.start === 'page' && body) this.pendingBreak = true;
       const n = Math.max(1, Math.round(g.sec?.columns ?? 1));
       if (n < 2) {
-        body += this.blocks(g.blocks, 0, this.contentW);
+        body += this.blocks(g.blocks, 0, contentW);
         return;
       }
       const gap = g.sec!.gap;
+      // unequal columns: style:column elements with relative widths; the gaps are their indents
+      let colEls = '';
+      let narrowest = (contentW - (n - 1) * gap) / n;
+      if (g.sec!.widths && g.sec!.widths.length === n) {
+        const gaps = Array.from({ length: n - 1 }, (_, i) => g.sec!.gaps?.[i] ?? gap);
+        const free = contentW - gaps.reduce((a, b) => a + b, 0);
+        const sum = g.sec!.widths.reduce((a, b) => a + b, 0);
+        const ws = g.sec!.widths.map((v) => (free * v) / sum);
+        narrowest = Math.min(...ws);
+        // (no fo:column-gap then: with it LibreOffice makes the columns equal); rel-widths add up to 65535
+        colEls = ws
+          .map((w, i) => {
+            const start = i > 0 ? gaps[i - 1] / 2 : 0;
+            const end = i < n - 1 ? gaps[i] / 2 : 0;
+            return `<style:column style:rel-width="${Math.round(((w + start + end) / contentW) * 65535)}*" fo:start-indent="${Math.round(start * 100) / 100}pt" fo:end-indent="${Math.round(end * 100) / 100}pt"/>`;
+          })
+          .join('');
+      }
       // like Word: balanced only when a continuous section follows
       const balance = groups[k + 1]?.sec?.start === 'continuous';
       const style = this.auto.get(
         'section',
         'Sect',
-        `<style:section-properties text:dont-balance-text-columns="${balance ? 'false' : 'true'}" style:editable="false"><style:columns fo:column-count="${n}" fo:column-gap="${Math.round(gap * 100) / 100}pt">` +
+        `<style:section-properties text:dont-balance-text-columns="${balance ? 'false' : 'true'}" style:editable="false"><style:columns fo:column-count="${n}"${colEls ? '' : ` fo:column-gap="${Math.round(gap * 100) / 100}pt"`}>` +
           (g.sec!.separator ? '<style:column-sep style:width="0.5pt" style:color="#000000" style:height="100%" style:vertical-align="top"/>' : '') +
+          colEls +
           '</style:columns></style:section-properties>',
       );
-      body += `<text:section text:style-name="${style}" text:name="Section${k}">${this.blocks(g.blocks, 0, (this.contentW - (n - 1) * gap) / n)}</text:section>`;
+      body += `<text:section text:style-name="${style}" text:name="Section${k}">${this.blocks(g.blocks, 0, narrowest)}</text:section>`;
     });
     if (!body) body = '<text:p text:style-name="Standard"/>';
     const contentAuto = this.auto.toString();
