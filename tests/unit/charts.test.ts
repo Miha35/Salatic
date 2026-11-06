@@ -245,8 +245,10 @@ describe('EMF writer', () => {
       const back = parseEmf(emf);
       expect(back.widthPt, k).toBeCloseTo(432, 0);
       expect(back.heightPt, k).toBeCloseTo(252, 0);
-      const kinds = (m: Metafile): number[] => ['path', 'text'].map((t) => m.cmds.filter((c) => c.k === t).length);
-      expect(kinds(back), k).toEqual(kinds(mf));
+      // translucent fills come back as alpha-blended bitmaps, everything else as paths
+      const translucent = mf.cmds.filter((c) => c.k === 'path' && c.fill && (c.opacity ?? 1) < 0.999).length;
+      const count = (m: Metafile, t: string): number => m.cmds.filter((c) => c.k === t).length;
+      expect([count(back, 'path') + count(back, 'image'), count(back, 'image'), count(back, 'text')], k).toEqual([count(mf, 'path'), translucent, count(mf, 'text')]);
       const txt = (m: Metafile): Extract<MetaCmd, { k: 'text' }>[] => m.cmds.filter((c): c is Extract<MetaCmd, { k: 'text' }> => c.k === 'text');
       const [a, b] = [txt(back), txt(mf)];
       expect(a.map((c) => c.text), k).toEqual(b.map((c) => c.text));
@@ -255,7 +257,7 @@ describe('EMF writer', () => {
     }
   });
 
-  it('keeps tspan runs flowing, colours, bold and opacity (blended with white)', () => {
+  it('keeps tspan runs flowing, colours, bold and opacity (as real transparency)', () => {
     const back = parseEmf(metafileToEmf(parseSvg(SVG_PICTURE)!));
     const texts = back.cmds.filter((c): c is Extract<MetaCmd, { k: 'text' }> => c.k === 'text');
     expect(texts.map((t) => [t.text.trim(), t.bold, t.color, !!t.flow])).toEqual([
@@ -263,9 +265,13 @@ describe('EMF writer', () => {
       ['вектор', false, '5F6368', false],
       ['SVG', false, 'EA4335', true],
     ]);
-    const circle = back.cmds.filter((c): c is Extract<MetaCmd, { k: 'path' }> => c.k === 'path')[1];
-    // #34A853 at 60 % over white
-    expect(circle.fill).toBe('85CB98');
+    // the 60 % green circle: an alpha bitmap with its own colour, not a colour mixed with white
+    const img = back.cmds.find((c): c is Extract<MetaCmd, { k: 'image' }> => c.k === 'image')!;
+    const dec = decodePng(img.png)!;
+    const o = ((dec.height >> 1) * dec.width + (dec.width >> 1)) * 4;
+    const [r, g, b, a] = dec.rgba.subarray(o, o + 4);
+    expect(Math.abs(a - 153)).toBeLessThan(4);
+    expect([r, g, b].every((v, i) => Math.abs(v - [0x34, 0xa8, 0x53][i]) < 6)).toBe(true);
   });
 
   it('embeds raster images as bitmaps', () => {

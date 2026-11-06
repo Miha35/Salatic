@@ -8,6 +8,7 @@ import { parseSvg } from '../../src/core/svg-render';
 import { metafileToEmf } from '../../src/core/writers/emf';
 import { docToPdf } from '../../src/core/writers/pdf';
 import { hasCmd, loadFonts, soffice, withTemp } from './helpers';
+import { decodePng } from '../../src/core/png';
 
 /** Rasterise page 1 at 72 dpi; RGB sampler with (0,0) at the picture's top-left (found by its red pixels). */
 function raster(pdf: Uint8Array): (x: number, y: number) => number[] {
@@ -166,3 +167,55 @@ describe('SVG clipPath', () => {
 });
 
 void readFileSync;
+
+const ALPHA_SVG =
+  '<svg xmlns="http://www.w3.org/2000/svg" width="300" height="120" viewBox="0 0 300 120">' +
+  '<defs><linearGradient id="g"><stop offset="0" stop-color="#ff0000"/><stop offset="1" stop-color="#0000ff"/></linearGradient></defs>' +
+  '<rect x="10" y="10" width="100" height="100" fill="#ff0000"/>' +
+  '<circle cx="110" cy="60" r="50" fill="#0000ff" fill-opacity="0.5"/>' +
+  '<rect x="180" y="10" width="110" height="100" fill="url(#g)"/>' +
+  '</svg>';
+
+describe('EMF writer: transparency and gradients', () => {
+  const emf = metafileToEmf(parseSvg(ALPHA_SVG)!);
+
+  it('writes them as alpha-blended bitmaps that our reader reads back', () => {
+    const back = parseEmf(emf);
+    expect(back.cmds.filter((c) => c.k === 'image').length).toBe(2);
+    const img = back.cmds.find((c): c is Extract<MetaCmd, { k: 'image' }> => c.k === 'image')!;
+    // the circle: 50 % blue at its centre, transparent at the corner of its box
+    const dec = decodePng(img.png)!;
+    const at = (x: number, y: number): number[] => [...dec.rgba.subarray((y * dec.width + x) * 4, (y * dec.width + x) * 4 + 4)];
+    expect(at(dec.width >> 1, dec.height >> 1)[3]).toBeGreaterThan(120);
+    expect(at(dec.width >> 1, dec.height >> 1)[3]).toBeLessThan(135);
+    expect(at(1, 1)[3]).toBe(0);
+  });
+
+  it.skipIf(!hasCmd('pdftoppm'))('our PDF of the EMF: the overlap is purple, the gradient runs red → blue', async () => {
+    // content starts at (10, 10); 300 px = 225 pt
+    const at = locate(await pdfOf(emf, 'image/emf', 225, 90), [10, 10], 0.75);
+    expect(isRed(at(40, 60))).toBe(true);
+    const mix = at(85, 60); // inside both: blue at 50 % over red
+    expect(mix[0]).toBeGreaterThan(100);
+    expect(mix[2]).toBeGreaterThan(100);
+    expect(mix[1]).toBeLessThan(40);
+    const left = at(185, 60);
+    const right = at(285, 60);
+    expect(left[0] > left[2] && right[2] > right[0]).toBe(true);
+  });
+
+  it.skipIf(!hasCmd('soffice') || !hasCmd('pdftoppm'))('LibreOffice blends them with the content underneath too', () => {
+    const at = locate(raster(soffice(emf, 'emf', 'pdf')), [10, 10], 0.75);
+    expect(isRed(at(40, 60))).toBe(true);
+    // red shows through the blue (blending with white would give light blue, with green ≈ 127).
+    // LibreOffice takes the bitmap as straight alpha and darkens the blue (≈ 64 instead of 127);
+    // GDI's AlphaBlend and MS-EMF define premultiplied values, which is what we write.
+    const mix = at(85, 60);
+    expect(mix[0]).toBeGreaterThan(100);
+    expect(mix[2]).toBeGreaterThan(40);
+    expect(mix[1]).toBeLessThan(40);
+    const left = at(185, 60);
+    const right = at(285, 60);
+    expect(left[0] > left[2] && right[2] > right[0]).toBe(true);
+  });
+});

@@ -446,8 +446,8 @@ class Gdi {
     });
   }
 
-  bitmap(x: number, y: number, w: number, h: number, dib: Uint8Array): void {
-    const png = dibToPng(dib);
+  bitmap(x: number, y: number, w: number, h: number, dib: Uint8Array, alpha = false): void {
+    const png = dibToPng(dib, alpha);
     if (!png) return;
     const [x0, y0] = this.pt(x, y);
     const [x1, y1] = this.pt(x + w, y + h);
@@ -507,8 +507,8 @@ export function encodePng(rgba: Uint8Array, w: number, h: number): Uint8Array {
   return out;
 }
 
-/** BITMAPINFO + bits (1/4/8/16/24/32 bpp, uncompressed or embedded PNG/JPEG) → PNG. */
-function dibToPng(dib: Uint8Array): Uint8Array | null {
+/** BITMAPINFO + bits (1/4/8/16/24/32 bpp, uncompressed or embedded PNG/JPEG) → PNG. `alpha`: 32-bit premultiplied BGRA. */
+function dibToPng(dib: Uint8Array, alpha = false): Uint8Array | null {
   if (dib.length < 40) return null;
   const dv = new DataView(dib.buffer, dib.byteOffset, dib.byteLength);
   const hs = dv.getUint32(0, true);
@@ -556,10 +556,20 @@ function dibToPng(dib: Uint8Array): Uint8Array | null {
         [r, g, b] = pal[idx] ?? [0, 0, 0];
       }
       const o = (y * w + x) * 4;
+      let a = 255;
+      if (alpha && bpp === 32) {
+        // premultiplied: undo it for PNG
+        a = dib[row + x * 4 + 3];
+        if (a > 0 && a < 255) {
+          r = Math.min(255, Math.round((r * 255) / a));
+          g = Math.min(255, Math.round((g * 255) / a));
+          b = Math.min(255, Math.round((b * 255) / a));
+        }
+      }
       rgba[o] = r;
       rgba[o + 1] = g;
       rgba[o + 2] = b;
-      rgba[o + 3] = 255;
+      rgba[o + 3] = a;
     }
   }
   return encodePng(rgba, w, h);
@@ -842,6 +852,20 @@ export function parseEmf(data: Uint8Array): Metafile {
         const off = u32(e + 12);
         const str = type === 84 ? utf16(data, pos + off, n) : ansi(data.subarray(pos + off, pos + off + n), g.dc.font.charset);
         g.text(x, y, str, false);
+        break;
+      }
+      case 114: {
+        // ALPHABLEND: a 32-bit bitmap with per-pixel (premultiplied) alpha
+        const xd = i32(p + 16);
+        const yd = i32(p + 20);
+        const wd = i32(p + 24);
+        const hd = i32(p + 28);
+        const perPixel = data[p + 35] === 1;
+        const offBmi = u32(p + 76);
+        const cbBmi = u32(p + 80);
+        const offBits = u32(p + 84);
+        const cbBits = u32(p + 88);
+        if (cbBmi) g.bitmap(xd, yd, wd, hd, joinDib(data, pos + offBmi, cbBmi, pos + offBits, cbBits), perPixel);
         break;
       }
       case 81: {

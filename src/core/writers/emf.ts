@@ -9,6 +9,7 @@
  */
 import type { Metafile, MetaCmd } from '../metafile';
 import { decodePng } from '../png';
+import { coverage, gradientAt, pathBox } from '../raster';
 
 const S = 16;
 const DPI = 96;
@@ -188,6 +189,65 @@ export function metafileToEmf(mf: Metafile): Uint8Array {
     return any;
   };
 
+  /** Render a fill into EMR_ALPHABLEND (32-bit premultiplied BGRA); false when it cannot be done. */
+  const alphaFill = (c: Extract<MetaCmd, { k: 'path' }>): boolean => {
+    const [bx0, by0, bx1, by1] = pathBox(c.d);
+    if (!(bx1 > bx0) || !(by1 > by0)) return false;
+    // about 2 pixels per unit, at most ~2.5 Mpx
+    const scale = Math.min(2, Math.sqrt(2_500_000 / ((bx1 - bx0) * (by1 - by0))));
+    const pw = Math.max(1, Math.ceil((bx1 - bx0) * scale));
+    const ph = Math.max(1, Math.ceil((by1 - by0) * scale));
+    const cov = coverage(c.d, c.evenOdd, bx0, by0, pw, ph, scale);
+    const op = c.opacity ?? 1;
+    const solid = c.fill ? [0, 2, 4].map((o) => parseInt(c.fill!.slice(o, o + 2), 16) || 0) : [0, 0, 0];
+    const bits = new Uint8Array(pw * ph * 4);
+    for (let y = 0; y < ph; y++)
+      for (let x = 0; x < pw; x++) {
+        const a0 = cov[y * pw + x];
+        if (a0 <= 0) continue;
+        const [r, g, b, ga] = c.grad ? gradientAt(c.grad, bx0 + (x + 0.5) / scale, by0 + (y + 0.5) / scale) : [solid[0], solid[1], solid[2], 1];
+        const a = Math.max(0, Math.min(1, a0 * op * ga));
+        const o = ((ph - 1 - y) * pw + x) * 4; // bottom-up rows
+        bits[o] = Math.round(b * a);
+        bits[o + 1] = Math.round(g * a);
+        bits[o + 2] = Math.round(r * a);
+        bits[o + 3] = Math.round(a * 255);
+      }
+    const offBmi = 108;
+    const offBits = offBmi + 40;
+    w.rec(
+      114, // ALPHABLEND
+      (dv, u8) => {
+        const ints = [L(bx0), L(by0), L(bx1 - bx0), L(by1 - by0)];
+        ints.forEach((v, k) => dv.setInt32(24 + k * 4, v, true));
+        u8[40] = 0; // AC_SRC_OVER
+        u8[41] = 0;
+        u8[42] = 255; // constant alpha
+        u8[43] = 1; // AC_SRC_ALPHA: per-pixel, premultiplied
+        dv.setInt32(44, 0, true);
+        dv.setInt32(48, 0, true);
+        [1, 0, 0, 1, 0, 0].forEach((v, k) => dv.setFloat32(52 + k * 4, v, true));
+        dv.setUint32(76, 0, true); // background colour
+        dv.setUint32(80, 0, true); // DIB_RGB_COLORS
+        dv.setUint32(84, offBmi, true);
+        dv.setUint32(88, 40, true);
+        dv.setUint32(92, offBits, true);
+        dv.setUint32(96, bits.length, true);
+        dv.setInt32(100, pw, true);
+        dv.setInt32(104, ph, true);
+        dv.setUint32(offBmi, 40, true);
+        dv.setInt32(offBmi + 4, pw, true);
+        dv.setInt32(offBmi + 8, ph, true);
+        dv.setUint16(offBmi + 12, 1, true);
+        dv.setUint16(offBmi + 14, 32, true);
+        dv.setUint32(offBmi + 20, bits.length, true);
+        u8.set(bits, offBits);
+      },
+      offBits + bits.length,
+    );
+    return true;
+  };
+
   const cmds = mf.cmds;
   for (let i = 0; i < cmds.length; i++) {
     const c = cmds[i];
@@ -206,8 +266,11 @@ export function metafileToEmf(mf: Metafile): Uint8Array {
       continue;
     }
     if (c.k === 'path') {
-      const fill = c.fill !== undefined && c.fill !== 'none' && (c.opacity ?? 1) > 0.02;
+      let fill = c.fill !== undefined && c.fill !== 'none' && (c.opacity ?? 1) > 0.02;
       const stroke = c.stroke !== undefined && c.stroke !== 'none' && (c.strokeOpacity ?? 1) > 0.02;
+      if (!fill && !stroke) continue;
+      // EMF has no vector transparency or gradients: such fills become an alpha-blended bitmap
+      if (fill && ((c.opacity ?? 1) < 0.999 || c.grad) && alphaFill(c)) fill = false;
       if (!fill && !stroke) continue;
       const mode = c.evenOdd ? 1 : 2;
       if (fill && mode !== polyFill) {
