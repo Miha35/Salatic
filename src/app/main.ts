@@ -8,6 +8,7 @@ const ROUTES: Record<string, { nav: string; title: string; load: () => Promise<P
   '/pdf-editor': { nav: 'pdf', title: 'Редактор PDF', load: () => import('./pages/pdf-editor') },
   '/image-editor': { nav: 'image', title: 'Редактор изображений', load: () => import('./pages/image-editor') },
   '/doc-editor': { nav: 'doc', title: 'Редактор документов', load: () => import('./pages/doc-editor') },
+  '/transcribe': { nav: 'speech', title: 'Расшифровка аудио и видео', load: () => import('./pages/transcribe') },
 };
 
 const main = document.getElementById('main')!;

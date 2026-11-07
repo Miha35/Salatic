@@ -12,12 +12,14 @@
     "preview": "npm run build && wrangler dev",
     "test:e2e": "node tests/e2e/run.mjs",
     "check": "npm run build && npm run test && npm run test:e2e",
-    "deploy": "npm run build && wrangler deploy"
+    "deploy": "npm run build && wrangler deploy",
+    "eval:speech": "vitest run -c vitest.eval.config.ts"
   },
   "engines": {
     "node": ">=22.13.0"
   },
   "dependencies": {
+    "@huggingface/transformers": "^4.3.2",
     "@pdf-lib/fontkit": "^1.1.1",
     "@pdf-lib/standard-fonts": "^1.0.0",
     "fflate": "^0.8.3",

@@ -483,6 +483,78 @@ test('PDF editor: redaction removes text and photo pixels from the file', async 
   });
 });
 
+// ---------------------------------------------------------------------------- speech to text
+/**
+ * A real two-reader dialogue (Russian LibriSpeech, public domain) as an MP4 video: the page extracts the
+ * sound, the worker downloads the models from Hugging Face (cached in a persistent profile between runs)
+ * and recognises it on the CPU (headless Chromium has no WebGPU).
+ */
+test('Speech: video → transcript with two speakers, names, exports; links checked', async () => {
+  const profile = process.env.SPEECH_PROFILE ?? join(out, 'speech-profile');
+  const proxy = process.env.HTTPS_PROXY ? { server: process.env.HTTPS_PROXY, bypass: '127.0.0.1,localhost' } : undefined;
+  const ctx = await chromium.launchPersistentContext(profile, { acceptDownloads: true, viewport: { width: 1280, height: 900 }, ...(proxy ? { proxy, ignoreHTTPSErrors: true } : {}) });
+  const page = ctx.pages()[0] ?? (await ctx.newPage());
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  try {
+    const ref = JSON.parse(readFileSync(join(root, 'tests/fixtures/speech/dialog.json'), 'utf8'));
+    await page.goto(`${BASE}/transcribe`);
+    await page.evaluate(() => localStorage.clear());
+    await page.reload();
+    await page.waitForSelector('.stt-device:not(:has-text("Проверяю"))');
+    // cross-origin isolation (COOP + COEP): the CPU path can use several threads
+    expect(await page.evaluate(() => self.crossOriginIsolated), 'page is cross-origin isolated');
+    // a video site is refused with an explanation
+    await page.fill('.stt-link input', 'https://www.youtube.com/watch?v=dQw4w9WgXcQ');
+    await page.click('.stt-link button');
+    await page.waitForSelector('.stt-result .note');
+    expect((await page.textContent('.stt-result .note')).includes('Видеохостинги'), 'video site message');
+    // the dialogue as a video file; two speakers known
+    await page.selectOption('.stt-options label:nth-child(2) select', '2');
+    await page.setInputFiles('.dropzone input[type=file]', join(root, 'tests/fixtures/speech/dialog.mp4'));
+    await page.waitForSelector('.stt-utt', { timeout: 1_800_000 });
+    const utts = await page.$$eval('.stt-utt', (els) => els.map((e) => ({ who: e.querySelector('select').value, text: e.querySelector('.stt-text').textContent })));
+    expect(new Set(utts.map((u) => u.who)).size === 2, `two speakers: ${JSON.stringify(utts)}`);
+    expect(utts.length === 4 && utts.every((u, i) => u.who === utts[i % 2].who) && utts[0].who !== utts[1].who, `turns alternate like the reference: ${JSON.stringify(utts)}`);
+    // the words: at most a few errors against the reference
+    const norm = (t) => t.toLowerCase().replace(/ё/g, 'е').replace(/[^\p{L}\s]/gu, ' ').split(/\s+/).filter(Boolean);
+    const want = norm(ref.turns.map((t) => t.text).join(' '));
+    const got = norm(utts.map((u) => u.text).join(' '));
+    const d = Array.from({ length: got.length + 1 }, (_, j) => j);
+    for (let i = 1; i <= want.length; i++) {
+      let prev = d[0];
+      d[0] = i;
+      for (let j = 1; j <= got.length; j++) {
+        const t = d[j];
+        d[j] = Math.min(d[j] + 1, d[j - 1] + 1, prev + (want[i - 1] === got[j - 1] ? 0 : 1));
+        prev = t;
+      }
+    }
+    const wer = d[got.length] / want.length;
+    console.log(`      speech WER ${(wer * 100).toFixed(1)}% (${d[got.length]} of ${want.length} words)`);
+    expect(wer <= 0.15, `word error rate ${wer}: ${got.join(' ')}`);
+    // the player and seeking
+    expect(await page.$('.stt-player'), 'a player for the recording');
+    // names, then exports
+    await page.fill('.stt-speaker:nth-child(1) input', 'Пушкин');
+    const txt = await downloadFrom(page, () => page.getByRole('button', { name: 'Текст' }).click());
+    const t = td.decode(txt.bytes);
+    expect(t.startsWith('Пушкин [00:00]: ') && t.split('\n\n').length === 4, `TXT export: ${t.slice(0, 200)}`);
+    const srt = td.decode((await downloadFrom(page, () => page.getByRole('button', { name: 'Субтитры SRT' }).click())).bytes);
+    expect(/^1\n00:00:0\d,\d{3} --> 00:00:0\d,\d{3}\nПушкин: /.test(srt), `SRT export: ${srt.slice(0, 120)}`);
+    const docx = await downloadFrom(page, () => page.getByRole('button', { name: 'Word (DOCX)' }).click());
+    const xml = td.decode(unzipSync(docx.bytes)['word/document.xml']);
+    expect(xml.includes('Пушкин') && xml.includes('<w:b/>'), 'DOCX with bold speaker names');
+    // the draft survives a reload
+    await page.reload();
+    await page.waitForSelector('.stt-utt');
+    expect((await page.inputValue('.stt-speaker:nth-child(1) input')) === 'Пушкин', 'renamed speaker kept in the draft');
+    expect(!errors.length, `page errors: ${errors.join('; ')}`);
+  } finally {
+    await ctx.close();
+  }
+});
+
 // ---------------------------------------------------------------------------- OCR
 test('OCR: scanned PDF → Word (auto), → searchable PDF, photo → Word', async () => {
   await withPage(async (page) => {

@@ -11,6 +11,7 @@
 import { detectFormat, FORMATS, targetsFor, type FormatId } from '../core/formats';
 import { LITE_FORMATS, readLite, writeLite } from '../core/convert-lite';
 import { ConvertError, stripExtension } from '../core/util';
+import { fetchMedia, MediaLinkError } from '../core/media-links';
 
 export interface Env {
   ASSETS: Fetcher;
@@ -156,6 +157,18 @@ export async function handleApi(request: Request, url: URL): Promise<Response> {
   if (path === '/api/formats') {
     if (request.method !== 'GET' && request.method !== 'HEAD') return error(405, 'method', 'Метод не поддерживается.');
     return json(formatsPayload(), 200, { 'Cache-Control': 'public, max-age=3600' });
+  }
+  if (path === '/api/media') {
+    // audio/video by link for the transcription page: only for pages of this site (not an open proxy)
+    if (request.method !== 'GET') return error(405, 'method', 'Используйте GET.');
+    const site = request.headers.get('Sec-Fetch-Site');
+    if (site !== 'same-origin') return error(403, 'forbidden', 'Этот метод доступен только со страниц сайта.');
+    try {
+      return await fetchMedia(url.searchParams.get('url') ?? '');
+    } catch (e) {
+      if (e instanceof MediaLinkError) return error(e.status, e.code, e.message);
+      return error(502, 'upstream', 'Не удалось скачать файл по ссылке.');
+    }
   }
   if (path === '/api/convert') {
     if (request.method !== 'POST') return error(405, 'method', 'Используйте POST.');
