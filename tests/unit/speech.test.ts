@@ -361,6 +361,29 @@ describe('pipeline (models stubbed)', () => {
     await expect(transcribeAudio(audio, engine, { signal: ac.signal })).rejects.toThrow(/Отменено/);
   });
 
+  it('decodes pieces in batches when the engine can, and falls back to one by one when a batch fails', async () => {
+    // 12 stretches of speech 8 s apart → 6 pieces → 3 lanes of 2 pieces
+    const long = new Float32Array(200 * rate);
+    for (let k = 0; k < 12; k++) long.set(audio.subarray(rate, 9 * rate), (1 + k * 16) * rate);
+    const batches: number[] = [];
+    const contexts: string[][] = [];
+    const seen: string[] = [];
+    const single = await transcribeAudio(long, { ...engine, transcribe: (p, c) => (seen.push(c ?? ''), engine.transcribe(p)) }, { speakers: 1 });
+    const batched = await transcribeAudio(long, { ...engine, batchSize: 4, transcribeBatch: async (ps, cs = []) => (batches.push(ps.length), contexts.push(cs), Promise.all(ps.map((p) => engine.transcribe(p)))) }, { speakers: 1 });
+    expect(seen.length).toBe(6);
+    expect(batches).toEqual([3, 3]);
+    // lanes start afresh; then each piece has its lane's previous piece as context (the pieces are alike,
+    // so that is the context piece 1 gets when decoding one by one)
+    expect(contexts[0]).toEqual(['', '', '']);
+    expect(seen[1].length).toBeGreaterThan(0);
+    expect(contexts[1]).toEqual([seen[1], seen[1], seen[1]]);
+    expect(batched.utterances.map((u) => u.text)).toEqual(single.utterances.map((u) => u.text));
+    let calls = 0;
+    const failing = await transcribeAudio(long, { ...engine, batchSize: 4, transcribeBatch: async () => (calls++, Promise.reject(new Error('out of memory'))) }, { speakers: 1 });
+    expect(calls).toBe(1);
+    expect(failing.utterances.map((u) => u.text)).toEqual(single.utterances.map((u) => u.text));
+  });
+
   it('silence gives an empty transcript, not invented text', async () => {
     const res = await transcribeAudio(new Float32Array(5 * rate), engine);
     expect(res.utterances).toEqual([]);

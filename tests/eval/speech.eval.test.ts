@@ -20,6 +20,8 @@ const N = Number(process.env.SPEECH_N ?? 25);
 const BEAMS = Number(process.env.SPEECH_BEAMS ?? 1);
 const OUT = process.env.SPEECH_OUT ?? '';
 const PLAIN = process.env.SPEECH_PLAIN === '1';
+/** Pieces per batch in the conversations (4 = the browser's GPU path, which drops the previous piece's text as context) */
+const BATCH = Number(process.env.SPEECH_BATCH ?? 1);
 
 /** Lower case, ё → е, letters and digits only. */
 export const normalize = (s: string): string[] =>
@@ -104,14 +106,14 @@ const load = (f: string): Float32Array => toSpeechRate(decodeWav(new Uint8Array(
 
 const has = DATA && existsSync(join(DATA, 'fleurs/dev.tsv')) && existsSync(join(DATA, 'ruls/x/index.json'));
 
-describe.skipIf(!has)(`speech accuracy (${PRESET}, beams ${BEAMS}${PLAIN ? ', no prompt' : ''})`, () => {
+describe.skipIf(!has)(`speech accuracy (${PRESET}, beams ${BEAMS}, batch ${BATCH}${PLAIN ? ', no prompt' : ''})`, () => {
   let engine: Awaited<ReturnType<typeof createEngine>>;
-  const report: Record<string, unknown> = { preset: PRESET, beams: BEAMS, plain: PLAIN };
+  const report: Record<string, unknown> = { preset: PRESET, beams: BEAMS, batch: BATCH, plain: PLAIN };
 
   it('loads the models', async () => {
     const tf = await import('@huggingface/transformers');
     tf.env.cacheDir = join(DATA, '../models');
-    engine = await createEngine(tf, { asr: ASR_MODELS[PRESET], device: 'cpu', language: 'russian', beams: BEAMS, plain: PLAIN });
+    engine = await createEngine(tf, { asr: ASR_MODELS[PRESET], device: 'cpu', language: 'russian', beams: BEAMS, plain: PLAIN, batch: BATCH });
   }, 1_800_000);
 
   it('recognition: WER and CER on real speech', async () => {

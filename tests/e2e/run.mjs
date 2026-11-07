@@ -489,13 +489,23 @@ test('PDF editor: redaction removes text and photo pixels from the file', async 
  * sound, the worker downloads the models from Hugging Face (cached in a persistent profile between runs)
  * and recognises it on the CPU (headless Chromium has no WebGPU).
  */
-test('Speech: video → transcript with two speakers, names, exports; links checked', async () => {
+/**
+ * `gpu`: Chromium with a WebGPU adapter (SwiftShader, software: correct but slow) — the page then runs
+ * recognition (batched, on the GPU) and the speaker search in two workers side by side.
+ */
+async function speechScenario({ gpu }) {
   const profile = process.env.SPEECH_PROFILE ?? join(out, 'speech-profile');
   const proxy = process.env.HTTPS_PROXY ? { server: process.env.HTTPS_PROXY, bypass: '127.0.0.1,localhost' } : undefined;
-  const ctx = await chromium.launchPersistentContext(profile, { acceptDownloads: true, viewport: { width: 1280, height: 900 }, ...(proxy ? { proxy, ignoreHTTPSErrors: true } : {}) });
+  const args = gpu ? ['--enable-unsafe-webgpu', '--enable-features=Vulkan', '--use-vulkan=swiftshader', '--use-webgpu-adapter=swiftshader'] : [];
+  const ctx = await chromium.launchPersistentContext(profile, { args, acceptDownloads: true, viewport: { width: 1280, height: 900 }, ...(proxy ? { proxy, ignoreHTTPSErrors: true } : {}) });
   const page = ctx.pages()[0] ?? (await ctx.newPage());
   const errors = [];
   page.on('pageerror', (e) => errors.push(e.message));
+  // our speech workers (not ONNX Runtime's own threads) and the notes they log
+  const workers = [];
+  page.on('worker', (w) => w.url().includes('speech-worker') && workers.push(w.url()));
+  const notes = [];
+  page.on('console', (m) => m.text().startsWith('[speech]') && notes.push(m.text()));
   try {
     const ref = JSON.parse(readFileSync(join(root, 'tests/fixtures/speech/dialog.json'), 'utf8'));
     await page.goto(`${BASE}/transcribe`);
@@ -504,6 +514,10 @@ test('Speech: video → transcript with two speakers, names, exports; links chec
     await page.waitForSelector('.stt-device:not(:has-text("Проверяю"))');
     // cross-origin isolation (COOP + COEP): the CPU path can use several threads
     expect(await page.evaluate(() => self.crossOriginIsolated), 'page is cross-origin isolated');
+    const deviceText = await page.textContent('.stt-device');
+    expect(gpu ? deviceText.includes('Видеокарта доступна') : deviceText.includes('WebGPU недоступен'), `device line: ${deviceText}`);
+    // the GPU path: two workers (recognition + speakers)
+
     // a video site is refused with an explanation
     await page.fill('.stt-link input', 'https://www.youtube.com/watch?v=dQw4w9WgXcQ');
     await page.click('.stt-link button');
@@ -511,8 +525,13 @@ test('Speech: video → transcript with two speakers, names, exports; links chec
     expect((await page.textContent('.stt-result .note')).includes('Видеохостинги'), 'video site message');
     // the dialogue as a video file; two speakers known
     await page.selectOption('.stt-options label:nth-child(2) select', '2');
+    const workersBefore = workers.length;
     await page.setInputFiles('.dropzone input[type=file]', join(root, 'tests/fixtures/speech/dialog.mp4'));
-    await page.waitForSelector('.stt-utt', { timeout: 1_800_000 });
+    await page.waitForSelector('.stt-utt', { timeout: 3_600_000 });
+    // with a GPU a second worker is started for the speakers; without, the page's one does everything
+    expect(workers.length - workersBefore === (gpu ? 1 : 0), `speech workers started by the run: ${workers.slice(workersBefore).join(', ')}`);
+    // on the GPU the pieces are decoded in batches (one piece here: a batch of one, without falling back)
+    if (gpu) expect(notes.some((n) => n.includes('batched decoding:')) && !notes.some((n) => n.includes('failed')), `batch notes: ${notes.join(' | ')}`);
     const utts = await page.$$eval('.stt-utt', (els) => els.map((e) => ({ who: e.querySelector('select').value, text: e.querySelector('.stt-text').textContent })));
     expect(new Set(utts.map((u) => u.who)).size === 2, `two speakers: ${JSON.stringify(utts)}`);
     expect(utts.length === 4 && utts.every((u, i) => u.who === utts[i % 2].who) && utts[0].who !== utts[1].who, `turns alternate like the reference: ${JSON.stringify(utts)}`);
@@ -553,7 +572,11 @@ test('Speech: video → transcript with two speakers, names, exports; links chec
   } finally {
     await ctx.close();
   }
-});
+}
+
+test('Speech: video → transcript with two speakers, names, exports; links checked', () => speechScenario({ gpu: false }));
+// slow on a software GPU: run with SPEECH_WEBGPU=1
+if (process.env.SPEECH_WEBGPU === '1') test('Speech on WebGPU (software adapter): two workers, batched decoding, same result', () => speechScenario({ gpu: true }));
 
 // ---------------------------------------------------------------------------- OCR
 test('OCR: scanned PDF → Word (auto), → searchable PDF, photo → Word', async () => {
